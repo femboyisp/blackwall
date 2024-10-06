@@ -129,13 +129,13 @@ fn parse_connections(
             let address_parts: Vec<&str> = local_address.split(':').collect();
             if address_parts.len() == 2 {
                 let ip = if is_ipv6 {
-                    IpAddr::V6(parse_ipv6(address_parts[0])?)
+                    IpAddr::V6(parse_ipv6(&address_parts[0])?)
                 } else {
-                    IpAddr::V4(parse_ipv4(address_parts[0])?)
+                    IpAddr::V4(parse_ipv4(&address_parts[0])?)
                 };
                 let port = u16::from_str_radix(address_parts[1], 16)?;
                 let process_name = get_process_name(inode_to_pid.get(inode))?;
-                let (connection_type, state) = determine_connection_type(&port_type, state_hex, remote_address);
+                let (connection_type, state) = determine_connection_type(&port_type, state_hex, local_address, remote_address);
                 let port_info = PortInfo { 
                     number: port, 
                     port_type: port_type.clone(), 
@@ -150,22 +150,33 @@ fn parse_connections(
     Ok(())
 }
 
-fn determine_connection_type(port_type: &PortType, state_hex: &str, remote_address: &str) -> (ConnectionType, String) {
+fn determine_connection_type(port_type: &PortType, state_hex: &str, local_address: &str, remote_address: &str) -> (ConnectionType, String) {
     let state = u8::from_str_radix(state_hex, 16).unwrap_or(0);
+
     match port_type {
-        PortType::TCP => match state {
-            1 => (ConnectionType::Client, "ESTABLISHED".to_string()),
-            2 => (ConnectionType::Client, "SYN_SENT".to_string()),
-            3 => (ConnectionType::Server, "SYN_RECV".to_string()),
-            4 => (ConnectionType::Server, "FIN_WAIT1".to_string()),
-            5 => (ConnectionType::Server, "FIN_WAIT2".to_string()),
-            6 => (ConnectionType::Client, "TIME_WAIT".to_string()),
-            7 => (ConnectionType::Server, "CLOSE".to_string()),
-            8 => (ConnectionType::Server, "CLOSE_WAIT".to_string()),
-            9 => (ConnectionType::Client, "LAST_ACK".to_string()),
-            10 => (ConnectionType::Server, "LISTEN".to_string()),
-            11 => (ConnectionType::Server, "CLOSING".to_string()),
-            _ => (ConnectionType::Unknown, format!("UNKNOWN ({})", state)),
+        PortType::TCP => {
+            match state {
+                1 => {
+                    // ESTABLISHED: Check if the remote port is 0 (unlikely for a client)
+                    let remote_port = u16::from_str_radix(remote_address.split(':').last().unwrap_or("0"), 16).unwrap_or(0);
+                    if remote_port == 0 {
+                        (ConnectionType::Server, "ESTABLISHED".to_string())
+                    } else {
+                        (ConnectionType::Client, "ESTABLISHED".to_string())
+                    }
+                },
+                2 => (ConnectionType::Client, "SYN_SENT".to_string()),
+                3 => (ConnectionType::Server, "SYN_RECV".to_string()),
+                4 => (ConnectionType::Unknown, "FIN_WAIT1".to_string()),
+                5 => (ConnectionType::Unknown, "FIN_WAIT2".to_string()),
+                6 => (ConnectionType::Client, "TIME_WAIT".to_string()),
+                7 => (ConnectionType::Unknown, "CLOSE".to_string()),
+                8 => (ConnectionType::Client, "CLOSE_WAIT".to_string()),
+                9 => (ConnectionType::Client, "LAST_ACK".to_string()),
+                10 => (ConnectionType::Server, "LISTEN".to_string()),
+                11 => (ConnectionType::Unknown, "CLOSING".to_string()),
+                _ => (ConnectionType::Unknown, format!("UNKNOWN ({})", state)),
+            }
         },
         PortType::UDP => {
             if remote_address == "00000000:0000" {
@@ -176,6 +187,7 @@ fn determine_connection_type(port_type: &PortType, state_hex: &str, remote_addre
         },
     }
 }
+
 
 fn get_process_name(pid: Option<&u32>) -> Result<String, Box<dyn std::error::Error>> {
     match pid {
