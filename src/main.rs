@@ -168,9 +168,9 @@ fn parse_connections(
             let address_parts: Vec<&str> = local_address.split(':').collect();
             if address_parts.len() == 2 {
                 let ip = if is_ipv6 {
-                    IpAddr::V6(parse_ipv6(&address_parts[0])?)
+                    IpAddr::V6(parse_ipv6(address_parts[0])?)
                 } else {
-                    IpAddr::V4(parse_ipv4(&address_parts[0])?)
+                    IpAddr::V4(parse_ipv4(address_parts[0])?)
                 };
                 let port = u16::from_str_radix(address_parts[1], 16)?;
                 let process_name = get_process_name(inode_to_pid.get(inode))?;
@@ -185,7 +185,7 @@ fn parse_connections(
                 };
                 open_ports
                     .entry(ip)
-                    .or_insert_with(HashSet::new)
+                    .or_default()
                     .insert(port_info);
             }
         }
