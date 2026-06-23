@@ -1,0 +1,68 @@
+---
+source: crates/blackwall-nft/src/render.rs
+expression: json
+---
+{
+  "nftables": [
+    {
+      "add": {
+        "table": {
+          "family": "inet",
+          "name": "blackwall"
+        }
+      }
+    },
+    {
+      "add": {
+        "set": {
+          "family": "inet",
+          "table": "blackwall",
+          "name": "real_v4",
+          "type": [
+            "ipv4_addr",
+            "inet_proto",
+            "inet_service"
+          ],
+          "elem": [
+            {
+              "concat": [
+                "203.0.113.5",
+                "tcp",
+                443
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "set": {
+          "family": "inet",
+          "table": "blackwall",
+          "name": "real_v6",
+          "type": [
+            "ipv6_addr",
+            "inet_proto",
+            "inet_service"
+          ],
+          "elem": []
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "table": "blackwall",
+          "name": "prerouting",
+          "type": "filter",
+          "hook": "prerouting",
+          "prio": -300,
+          "dev": "eth0",
+          "policy": "accept"
+        }
+      }
+    }
+  ]
+}
