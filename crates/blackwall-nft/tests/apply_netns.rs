@@ -43,3 +43,39 @@ fn applies_in_netns() {
         "ruleset missing: {text}"
     );
 }
+
+/// Regression test: after applying a policy that includes a service, then
+/// applying a second policy with that service removed, the service's address
+/// must no longer appear in the real_v4 set.  This encodes the flush-table
+/// atomicity guarantee: stale set elements from a prior apply must not persist.
+#[test]
+fn stale_set_elements_removed_on_second_apply() {
+    if !enabled() {
+        eprintln!("BLACKWALL_NETNS_TESTS != 1; skipping");
+        return;
+    }
+
+    // First apply: policy with 203.0.113.5 TCP/443.
+    let policy_with_service = sample();
+    blackwall_nft::apply(&policy_with_service).expect("first apply");
+
+    // Second apply: policy with no tenants (no services).
+    let policy_empty = Policy {
+        interface: "lo".to_owned(),
+        prefixes: vec!["203.0.113.0/24".parse().expect("prefix")],
+        default_state: PortState::Deception,
+        tenants: vec![],
+    };
+    blackwall_nft::apply(&policy_empty).expect("second apply");
+
+    let listing = std::process::Command::new("nft")
+        .args(["list", "ruleset"])
+        .output()
+        .expect("run nft");
+    let text = String::from_utf8_lossy(&listing.stdout);
+
+    assert!(
+        !text.contains("203.0.113.5"),
+        "removed service address still present after second apply: {text}"
+    );
+}

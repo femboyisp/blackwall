@@ -14,7 +14,10 @@
 use blackwall_core::{Policy, PolicyError, PortState};
 use nftables::{
     expr::{Expression, NamedExpression},
-    schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Set, SetType, SetTypeValue, Table},
+    schema::{
+        Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Set, SetType, SetTypeValue,
+        Table,
+    },
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 
@@ -25,20 +28,26 @@ const TABLE: &str = "blackwall";
 
 /// Build the full nftables ruleset for `policy`.
 ///
-/// Emits four objects in order:
-/// 1. `add table inet blackwall`
-/// 2. `add set inet blackwall real_v4 { type ipv4_addr . inet_proto . inet_service; ... }`
-/// 3. `add set inet blackwall real_v6 { type ipv6_addr . inet_proto . inet_service; ... }`
-/// 4. `add chain inet blackwall prerouting { type filter hook prerouting priority -300; }`
+/// Emits five objects in order:
+/// 1. `add table inet blackwall`   — ensure the table exists
+/// 2. `flush table inet blackwall` — atomically empty it (stale state removed)
+/// 3. `add set inet blackwall real_v4 { type ipv4_addr . inet_proto . inet_service; ... }`
+/// 4. `add set inet blackwall real_v6 { type ipv6_addr . inet_proto . inet_service; ... }`
+/// 5. `add chain inet blackwall prerouting { type filter hook prerouting priority -300; }`
+///
+/// The idiomatic nft atomic full-replace pattern is: `add table` (creates if
+/// absent), `flush table` (empties existing content), then re-add sets and
+/// chains. This guarantees that services removed from the policy are never left
+/// behind in `real_v4`/`real_v6`.
 ///
 /// The chain `comment` encodes the intended default action; live rules are
-/// wired in Task 8 alongside `apply()`.
+/// wired in Milestone 2 alongside deception/NFQUEUE support.
 pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
     let resolved = policy.resolve()?;
 
     let mut objects: Vec<NfObject> = Vec::new();
 
-    // 1. Table.
+    // 1. Table — create if absent.
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(
         Table {
             family: FAMILY,
@@ -47,7 +56,17 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
         },
     ))));
 
-    // 2. Named set of open (addr, proto, port) tuples — IPv4 addresses only.
+    // 2. Flush table — atomically empty stale sets/chains so that a service
+    //    removed from the policy is never left behind in real_v4/real_v6.
+    objects.push(NfObject::CmdObject(NfCmd::Flush(FlushObject::Table(
+        Table {
+            family: FAMILY,
+            name: TABLE.to_owned(),
+            handle: None,
+        },
+    ))));
+
+    // 3. Named set of open (addr, proto, port) tuples — IPv4 addresses only.
     let v4_elements = set_elements_for(&resolved, |s| s.addr.is_ipv4());
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(Set {
         family: FAMILY,
@@ -68,7 +87,7 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
         comment: None,
     }))));
 
-    // 3. Named set of open (addr, proto, port) tuples — IPv6 addresses only.
+    // 4. Named set of open (addr, proto, port) tuples — IPv6 addresses only.
     //    Uses SetType::Ipv6Addr for the address field.
     let v6_elements = set_elements_for(&resolved, |s| s.addr.is_ipv6());
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(Set {
@@ -90,9 +109,18 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
         comment: None,
     }))));
 
-    // 4. Prerouting base chain.  The chain policy encodes the intended default
-    //    action: `drop` for Closed, `accept` for Deception/Open (the deception
-    //    queue rule is added in Task 8; accept here means "fall through to it").
+    // 5. Prerouting base chain.
+    //
+    // Chain policy mapping:
+    //   Closed     → Drop    (enforce closed posture immediately)
+    //   Deception  → Accept  (PLACEHOLDER: Milestone 2 will add NFQUEUE redirect
+    //                         rules that route unknown traffic to the deception
+    //                         honeypot; Accept here is intentional and means the
+    //                         M1 ruleset classifies structure only — it does NOT
+    //                         yet enforce deception protection)
+    //   Open       → Accept  (PLACEHOLDER: Milestone 2 will add real-service
+    //                         DNAT rules; the M1 ruleset does not yet enforce
+    //                         any protection for Open services either)
     let chain_policy = match policy.default_state {
         PortState::Closed => NfChainPolicy::Drop,
         PortState::Deception | PortState::Open => NfChainPolicy::Accept,
@@ -187,8 +215,8 @@ mod tests {
     #[test]
     fn renders_table_set_and_chain() {
         let ruleset = render(&sample()).expect("render");
-        // Expect exactly 4 objects: table, real_v4 set, real_v6 set, chain.
-        assert_eq!(ruleset.objects.len(), 4);
+        // Expect exactly 5 objects: add-table, flush-table, real_v4 set, real_v6 set, chain.
+        assert_eq!(ruleset.objects.len(), 5);
 
         // Assert structural order and types.
         assert!(
@@ -196,28 +224,35 @@ mod tests {
                 &ruleset.objects[0],
                 NfObject::CmdObject(NfCmd::Add(NfListObject::Table(_)))
             ),
-            "objects[0] must be a table"
+            "objects[0] must be add table"
         );
         assert!(
             matches!(
                 &ruleset.objects[1],
-                NfObject::CmdObject(NfCmd::Add(NfListObject::Set(s))) if s.name == "real_v4"
+                NfObject::CmdObject(NfCmd::Flush(FlushObject::Table(_)))
             ),
-            "objects[1] must be the real_v4 set"
+            "objects[1] must be flush table"
         );
         assert!(
             matches!(
                 &ruleset.objects[2],
-                NfObject::CmdObject(NfCmd::Add(NfListObject::Set(s))) if s.name == "real_v6"
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Set(s))) if s.name == "real_v4"
             ),
-            "objects[2] must be the real_v6 set"
+            "objects[2] must be the real_v4 set"
         );
         assert!(
             matches!(
                 &ruleset.objects[3],
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Set(s))) if s.name == "real_v6"
+            ),
+            "objects[3] must be the real_v6 set"
+        );
+        assert!(
+            matches!(
+                &ruleset.objects[4],
                 NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(_)))
             ),
-            "objects[3] must be a chain"
+            "objects[4] must be a chain"
         );
     }
 
@@ -225,8 +260,8 @@ mod tests {
     fn renders_ipv6_service_into_v6_set() {
         let ruleset = render(&sample_v6()).expect("render v6");
 
-        // real_v6 set (objects[2]) must contain the service.
-        let v6_set = match &ruleset.objects[2] {
+        // real_v6 set (objects[3]) must contain the service.
+        let v6_set = match &ruleset.objects[3] {
             NfObject::CmdObject(NfCmd::Add(NfListObject::Set(s))) => s,
             other => panic!("expected real_v6 set, got {other:?}"),
         };
@@ -234,8 +269,8 @@ mod tests {
         let elems = v6_set.elem.as_ref().expect("real_v6 has elements");
         assert_eq!(elems.len(), 1, "one IPv6 service expected");
 
-        // real_v4 set (objects[1]) must be empty.
-        let v4_set = match &ruleset.objects[1] {
+        // real_v4 set (objects[2]) must be empty.
+        let v4_set = match &ruleset.objects[2] {
             NfObject::CmdObject(NfCmd::Add(NfListObject::Set(s))) => s,
             other => panic!("expected real_v4 set, got {other:?}"),
         };
@@ -258,7 +293,7 @@ mod tests {
         let mut policy = sample();
         policy.default_state = PortState::Closed;
         let ruleset = render(&policy).expect("render");
-        let chain = match &ruleset.objects[3] {
+        let chain = match &ruleset.objects[4] {
             NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(c))) => c,
             other => panic!("expected chain, got {other:?}"),
         };

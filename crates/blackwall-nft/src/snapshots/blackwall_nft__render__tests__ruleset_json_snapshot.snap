@@ -13,6 +13,14 @@ expression: json
       }
     },
     {
+      "flush": {
+        "table": {
+          "family": "inet",
+          "name": "blackwall"
+        }
+      }
+    },
+    {
       "add": {
         "set": {
           "family": "inet",

@@ -65,6 +65,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(services = n, "policy persisted");
             blackwall_nft::apply(&policy)?;
             tracing::info!("ruleset applied");
+            tracing::warn!(
+                "deception/forwarding enforcement is NOT yet active (Milestone 2); \
+                 the applied ruleset classifies structure only and does not yet \
+                 protect services — NFQUEUE redirect and real-service DNAT rules \
+                 are deferred to Milestone 2"
+            );
             Ok(())
         }
     }
