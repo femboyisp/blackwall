@@ -1,0 +1,15 @@
+[package]
+name = "blackwall-state"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blackwall-core = { path = "../blackwall-core" }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+ipnet = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
