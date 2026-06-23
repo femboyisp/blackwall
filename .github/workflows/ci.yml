@@ -29,6 +29,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- --deny warnings
+      - name: Test
+        run: cargo test --workspace
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Test with coverage gate
