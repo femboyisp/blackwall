@@ -252,4 +252,30 @@ mod tests {
         let json = ruleset_json(&sample()).expect("render json");
         insta::assert_snapshot!(json);
     }
+
+    #[test]
+    fn drop_default_state_sets_chain_policy_to_drop() {
+        let mut policy = sample();
+        policy.default_state = PortState::Closed;
+        let ruleset = render(&policy).expect("render");
+        let chain = match &ruleset.objects[3] {
+            NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(c))) => c,
+            other => panic!("expected chain, got {other:?}"),
+        };
+        assert_eq!(chain.policy, Some(NfChainPolicy::Drop));
+    }
+
+    #[test]
+    fn ruleset_json_is_valid_json() {
+        let json = ruleset_json(&sample()).expect("render json");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(v.is_object(), "top-level nftables json should be an object");
+    }
+
+    #[test]
+    fn nft_error_display() {
+        use crate::NftError;
+        let e = NftError::Apply("permission denied".to_owned());
+        assert!(e.to_string().contains("permission denied"));
+    }
 }

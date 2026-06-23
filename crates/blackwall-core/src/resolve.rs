@@ -214,4 +214,48 @@ mod tests {
         assert_eq!(policy.owner_of(ip("203.0.113.5")), Some("acme"));
         assert_eq!(policy.owner_of(ip("203.0.113.9")), None);
     }
+
+    #[test]
+    fn policy_error_display_address_outside_prefixes() {
+        let addr = ip("10.0.0.1");
+        let e = PolicyError::AddressOutsidePrefixes(addr);
+        assert!(e.to_string().contains("10.0.0.1"));
+        assert!(e.to_string().contains("managed prefix"));
+    }
+
+    #[test]
+    fn policy_error_display_duplicate_ownership() {
+        let e = PolicyError::DuplicateOwnership {
+            addr: ip("203.0.113.5"),
+            tenants: ("acme".to_owned(), "globex".to_owned()),
+        };
+        let s = e.to_string();
+        assert!(s.contains("203.0.113.5"));
+        assert!(s.contains("acme"));
+        assert!(s.contains("globex"));
+    }
+
+    #[test]
+    fn policy_error_display_duplicate_service() {
+        let e = PolicyError::DuplicateService {
+            addr: ip("203.0.113.5"),
+            proto: L4Proto::Tcp,
+            port: 443,
+        };
+        let s = e.to_string();
+        assert!(s.contains("203.0.113.5"));
+        assert!(s.contains("443"));
+    }
+
+    #[test]
+    fn resolve_empty_policy_succeeds() {
+        let policy = Policy {
+            interface: "eth0".to_owned(),
+            prefixes: vec![],
+            default_state: PortState::Deception,
+            tenants: vec![],
+        };
+        let resolved = policy.resolve().expect("empty policy resolves");
+        assert!(resolved.is_empty());
+    }
 }

@@ -262,4 +262,159 @@ tenant acme {
             "expected UnexpectedToken with 1-based line, got {err:?}"
         );
     }
+
+    #[test]
+    fn parses_default_drop() {
+        let input = "interface wan eth0\ndefault drop\n";
+        let policy = parse_text(input).expect("valid config");
+        assert_eq!(policy.default_state, PortState::Closed);
+    }
+
+    #[test]
+    fn rejects_bad_default_state() {
+        let err = parse_text("interface wan eth0\ndefault bogus\n").expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "default state", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_cidr() {
+        let err = parse_text("interface wan eth0\nipv4 notacidr\n").expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "cidr", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_nat_target() {
+        let input = "\
+interface wan eth0
+ipv4 203.0.113.0/24
+tenant t {
+    owns 203.0.113.5
+    allow tcp 8080 nat:203.0.113.5:9090
+}
+";
+        let policy = parse_text(input).expect("valid config");
+        let rule = &policy.tenants[0].allows[0];
+        assert!(matches!(rule.target, ServiceTarget::Nat(_)));
+    }
+
+    #[test]
+    fn parses_host_target() {
+        let input = "\
+interface wan eth0
+ipv4 203.0.113.0/24
+tenant t {
+    owns 203.0.113.5
+    allow tcp 22 host
+}
+";
+        let policy = parse_text(input).expect("valid config");
+        let rule = &policy.tenants[0].allows[0];
+        assert_eq!(rule.target, ServiceTarget::Host);
+    }
+
+    #[test]
+    fn rejects_bad_target() {
+        let input = "interface wan eth0\nipv4 203.0.113.0/24\ntenant t {\n owns 203.0.113.5\n allow tcp 80 badtarget\n}\n";
+        let err = parse_text(input).expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "target", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_nat_sockaddr() {
+        let input = "interface wan eth0\nipv4 203.0.113.0/24\ntenant t {\n owns 203.0.113.5\n allow tcp 80 nat:notanaddr\n}\n";
+        let err = parse_text(input).expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "nat target", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_tenant_header() {
+        let input = "interface wan eth0\ntenant missing_brace\n";
+        let err = parse_text(input).expect_err("should fail");
+        assert!(matches!(err, ConfigError::UnexpectedToken { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_unclosed_tenant_block() {
+        let input = "interface wan eth0\nipv4 203.0.113.0/24\ntenant t {\n  owns 203.0.113.5\n";
+        let err = parse_text(input).expect_err("should fail");
+        assert!(matches!(err, ConfigError::UnexpectedToken { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_unknown_directive_in_tenant() {
+        let input = "interface wan eth0\nipv4 203.0.113.0/24\ntenant t {\n  bogus directive\n}\n";
+        let err = parse_text(input).expect_err("should fail");
+        assert!(matches!(err, ConfigError::UnknownDirective { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_bad_protocol_in_allow() {
+        let input = "interface wan eth0\nipv4 203.0.113.0/24\ntenant t {\n  owns 203.0.113.5\n  allow sctp 80 host\n}\n";
+        let err = parse_text(input).expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "protocol", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_ip_in_owns() {
+        let input = "interface wan eth0\nipv4 203.0.113.0/24\ntenant t {\n  owns notanip\n}\n";
+        let err = parse_text(input).expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "ip address", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_token_count_for_directive() {
+        // `interface` expects exactly 3 words
+        let err = parse_text("interface eth0\n").expect_err("should fail");
+        assert!(matches!(err, ConfigError::UnexpectedToken { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn error_display_unexpected_token() {
+        let e = ConfigError::UnexpectedToken {
+            line: 5,
+            found: "foo".to_owned(),
+            expected: "bar",
+        };
+        assert!(e.to_string().contains("line 5"));
+        assert!(e.to_string().contains("foo"));
+    }
+
+    #[test]
+    fn error_display_unknown_directive() {
+        let e = ConfigError::UnknownDirective {
+            line: 3,
+            word: "baz".to_owned(),
+        };
+        assert!(e.to_string().contains("line 3"));
+        assert!(e.to_string().contains("baz"));
+    }
+
+    #[test]
+    fn error_display_bad_value() {
+        let e = ConfigError::BadValue {
+            line: 7,
+            what: "port",
+            value: "xyz".to_owned(),
+        };
+        assert!(e.to_string().contains("line 7"));
+        assert!(e.to_string().contains("xyz"));
+    }
 }

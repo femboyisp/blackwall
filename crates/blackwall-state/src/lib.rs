@@ -222,6 +222,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pool_accessor_returns_pool() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        // Just verify pool() doesn't panic; audit_count uses the pool.
+        let _count = store.audit_count().await.expect("audit_count via pool()");
+    }
+
+    #[test]
+    fn state_error_display_policy() {
+        use blackwall_core::PolicyError;
+        let inner = PolicyError::AddressOutsidePrefixes("10.0.0.1".parse().unwrap());
+        let e = StateError::Policy(inner);
+        assert!(e.to_string().contains("invalid policy"));
+    }
+
     fn blackwall_config_sample() -> Policy {
         use blackwall_core::{AllowRule, ServiceTarget, Tenant};
         Policy {
