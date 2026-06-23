@@ -7,3 +7,4 @@ All notable changes to this project are documented here, following
 
 ### Added
 - Workspace scaffold, CI, and lint configuration.
+- `blackwalld` CLI with `render` and `apply` commands wiring config, state, and nftables.
