@@ -6,7 +6,9 @@ services:
       POSTGRES_PASSWORD: blackwall
       POSTGRES_DB: blackwall
     ports:
-      - "5432:5432"
+      # Host port is overridable to avoid clashes with other local Postgres
+      # instances; defaults to 5432 to match CI and the docs.
+      - "${BW_PG_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U blackwall"]
       interval: 2s
