@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: blackwall
+      POSTGRES_PASSWORD: blackwall
+      POSTGRES_DB: blackwall
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blackwall"]
+      interval: 2s
+      timeout: 5s
+      retries: 15

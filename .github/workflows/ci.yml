@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: blackwall
+          POSTGRES_PASSWORD: blackwall
+          POSTGRES_DB: blackwall
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U blackwall"
+          --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      DATABASE_URL: postgres://blackwall:blackwall@localhost:5432/blackwall
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- --deny warnings
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Test with coverage gate
+        run: cargo llvm-cov --workspace --fail-under-lines 90
