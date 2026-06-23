@@ -10,6 +10,7 @@ blackwall-core = { path = "../blackwall-core" }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 ipnet = { workspace = true }
+serde_json = "1.0.135"
 
 [dev-dependencies]
 tokio = { workspace = true }

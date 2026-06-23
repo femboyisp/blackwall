@@ -9,4 +9,7 @@ pub enum StateError {
     /// A migration failure.
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    /// The policy could not be resolved before persisting.
+    #[error("invalid policy: {0}")]
+    Policy(#[from] blackwall_core::PolicyError),
 }
