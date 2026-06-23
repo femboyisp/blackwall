@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 ipnet = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
