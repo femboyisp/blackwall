@@ -4,7 +4,7 @@
 
 By default, every address and port across your IPv4/IPv6 prefixes *appears* open and running a
 service — scanners and attackers can't tell which ports are real. A port only becomes a genuine,
-forwarded service when you explicitly open it (via a declarative config, the API, or Incus
+forwarded service when you explicitly open it (via a declarative config file, the API, or Incus
 auto-discovery); everything else is answered by an interactive honeypot engine that behaves like
 the real thing. Blackwall is built for high packet rates and multi-tenant hosting, with a fast
 nftables data plane today and an XDP/eBPF fast path, BGP scrubbing, and DNS fast-flux on the
@@ -35,7 +35,7 @@ deception) while real services stay stable.
 - **Interactive honeypot engine** *(Milestone 2)* — stateless SYN-cookie answers for scan/flood
   volume, plus per-protocol emulators that hold real multi-turn conversations and capture
   attacker activity.
-- **declarative config DSL** — high-level, readable rules compiled down to nftables.
+- **Declarative config DSL** — high-level, readable rules compiled down to nftables.
 - **Fast nftables data plane** — real traffic accepted/DNAT'd on a flowtable fast path; deception
   traffic handed to userspace; designed so an XDP/AF_XDP fast path slots in later.
 - **Multi-tenant** — per-tenant IP/prefix ownership; tenants manage ports only on their own
@@ -103,7 +103,6 @@ public items) and ships a pre-commit config (`pre-commit install`).
 | `blackwall-state` | PostgreSQL persistence (migrations, tenants, services, audit log). |
 | `blackwall-nft` | Renders the policy to an nftables ruleset and applies it atomically. |
 | `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`). |
-
 
 ## Roadmap
 
