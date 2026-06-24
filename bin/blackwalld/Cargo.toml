@@ -1,0 +1,18 @@
+[package]
+name = "blackwalld"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blackwall-config = { path = "../../crates/blackwall-config" }
+blackwall-state = { path = "../../crates/blackwall-state" }
+blackwall-nft = { path = "../../crates/blackwall-nft" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

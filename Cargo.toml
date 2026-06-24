@@ -1,8 +1,43 @@
-[package]
-name = "blackwall"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["crates/*", "bin/*"]
 
-[dependencies]
-pnet = "0.35.0"
-colored = "2.1.0"
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/femboyisp/blackwall"
+
+[workspace.dependencies]
+thiserror = "2.0.9"
+serde = { version = "1.0.217", features = ["derive"] }
+ipnet = { version = "2.10.1", features = ["serde"] }
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "fs"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+clap = { version = "4.5.26", features = ["derive", "env"] }
+sqlx = { version = "0.8.3", features = ["runtime-tokio", "postgres", "macros", "migrate", "ipnetwork"] }
+nftables = "0.4.1"
+insta = "1.42.0"
+serde_json = "1.0.135"
+
+[workspace.lints.clippy]
+allow_attributes = "warn"
+as_ptr_cast_mut = "warn"
+as_underscore = "warn"
+borrow_as_ptr = "warn"
+implicit_clone = "warn"
+undocumented_unsafe_blocks = "warn"
+unicode_not_nfc = "warn"
+unused_async = "deny"
+wildcard_dependencies = "deny"
+
+[workspace.lints.rust]
+absolute_paths_not_starting_with_crate = "deny"
+explicit_outlives_requirements = "warn"
+macro_use_extern_crate = "deny"
+missing_abi = "deny"
+non_ascii_idents = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+single_use_lifetimes = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
