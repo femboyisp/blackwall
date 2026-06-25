@@ -15,3 +15,4 @@ All notable changes to this project are documented here, following
 - nftables kernel application via the `nftables` crate (`blackwall-nft::apply`).
 - `blackwalld` CLI with `render` and `apply` subcommands wiring config, state, and nftables.
 - Coverage gate: ≥ 90% line coverage enforced via `cargo llvm-cov --fail-under-lines 90`.
+- Deception engine (`blackwall-deception`): TPROXY-terminated interactive emulators (HTTP, generic/tarpit), NFQUEUE ICMP responder, session audit, and `blackwalld run`.
