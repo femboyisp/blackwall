@@ -64,4 +64,16 @@ mod tests {
     fn empty_is_none() {
         assert!(aggregate(vec![]).is_none());
     }
+
+    #[test]
+    fn one_nan_reading_does_not_poison_aggregate() {
+        let agg = aggregate(vec![
+            reading("a", 900.0, None, 10.0),
+            reading("b", f64::NAN, None, f64::NAN),
+            reading("c", 800.0, None, 12.0),
+        ])
+        .unwrap();
+        assert!(agg.download_mbps.is_finite());
+        assert!(agg.latency_ms.is_finite());
+    }
 }

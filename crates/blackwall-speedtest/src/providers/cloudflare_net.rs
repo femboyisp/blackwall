@@ -3,6 +3,7 @@
 //! All parsing and math lives in [`super::cloudflare_parse`].
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use std::time::Instant;
 
 use crate::error::SpeedtestError;
@@ -64,13 +65,17 @@ impl SpeedtestProvider for CloudflareProvider {
             .and_then(|v| v.to_str().ok())
             .and_then(server_timing_latency);
 
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+        let cap = bytes;
+        let mut stream = resp.bytes_stream();
+        let mut received: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| SpeedtestError::Http(e.to_string()))?;
+            received = received.saturating_add(chunk.len() as u64);
+            if received >= cap {
+                break;
+            }
+        }
         let elapsed = start.elapsed();
-
-        let received = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let download_mbps = mbps_from(received, elapsed);
         let latency_ms = server_timing.unwrap_or(elapsed.as_secs_f64() * 1000.0);
 
