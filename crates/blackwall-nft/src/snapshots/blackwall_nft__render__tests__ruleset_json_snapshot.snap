@@ -71,6 +71,203 @@ expression: json
           "policy": "accept"
         }
       }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "blackwall",
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "right": "ipv4",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "concat": [
+                    {
+                      "payload": {
+                        "protocol": "ip",
+                        "field": "daddr"
+                      }
+                    },
+                    {
+                      "meta": {
+                        "key": "l4proto"
+                      }
+                    },
+                    {
+                      "payload": {
+                        "protocol": "th",
+                        "field": "dport"
+                      }
+                    }
+                  ]
+                },
+                "right": "@real_v4",
+                "op": "in"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "comment": "real service: accept (DNAT to backend deferred to M3)"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "blackwall",
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "right": "ipv6",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "concat": [
+                    {
+                      "payload": {
+                        "protocol": "ip6",
+                        "field": "daddr"
+                      }
+                    },
+                    {
+                      "meta": {
+                        "key": "l4proto"
+                      }
+                    },
+                    {
+                      "payload": {
+                        "protocol": "th",
+                        "field": "dport"
+                      }
+                    }
+                  ]
+                },
+                "right": "@real_v6",
+                "op": "in"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "comment": "real service: accept (DNAT to backend deferred to M3)"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "blackwall",
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "right": "tcp",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "203.0.113.0",
+                    "len": 24
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "tproxy": {
+                "family": "ip",
+                "port": 61000
+              }
+            }
+          ],
+          "comment": "deception TCP: tproxy to engine port 61000"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "blackwall",
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "right": "tcp",
+                "op": "!="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "203.0.113.0",
+                    "len": 24
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "queue": {
+                "num": 0
+              }
+            }
+          ],
+          "comment": "deception ICMP/UDP: queue to nfqueue 0"
+        }
+      }
     }
   ]
 }

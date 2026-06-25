@@ -7,10 +7,11 @@ repository.workspace = true
 
 [dependencies]
 blackwall-config = { path = "../../crates/blackwall-config" }
+blackwall-deception = { path = "../../crates/blackwall-deception" }
 blackwall-state = { path = "../../crates/blackwall-state" }
 blackwall-nft = { path = "../../crates/blackwall-nft" }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
