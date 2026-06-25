@@ -2,6 +2,17 @@
 
 use std::time::Duration;
 
+/// Whether a download measurement should keep reading: stop once either the
+/// byte cap is reached or the measurement window has elapsed.
+pub fn keep_downloading(
+    received: u64,
+    max_bytes: u64,
+    elapsed: Duration,
+    window: Duration,
+) -> bool {
+    received < max_bytes && elapsed < window
+}
+
 /// Megabits per second from `bytes` transferred over `elapsed`.
 /// Returns `0.0` when `elapsed` is zero (avoids division by zero).
 pub fn mbps_from(bytes: u64, elapsed: Duration) -> f64 {
@@ -52,6 +63,19 @@ pub fn trimmed_mean(values: &[f64]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_downloading_stops_on_cap_or_window() {
+        let secs = |s| Duration::from_secs(s);
+        // under both limits → keep going
+        assert!(keep_downloading(100, 1000, secs(1), secs(10)));
+        // received >= max_bytes → stop
+        assert!(!keep_downloading(1000, 1000, secs(1), secs(10)));
+        assert!(!keep_downloading(1001, 1000, secs(1), secs(10)));
+        // elapsed >= window → stop
+        assert!(!keep_downloading(100, 1000, secs(10), secs(10)));
+        assert!(!keep_downloading(100, 1000, secs(11), secs(10)));
+    }
 
     #[test]
     fn mbps_basic() {

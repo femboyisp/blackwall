@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
-use crate::throughput::mbps_from;
+use crate::throughput::{keep_downloading, mbps_from};
 
 use super::cloudflare_parse::{download_url, server_timing_latency};
 
@@ -71,7 +71,7 @@ impl SpeedtestProvider for CloudflareProvider {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| SpeedtestError::Http(e.to_string()))?;
             received = received.saturating_add(chunk.len() as u64);
-            if received >= cap {
+            if !keep_downloading(received, cap, start.elapsed(), cfg.measure_window) {
                 break;
             }
         }

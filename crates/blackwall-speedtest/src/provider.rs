@@ -6,6 +6,11 @@ use async_trait::async_trait;
 use std::time::Duration;
 
 /// Tunables shared by all providers.
+///
+/// `measure_window` caps how long a single download measurement may run,
+/// independent of `max_bytes`. Whichever limit is hit first stops the
+/// transfer; throughput is then computed from bytes-received / elapsed.
+/// This ensures a slow link yields a low reading rather than a timeout.
 #[derive(Debug, Clone, Copy)]
 pub struct SpeedtestConfig {
     /// Maximum bytes any single provider may transfer for a download test.
@@ -14,6 +19,10 @@ pub struct SpeedtestConfig {
     pub timeout: Duration,
     /// Maximum providers to run concurrently.
     pub concurrency: usize,
+    /// Maximum wall-clock time spent transferring data for one download
+    /// measurement. The download stops at whichever comes first: this
+    /// window or `max_bytes`. Throughput is bytes-received / elapsed.
+    pub measure_window: Duration,
 }
 
 impl Default for SpeedtestConfig {
@@ -22,6 +31,7 @@ impl Default for SpeedtestConfig {
             max_bytes: 100 * 1024 * 1024,
             timeout: Duration::from_secs(30),
             concurrency: 4,
+            measure_window: Duration::from_secs(10),
         }
     }
 }
@@ -61,5 +71,11 @@ mod tests {
         let r = p.measure(&SpeedtestConfig::default()).await.unwrap();
         assert_eq!(r.provider, "stub");
         assert_eq!(r.download_mbps, 500.0);
+    }
+
+    #[test]
+    fn default_measure_window_is_10s() {
+        let cfg = SpeedtestConfig::default();
+        assert_eq!(cfg.measure_window, Duration::from_secs(10));
     }
 }
