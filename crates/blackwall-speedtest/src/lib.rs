@@ -3,6 +3,7 @@
 mod aggregate;
 mod error;
 mod provider;
+pub mod providers;
 mod reading;
 mod runner;
 mod throughput;
