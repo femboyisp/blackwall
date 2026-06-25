@@ -4,10 +4,12 @@
 mod audit;
 mod error;
 mod services;
+mod sessions;
 mod tenants;
 
 pub use error::StateError;
 pub use services::StoredService;
+pub use sessions::SessionRow;
 
 use blackwall_core::{L4Proto, Policy, ServiceTarget};
 use sqlx::postgres::PgPoolOptions;
@@ -153,6 +155,34 @@ impl Store {
         Ok(out)
     }
 
+    /// Append a deception-session audit row.
+    pub async fn record_session(&self, s: &SessionRow) -> Result<(), StateError> {
+        sqlx::query(
+            "INSERT INTO deception_sessions \
+             (local_addr, local_port, peer_addr, proto, emulator, bytes_in, bytes_out, note) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(ipnetwork_addr(s.local_addr))
+        .bind(i32::from(s.local_port))
+        .bind(ipnetwork_addr(s.peer_addr))
+        .bind(&s.proto)
+        .bind(&s.emulator)
+        .bind(s.bytes_in)
+        .bind(s.bytes_out)
+        .bind(s.note.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Count recorded deception sessions.
+    pub async fn session_count(&self) -> Result<i64, StateError> {
+        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM deception_sessions")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
     /// Count audit-log entries.
     pub async fn audit_count(&self) -> Result<i64, StateError> {
         let row: (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log")
@@ -232,6 +262,31 @@ mod tests {
         store.migrate().await.expect("migrate");
         // Just verify pool() doesn't panic; audit_count uses the pool.
         let _count = store.audit_count().await.expect("audit_count via pool()");
+    }
+
+    #[tokio::test]
+    async fn records_and_counts_sessions() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let before = store.session_count().await.expect("count");
+        store
+            .record_session(&SessionRow {
+                local_addr: "203.0.113.5".parse().unwrap(),
+                local_port: 80,
+                peer_addr: "198.51.100.9".parse().unwrap(),
+                proto: "tcp".to_owned(),
+                emulator: "http".to_owned(),
+                bytes_in: 30,
+                bytes_out: 200,
+                note: Some("GET / HTTP/1.1".to_owned()),
+            })
+            .await
+            .expect("record");
+        assert_eq!(store.session_count().await.expect("count"), before + 1);
     }
 
     #[test]
