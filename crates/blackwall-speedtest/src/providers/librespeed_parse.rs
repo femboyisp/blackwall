@@ -31,6 +31,14 @@ pub fn ping_url(server: &str) -> String {
     format!("{}/backend/empty.php", base(server))
 }
 
+/// The upload (POST) URL for `server`.
+///
+/// LibreSpeed uses `empty.php` for both ping and upload; the upload path
+/// distinguishes itself by sending a request body.
+pub fn upload_url(server: &str) -> String {
+    format!("{}/backend/empty.php", base(server))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,6 +49,14 @@ mod tests {
         let servers = parse_server_list(json).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "Example");
+    }
+
+    #[test]
+    fn builds_upload_url_trimming_slash() {
+        assert_eq!(
+            upload_url("https://ls.example.com/"),
+            "https://ls.example.com/backend/empty.php"
+        );
     }
 
     #[test]

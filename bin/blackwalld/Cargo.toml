@@ -12,6 +12,7 @@ blackwall-deception = { path = "../../crates/blackwall-deception" }
 blackwall-discovery = { path = "../../crates/blackwall-discovery" }
 blackwall-state = { path = "../../crates/blackwall-state" }
 blackwall-nft = { path = "../../crates/blackwall-nft" }
+blackwall-shaper = { path = "../../crates/blackwall-shaper" }
 blackwall-speedtest = { path = "../../crates/blackwall-speedtest" }
 clap = { workspace = true }
 serde_json = { workspace = true }
