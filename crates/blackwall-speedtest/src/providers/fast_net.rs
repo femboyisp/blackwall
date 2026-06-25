@@ -78,14 +78,17 @@ impl SpeedtestProvider for FastProvider {
         let token = extract_token(&js)
             .ok_or_else(|| SpeedtestError::Parse("fast.com: token not found in JS".to_owned()))?;
 
-        // Query the measurement API for download targets.
+        // Query the measurement API for download targets; time it as latency.
         let url = api_url(&token, TARGET_COUNT);
-        let api_json = self
+        let api_start = Instant::now();
+        let api_resp = self
             .client
             .get(&url)
             .send()
             .await
-            .map_err(|e| SpeedtestError::Http(e.to_string()))?
+            .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+        let latency_ms = api_start.elapsed().as_secs_f64() * 1000.0;
+        let api_json = api_resp
             .text()
             .await
             .map_err(|e| SpeedtestError::Http(e.to_string()))?;
@@ -93,7 +96,7 @@ impl SpeedtestProvider for FastProvider {
         let targets = parse_targets(&api_json)?;
         let target = targets.into_iter().next().ok_or(SpeedtestError::NoResult)?;
 
-        // Time the download of the first target, stream-capped at cfg.max_bytes.
+        // Download the first target, stream-capped at cfg.max_bytes.
         let dl_start = Instant::now();
         let resp = self
             .client
@@ -101,7 +104,6 @@ impl SpeedtestProvider for FastProvider {
             .send()
             .await
             .map_err(|e| SpeedtestError::Http(e.to_string()))?;
-        let latency_ms = dl_start.elapsed().as_secs_f64() * 1000.0;
 
         let mut received: u64 = 0;
         let mut stream = resp.bytes_stream();

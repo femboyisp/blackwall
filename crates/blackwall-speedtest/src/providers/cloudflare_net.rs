@@ -44,9 +44,9 @@ impl SpeedtestProvider for CloudflareProvider {
 
     /// Measure download throughput and latency via Cloudflare's speed endpoint.
     ///
-    /// Download is capped at `min(cfg.max_bytes, 25 MiB)`. Latency is taken
-    /// from the `Server-Timing` response header when present, falling back to
-    /// the full round-trip duration.
+    /// Download is capped at `min(cfg.max_bytes, 25 MiB)`. Latency is the
+    /// `Server-Timing: cfRequestDuration;dur=X` header value when present;
+    /// otherwise it falls back to the TTFB of a `__down?bytes=1` probe request.
     async fn measure(&self, cfg: &SpeedtestConfig) -> Result<ProviderReading, SpeedtestError> {
         let bytes = cfg.max_bytes.min(MAX_CF_BYTES);
         let url = download_url(bytes);
@@ -58,12 +58,17 @@ impl SpeedtestProvider for CloudflareProvider {
             .send()
             .await
             .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+        let ttfb_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let server_timing = resp
             .headers()
             .get("server-timing")
             .and_then(|v| v.to_str().ok())
             .and_then(server_timing_latency);
+
+        // Prefer the Server-Timing header (server-side RTT proxy); fall back to
+        // TTFB of this same request, which is the real network round-trip time.
+        let latency_ms = server_timing.unwrap_or(ttfb_ms);
 
         let cap = bytes;
         let mut stream = resp.bytes_stream();
@@ -77,7 +82,6 @@ impl SpeedtestProvider for CloudflareProvider {
         }
         let elapsed = start.elapsed();
         let download_mbps = mbps_from(received, elapsed);
-        let latency_ms = server_timing.unwrap_or(elapsed.as_secs_f64() * 1000.0);
 
         Ok(ProviderReading {
             provider: self.name().to_owned(),
