@@ -40,3 +40,4 @@ All notable changes to this project are documented here, following
 - `blackwalld run` integration: service discovery reconciler invoked at startup to populate dynamic allow-rules from live Incus instances.
 - Multi-source speedtest aggregator (`blackwall-speedtest`): Cloudflare/LibreSpeed/fast.com/Ookla providers run concurrently with trimmed-mean aggregation, plus a `blackwalld speedtest` subcommand.
 - CAKE traffic shaping (`blackwall-shaper`): a `shape` config directive, egress + ingress (IFB) CAKE qdiscs applied via tc/ip, auto-tuned from the speedtest aggregate (Cloudflare/LibreSpeed now also measure upload), wired into `blackwalld run`.
+- Speedtest source binding (`--source-ip`/`--interface`; `shape <iface> auto` measures bound to that interface) and upload measurement for the fast.com and Ookla providers (all four providers now report upload).
