@@ -71,7 +71,8 @@ impl SpeedtestProvider for OoklaProvider {
             .await
             .map_err(|e| SpeedtestError::Http(e.to_string()))?;
 
-        // Send HI greeting.
+        // Send HI greeting and time the HELLO response as latency.
+        let hi_start = Instant::now();
         stream
             .write_all(b"HI\n")
             .await
@@ -79,6 +80,7 @@ impl SpeedtestProvider for OoklaProvider {
 
         // Read the HELLO response line.
         let hello_line = read_line(&mut stream).await?;
+        let latency_ms = hi_start.elapsed().as_secs_f64() * 1000.0;
         let _version = parse_hello(&hello_line);
 
         // Request the download.
@@ -113,7 +115,6 @@ impl SpeedtestProvider for OoklaProvider {
         }
 
         let download_mbps = mbps_from(received, elapsed);
-        let latency_ms = elapsed.as_secs_f64() * 1000.0;
 
         Ok(ProviderReading {
             provider: self.name().to_owned(),
