@@ -68,6 +68,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         prefixes,
         default_state,
         tenants,
+        shaping: Vec::new(),
     })
 }
 

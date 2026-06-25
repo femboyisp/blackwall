@@ -110,6 +110,7 @@ mod tests {
             prefixes: vec!["203.0.113.0/24".parse::<IpNet>().expect("prefix")],
             default_state: PortState::Deception,
             tenants,
+            shaping: Vec::new(),
         }
     }
 

@@ -355,6 +355,7 @@ mod tests {
                     },
                 ],
             }],
+            shaping: Vec::new(),
         }
     }
 }
