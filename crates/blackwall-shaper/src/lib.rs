@@ -1,10 +1,12 @@
 //! CAKE traffic shaping for Blackwall.
 
+mod apply;
 mod bandwidth;
 mod command;
 mod error;
 mod plan;
 
+pub use apply::apply;
 pub use bandwidth::parse_bandwidth;
 pub use command::{egress_commands, ingress_commands, teardown_commands};
 pub use error::ShaperError;
