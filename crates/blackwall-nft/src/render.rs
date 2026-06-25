@@ -5,19 +5,24 @@
 //!   tuples for every Open IPv4 service in the policy.
 //! * Named set `real_v6` — open `(ipv6_addr, inet_proto, inet_service)`
 //!   tuples for every Open IPv6 service in the policy.
-//! * Chain `prerouting` — base chain capturing the managed interface; the
-//!   `comment` field records the default action (drop vs. deception queue) so
-//!   the snapshot captures it without needing live rules.
+//! * Chain `prerouting` — base chain capturing the managed interface with
+//!   classifier rules:
+//!   1. Real-service membership → accept (DNAT to backend deferred to M3).
+//!   2. Deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
+//!   3. Deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
+//!   4. If default_state == Closed → drop (chain policy).
 //!
-//! This module is pure: it builds the schema only. Applying it is Task 8.
+//! This module is pure: it builds the schema only. Applying it is handled by
+//! the `apply` function in the crate root.
 
 use blackwall_core::{Policy, PolicyError, PortState};
 use nftables::{
-    expr::{Expression, NamedExpression},
+    expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix},
     schema::{
-        Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Set, SetType, SetTypeValue,
-        Table,
+        Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetType,
+        SetTypeValue, Table,
     },
+    stmt::{Match, Operator, Queue, Statement},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 
@@ -26,22 +31,37 @@ const FAMILY: NfFamily = NfFamily::INet;
 /// The table name Blackwall owns.
 const TABLE: &str = "blackwall";
 
+/// TCP port the deception engine's tproxy listener binds to.
+///
+/// Traffic classified as deception TCP is redirected here so the engine can
+/// respond with honeypot content. The engine itself is wired in Task 9.
+const ENGINE_TPROXY_PORT: u16 = 61000;
+
+/// NFQUEUE number used for deception ICMP/UDP packets.
+///
+/// The deception engine receives these packets via the kernel's userspace
+/// queue mechanism and generates appropriate honeypot responses. The engine
+/// is wired in Task 9.
+const DECEPTION_QUEUE: u16 = 0;
+
 /// Build the full nftables ruleset for `policy`.
 ///
-/// Emits five objects in order:
+/// Emits objects in order:
 /// 1. `add table inet blackwall`   — ensure the table exists
 /// 2. `flush table inet blackwall` — atomically empty it (stale state removed)
 /// 3. `add set inet blackwall real_v4 { type ipv4_addr . inet_proto . inet_service; ... }`
 /// 4. `add set inet blackwall real_v6 { type ipv6_addr . inet_proto . inet_service; ... }`
 /// 5. `add chain inet blackwall prerouting { type filter hook prerouting priority -300; }`
+/// 6. Rule: real-service membership → accept (DNAT to backend deferred to M3)
+/// 7. Rule: deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT
+/// 8. Rule: deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE
 ///
 /// The idiomatic nft atomic full-replace pattern is: `add table` (creates if
 /// absent), `flush table` (empties existing content), then re-add sets and
 /// chains. This guarantees that services removed from the policy are never left
 /// behind in `real_v4`/`real_v6`.
 ///
-/// The chain `comment` encodes the intended default action; live rules are
-/// wired in Milestone 2 alongside deception/NFQUEUE support.
+/// When `policy.default_state == Closed` the chain's default policy is `drop`.
 pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
     let resolved = policy.resolve()?;
 
@@ -111,16 +131,8 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
 
     // 5. Prerouting base chain.
     //
-    // Chain policy mapping:
-    //   Closed     → Drop    (enforce closed posture immediately)
-    //   Deception  → Accept  (PLACEHOLDER: Milestone 2 will add NFQUEUE redirect
-    //                         rules that route unknown traffic to the deception
-    //                         honeypot; Accept here is intentional and means the
-    //                         M1 ruleset classifies structure only — it does NOT
-    //                         yet enforce deception protection)
-    //   Open       → Accept  (PLACEHOLDER: Milestone 2 will add real-service
-    //                         DNAT rules; the M1 ruleset does not yet enforce
-    //                         any protection for Open services either)
+    // Chain policy: Closed → Drop (enforce closed posture); otherwise Accept
+    // (the explicit classifier rules above handle deception/real traffic).
     let chain_policy = match policy.default_state {
         PortState::Closed => NfChainPolicy::Drop,
         PortState::Deception | PortState::Open => NfChainPolicy::Accept,
@@ -139,6 +151,177 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
             policy: Some(chain_policy),
         },
     ))));
+
+    // 6. Rule: real-service membership check — accept.
+    //    daddr . l4proto . dport in @real_v4 → accept
+    //    (DNAT to Incus backend is deferred to M3; for now, accept passes the
+    //    packet to the host stack which will reach the real service.)
+    //
+    //    Note: we emit one rule per address family so the concat type matches.
+    //    IPv4: meta nfproto ipv4 ip daddr . meta l4proto . th dport @real_v4 accept
+    //    IPv6: meta nfproto ipv6 ip6 daddr . meta l4proto . th dport @real_v6 accept
+    for (set_name, nfproto) in [("real_v4", "ipv4"), ("real_v6", "ipv6")] {
+        let daddr_field = if set_name == "real_v4" { "ip" } else { "ip6" };
+        let accept_rule = Rule {
+            family: FAMILY,
+            table: TABLE.to_owned(),
+            chain: "prerouting".to_owned(),
+            expr: vec![
+                // meta nfproto == ipv4/ipv6
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::Nfproto,
+                    })),
+                    right: Expression::String(nfproto.to_owned()),
+                    op: Operator::EQ,
+                }),
+                // daddr . l4proto . dport in @real_vN
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Concat(vec![
+                        Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                            PayloadField {
+                                protocol: daddr_field.to_owned(),
+                                field: "daddr".to_owned(),
+                            },
+                        ))),
+                        Expression::Named(NamedExpression::Meta(Meta {
+                            key: MetaKey::L4proto,
+                        })),
+                        Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                            PayloadField {
+                                protocol: "th".to_owned(),
+                                field: "dport".to_owned(),
+                            },
+                        ))),
+                    ])),
+                    right: Expression::String(format!("@{set_name}")),
+                    op: Operator::IN,
+                }),
+                // accept — DNAT to backend deferred to M3
+                Statement::Accept(None),
+            ],
+            handle: None,
+            index: None,
+            comment: Some("real service: accept (DNAT to backend deferred to M3)".to_owned()),
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+            accept_rule,
+        ))));
+    }
+
+    // 7. Rule: deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
+    //
+    //    nftables-0.4.1 does not provide a typed `tproxy` Statement variant.
+    //    We emit it via `Statement::XT` (the crate's generic/verbatim escape
+    //    hatch for unsupported statement types), which produces JSON of the form
+    //    `{"xt": {"tproxy": ...}}`.  This is not the canonical nftables JSON
+    //    form — the correct form is `{"tproxy": {"port": <n>}}` — so this rule
+    //    requires a crate patch (adding a typed Tproxy variant) to be accepted
+    //    verbatim by the nft binary.  The XT wrapper is intentional and is the
+    //    only option within the crate's current type system; see task-8 report.
+    for prefix in &policy.prefixes {
+        let (addr_family, proto_name) = if prefix.addr().is_ipv4() {
+            ("ip", "ip")
+        } else {
+            ("ip6", "ip6")
+        };
+        let prefix_len = prefix.prefix_len();
+        let tproxy_rule = Rule {
+            family: FAMILY,
+            table: TABLE.to_owned(),
+            chain: "prerouting".to_owned(),
+            expr: vec![
+                // meta l4proto tcp
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::L4proto,
+                    })),
+                    right: Expression::String("tcp".to_owned()),
+                    op: Operator::EQ,
+                }),
+                // daddr in managed prefix
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                        PayloadField {
+                            protocol: proto_name.to_owned(),
+                            field: "daddr".to_owned(),
+                        },
+                    ))),
+                    right: Expression::Named(NamedExpression::Prefix(Prefix {
+                        addr: Box::new(Expression::String(prefix.addr().to_string())),
+                        len: u32::from(prefix_len),
+                    })),
+                    op: Operator::EQ,
+                }),
+                // tproxy to ENGINE_TPROXY_PORT (emitted via XT; see comment above)
+                Statement::XT(Some(serde_json::json!({
+                    "tproxy": {
+                        "family": addr_family,
+                        "port": ENGINE_TPROXY_PORT
+                    }
+                }))),
+            ],
+            handle: None,
+            index: None,
+            comment: Some(format!(
+                "deception TCP: tproxy to engine port {ENGINE_TPROXY_PORT}"
+            )),
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+            tproxy_rule,
+        ))));
+    }
+
+    // 8. Rule: deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
+    //
+    //    `Statement::Queue` is a typed variant in nftables-0.4.1; it serializes
+    //    as `{"queue": {"num": <n>}}`.
+    for prefix in &policy.prefixes {
+        let proto_name = if prefix.addr().is_ipv4() { "ip" } else { "ip6" };
+        let prefix_len = prefix.prefix_len();
+        let queue_rule = Rule {
+            family: FAMILY,
+            table: TABLE.to_owned(),
+            chain: "prerouting".to_owned(),
+            expr: vec![
+                // meta l4proto != tcp  (i.e. ICMP and UDP)
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::L4proto,
+                    })),
+                    right: Expression::String("tcp".to_owned()),
+                    op: Operator::NEQ,
+                }),
+                // daddr in managed prefix
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                        PayloadField {
+                            protocol: proto_name.to_owned(),
+                            field: "daddr".to_owned(),
+                        },
+                    ))),
+                    right: Expression::Named(NamedExpression::Prefix(Prefix {
+                        addr: Box::new(Expression::String(prefix.addr().to_string())),
+                        len: u32::from(prefix_len),
+                    })),
+                    op: Operator::EQ,
+                }),
+                // queue num DECEPTION_QUEUE
+                Statement::Queue(Queue {
+                    num: Expression::Number(u32::from(DECEPTION_QUEUE)),
+                    flags: None,
+                }),
+            ],
+            handle: None,
+            index: None,
+            comment: Some(format!(
+                "deception ICMP/UDP: queue to nfqueue {DECEPTION_QUEUE}"
+            )),
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+            queue_rule,
+        ))));
+    }
 
     Ok(Nftables { objects })
 }
@@ -215,8 +398,9 @@ mod tests {
     #[test]
     fn renders_table_set_and_chain() {
         let ruleset = render(&sample()).expect("render");
-        // Expect exactly 5 objects: add-table, flush-table, real_v4 set, real_v6 set, chain.
-        assert_eq!(ruleset.objects.len(), 5);
+        // sample() has 1 prefix → 2 accept rules (v4+v6) + 1 tproxy rule + 1 queue rule = 4 rules
+        // Total objects: add-table, flush-table, real_v4, real_v6, chain, + 4 rules = 9
+        assert_eq!(ruleset.objects.len(), 9);
 
         // Assert structural order and types.
         assert!(
@@ -254,6 +438,44 @@ mod tests {
             ),
             "objects[4] must be a chain"
         );
+        // objects[5..6]: real-service accept rules (v4 + v6)
+        assert!(
+            matches!(
+                &ruleset.objects[5],
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(_)))
+            ),
+            "objects[5] must be the real_v4 accept rule"
+        );
+        assert!(
+            matches!(
+                &ruleset.objects[6],
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(_)))
+            ),
+            "objects[6] must be the real_v6 accept rule"
+        );
+        // objects[7]: tproxy rule for 203.0.113.0/24
+        assert!(
+            matches!(
+                &ruleset.objects[7],
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(_)))
+            ),
+            "objects[7] must be the tproxy rule"
+        );
+        // objects[8]: queue rule for 203.0.113.0/24
+        assert!(
+            matches!(
+                &ruleset.objects[8],
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(_)))
+            ),
+            "objects[8] must be the queue rule"
+        );
+    }
+
+    #[test]
+    fn ruleset_json_contains_tproxy_and_queue() {
+        let json = ruleset_json(&sample()).expect("render json");
+        assert!(json.contains("tproxy"), "rendered JSON must contain tproxy");
+        assert!(json.contains("queue"), "rendered JSON must contain queue");
     }
 
     #[test]

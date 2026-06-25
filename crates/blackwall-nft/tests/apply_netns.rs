@@ -42,6 +42,8 @@ fn applies_in_netns() {
         text.contains("table inet blackwall"),
         "ruleset missing: {text}"
     );
+    assert!(text.contains("tproxy"), "tproxy rule missing: {text}");
+    assert!(text.contains("queue"), "queue rule missing: {text}");
 }
 
 /// Regression test: after applying a policy that includes a service, then
