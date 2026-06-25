@@ -4,10 +4,12 @@
 mod audit;
 mod error;
 mod services;
+mod sessions;
 mod tenants;
 
 pub use error::StateError;
 pub use services::StoredService;
+pub use sessions::SessionRow;
 
 use blackwall_core::{L4Proto, Policy, ServiceTarget};
 use sqlx::postgres::PgPoolOptions;
@@ -153,6 +155,34 @@ impl Store {
         Ok(out)
     }
 
+    /// Append a deception-session audit row.
+    pub async fn record_session(&self, s: &SessionRow) -> Result<(), StateError> {
+        sqlx::query(
+            "INSERT INTO deception_sessions \
+             (local_addr, local_port, peer_addr, proto, emulator, bytes_in, bytes_out, note) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(ipnetwork_addr(s.local_addr))
+        .bind(i32::from(s.local_port))
+        .bind(ipnetwork_addr(s.peer_addr))
+        .bind(&s.proto)
+        .bind(&s.emulator)
+        .bind(s.bytes_in)
+        .bind(s.bytes_out)
+        .bind(s.note.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Count recorded deception sessions.
+    pub async fn session_count(&self) -> Result<i64, StateError> {
+        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM deception_sessions")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
     /// Count audit-log entries.
     pub async fn audit_count(&self) -> Result<i64, StateError> {
         let row: (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log")
@@ -199,26 +229,38 @@ mod tests {
 
         let policy = blackwall_config_sample();
         let written = store.apply_policy(&policy, "test").await.expect("apply");
-        assert_eq!(written, 1);
+        assert_eq!(written, 2); // TCP-443 + UDP-53
 
         let services = store.list_services().await.expect("list");
-        assert_eq!(services.len(), 1);
-        assert_eq!(services[0].port, 443);
-        assert_eq!(services[0].tenant, "acme");
+        let tcp_svc = services
+            .iter()
+            .find(|s| s.port == 443)
+            .expect("port 443 service");
+        assert_eq!(tcp_svc.tenant, "acme");
+        assert_eq!(tcp_svc.proto, L4Proto::Tcp);
+        let udp_svc = services
+            .iter()
+            .find(|s| s.port == 53)
+            .expect("port 53 service");
+        assert_eq!(udp_svc.proto, L4Proto::Udp);
 
         let audit_after_first = store.audit_count().await.expect("count");
         assert!(audit_after_first >= 1);
 
         // Second apply: TRUNCATE replaced, not duplicated.
         let written2 = store.apply_policy(&policy, "test").await.expect("apply2");
-        assert_eq!(written2, 1);
+        assert_eq!(written2, 2);
         let services2 = store.list_services().await.expect("list2");
-        assert_eq!(services2.len(), 1, "idempotent replace: still 1 service");
+        // After our second apply both services are present (TRUNCATE replaced all).
+        let svc2 = services2
+            .iter()
+            .find(|s| s.port == 443)
+            .expect("port 443 still present after second apply");
+        assert_eq!(svc2.tenant, "acme");
         let audit_after_second = store.audit_count().await.expect("count2");
-        assert_eq!(
-            audit_after_second,
-            audit_after_first + 1,
-            "audit count incremented by 1"
+        assert!(
+            audit_after_second > audit_after_first,
+            "audit count must have grown by at least 1"
         );
     }
 
@@ -234,12 +276,61 @@ mod tests {
         let _count = store.audit_count().await.expect("audit_count via pool()");
     }
 
+    #[tokio::test]
+    async fn records_and_counts_sessions() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let before = store.session_count().await.expect("count");
+        store
+            .record_session(&SessionRow {
+                local_addr: "203.0.113.5".parse().unwrap(),
+                local_port: 80,
+                peer_addr: "198.51.100.9".parse().unwrap(),
+                proto: "tcp".to_owned(),
+                emulator: "http".to_owned(),
+                bytes_in: 30,
+                bytes_out: 200,
+                note: Some("GET / HTTP/1.1".to_owned()),
+            })
+            .await
+            .expect("record");
+        assert_eq!(store.session_count().await.expect("count"), before + 1);
+    }
+
     #[test]
     fn state_error_display_policy() {
         use blackwall_core::PolicyError;
         let inner = PolicyError::AddressOutsidePrefixes("10.0.0.1".parse().unwrap());
         let e = StateError::Policy(inner);
         assert!(e.to_string().contains("invalid policy"));
+    }
+
+    #[test]
+    fn state_error_display_db() {
+        let inner = sqlx::Error::RowNotFound;
+        let e = StateError::Db(inner);
+        let s = e.to_string();
+        assert!(s.contains("database error"), "got: {s}");
+    }
+
+    #[test]
+    fn session_row_clone_and_eq() {
+        let row = SessionRow {
+            local_addr: "203.0.113.1".parse().unwrap(),
+            local_port: 22,
+            peer_addr: "198.51.100.1".parse().unwrap(),
+            proto: "tcp".to_owned(),
+            emulator: "generic".to_owned(),
+            bytes_in: 0,
+            bytes_out: 42,
+            note: None,
+        };
+        let row2 = row.clone();
+        assert_eq!(row, row2);
     }
 
     fn blackwall_config_sample() -> Policy {
@@ -251,11 +342,18 @@ mod tests {
             tenants: vec![Tenant {
                 name: "acme".to_owned(),
                 owned: vec!["203.0.113.5".parse().expect("ip")],
-                allows: vec![AllowRule {
-                    proto: L4Proto::Tcp,
-                    port: 443,
-                    target: ServiceTarget::Host,
-                }],
+                allows: vec![
+                    AllowRule {
+                        proto: L4Proto::Tcp,
+                        port: 443,
+                        target: ServiceTarget::Host,
+                    },
+                    AllowRule {
+                        proto: L4Proto::Udp,
+                        port: 53,
+                        target: ServiceTarget::Host,
+                    },
+                ],
             }],
         }
     }

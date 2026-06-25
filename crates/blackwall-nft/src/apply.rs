@@ -14,6 +14,6 @@ use nftables::helper;
 /// Requires `CAP_NET_ADMIN` (run as root).
 pub fn apply(policy: &Policy) -> Result<(), NftError> {
     let ruleset = crate::render::render(policy).map_err(|e| NftError::Apply(e.to_string()))?;
-    helper::apply_ruleset(&ruleset, None, None).map_err(|e| NftError::Apply(e.to_string()))?;
+    helper::apply_ruleset(&ruleset).map_err(|e| NftError::Apply(e.to_string()))?;
     Ok(())
 }
