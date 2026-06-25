@@ -32,3 +32,9 @@ All notable changes to this project are documented here, following
 - MySQL emulator: static handshake packet + error response capturing client login attempt.
 - PostgreSQL emulator: `ErrorResponse` framing capturing startup message.
 - Emulator port registration: SSH (22), SMTP (25), Redis (6379), MySQL (3306), PostgreSQL (5432) registered in `default_registry`.
+- Service discovery crate (`blackwall-discovery`): host-socket scanner parsing `/proc/net/{tcp,tcp6,udp,udp6}` into `ListeningSocket` entries.
+- Incus instance model: `IncusInstance` + `instance_services` producing `ResolvedService` from Incus API JSON (addresses × ports cartesian product).
+- Incus event stream parser: lifecycle events (`started`, `stopped`, `deleted`) mapped to `IncusLifecycleEvent`.
+- Incus unix-socket client (`IncusClient`): `list_instances` + `stream_events` over the Incus unix socket with a `MockIncusClient` for unit tests.
+- Policy reconciler (`reconcile_incus_instances`): auto-opens Incus-opted ports by merging discovered services into the active `Policy`, respecting tenant prefix ownership and synthesizing a catch-all tenant for unowned-but-in-prefix addresses.
+- `blackwalld run` integration: service discovery reconciler invoked at startup to populate dynamic allow-rules from live Incus instances.
