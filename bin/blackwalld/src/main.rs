@@ -7,7 +7,12 @@ use std::process::ExitCode;
 use blackwall_deception::transport::{run_nfqueue, serve, TproxyListener};
 use blackwall_deception::{default_registry, EngineLimits, SharedBanners};
 use blackwall_discovery::IncusClient;
+use blackwall_speedtest::providers::{
+    CloudflareProvider, FastProvider, LibreSpeedProvider, OoklaProvider,
+};
+use blackwall_speedtest::{Speedtest, SpeedtestConfig, SpeedtestProvider};
 use blackwall_state::SessionRow;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Blackwall deception firewall control binary.
@@ -35,6 +40,22 @@ enum Command {
         /// PostgreSQL connection URL.
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
+    },
+    /// Run a multi-provider network speed test and print results as JSON.
+    Speedtest {
+        /// LibreSpeed backend server URL.
+        ///
+        /// Defaults to `https://lon.speedtest.clouvider.net` (a well-known public
+        /// LibreSpeed instance operated by Clouvider).  Pass a different URL to
+        /// test against your own LibreSpeed deployment.
+        #[arg(long, default_value = "https://lon.speedtest.clouvider.net")]
+        librespeed_server: String,
+        /// Maximum bytes per measurement window (overrides SpeedtestConfig default).
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        /// Per-request timeout in seconds (overrides SpeedtestConfig default).
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
     /// Apply the ruleset and start the deception engine (requires CAP_NET_ADMIN).
     Run {
@@ -144,6 +165,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let json = blackwall_nft::ruleset_json(&policy)?;
             println!("{json}");
             Ok(())
+        }
+        Command::Speedtest {
+            librespeed_server,
+            max_bytes,
+            timeout_secs,
+        } => {
+            let providers: Vec<Arc<dyn SpeedtestProvider>> = vec![
+                Arc::new(CloudflareProvider::new()),
+                Arc::new(LibreSpeedProvider::new(librespeed_server)),
+                Arc::new(FastProvider::new()),
+                Arc::new(OoklaProvider::new()),
+            ];
+            let mut cfg = SpeedtestConfig::default();
+            if let Some(b) = max_bytes {
+                cfg.max_bytes = b;
+            }
+            if let Some(t) = timeout_secs {
+                cfg.timeout = std::time::Duration::from_secs(t);
+            }
+            let runner = Speedtest::new(providers);
+            match runner.run(&cfg).await {
+                Ok(aggregate) => {
+                    println!("{}", serde_json::to_string_pretty(&aggregate)?);
+                    Ok(())
+                }
+                Err(blackwall_speedtest::SpeedtestError::NoResult) => {
+                    eprintln!(
+                        "speedtest: all providers returned no result; check network connectivity"
+                    );
+                    Err("speedtest produced no result".into())
+                }
+                Err(err) => Err(err.into()),
+            }
         }
         Command::Apply {
             config,
