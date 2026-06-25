@@ -39,3 +39,4 @@ All notable changes to this project are documented here, following
 - Policy reconciler (`reconcile_incus_instances`): auto-opens Incus-opted ports by merging discovered services into the active `Policy`, respecting tenant prefix ownership and synthesizing a catch-all tenant for unowned-but-in-prefix addresses.
 - `blackwalld run` integration: service discovery reconciler invoked at startup to populate dynamic allow-rules from live Incus instances.
 - Multi-source speedtest aggregator (`blackwall-speedtest`): Cloudflare/LibreSpeed/fast.com/Ookla providers run concurrently with trimmed-mean aggregation, plus a `blackwalld speedtest` subcommand.
+- CAKE traffic shaping (`blackwall-shaper`): a `shape` config directive, egress + ingress (IFB) CAKE qdiscs applied via tc/ip, auto-tuned from the speedtest aggregate (Cloudflare/LibreSpeed now also measure upload), wired into `blackwalld run`.

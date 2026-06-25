@@ -123,6 +123,7 @@ mod tests {
             prefixes: vec![prefix("203.0.113.0/24")],
             default_state: PortState::Deception,
             tenants,
+            shaping: Vec::new(),
         }
     }
 
@@ -254,6 +255,7 @@ mod tests {
             prefixes: vec![],
             default_state: PortState::Deception,
             tenants: vec![],
+            shaping: Vec::new(),
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());

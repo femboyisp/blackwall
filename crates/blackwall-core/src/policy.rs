@@ -39,4 +39,6 @@ pub struct Policy {
     pub default_state: PortState,
     /// Tenants and their exposed services.
     pub tenants: Vec<Tenant>,
+    /// Traffic-shaping rules (empty if the config defines none).
+    pub shaping: Vec<crate::ShapeRule>,
 }
