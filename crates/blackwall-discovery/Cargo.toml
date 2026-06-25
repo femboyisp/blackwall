@@ -9,7 +9,6 @@ repository.workspace = true
 async-trait = { workspace = true }
 blackwall-core = { path = "../blackwall-core" }
 ipnet = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

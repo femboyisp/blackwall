@@ -309,10 +309,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 tracing::warn!("Incus event stream ended; discovery loop exiting");
                                 break;
                             }
+                            Err(blackwall_discovery::DiscoveryError::Parse(msg)) => {
+                                tracing::warn!(%msg, "skipping malformed Incus event");
+                                continue;
+                            }
                             Err(err) => {
                                 tracing::warn!(
                                     %err,
-                                    "Incus event stream error; discovery loop exiting"
+                                    "Incus event stream error; discovery stopping"
                                 );
                                 break;
                             }

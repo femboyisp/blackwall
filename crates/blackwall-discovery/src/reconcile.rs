@@ -36,6 +36,12 @@ const DISCOVERED_TENANT: &str = "discovered";
 /// as an `AllowRule` to the tenant that owns the address, or to a synthetic
 /// `"discovered"` tenant when no configured tenant owns it. Services outside all
 /// managed prefixes, and duplicates already present, are skipped.
+///
+/// Because [`AllowRule`] is not address-scoped, a discovered service attached to
+/// a tenant opens that port on **all** addresses that tenant owns — consistent
+/// with config-file allow semantics. Operators reading the audit log should
+/// therefore expect to see a port opened on an address that was not itself
+/// observed listening, if another address in the same tenant triggered the rule.
 pub fn reconcile(base: &Policy, discovered: &[DiscoveredService]) -> Policy {
     let mut effective = base.clone();
 
