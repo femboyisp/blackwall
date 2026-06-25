@@ -22,7 +22,7 @@ use nftables::{
         Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetType,
         SetTypeValue, Table,
     },
-    stmt::{Match, Operator, Queue, Statement},
+    stmt::{Match, Operator, Queue, Statement, TProxy},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 
@@ -62,16 +62,16 @@ const DECEPTION_QUEUE: u16 = 0;
 /// behind in `real_v4`/`real_v6`.
 ///
 /// When `policy.default_state == Closed` the chain's default policy is `drop`.
-pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
+pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     let resolved = policy.resolve()?;
 
-    let mut objects: Vec<NfObject> = Vec::new();
+    let mut objects: Vec<NfObject<'static>> = Vec::new();
 
     // 1. Table — create if absent.
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(
         Table {
             family: FAMILY,
-            name: TABLE.to_owned(),
+            name: TABLE.into(),
             handle: None,
         },
     ))));
@@ -81,53 +81,53 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Flush(FlushObject::Table(
         Table {
             family: FAMILY,
-            name: TABLE.to_owned(),
+            name: TABLE.into(),
             handle: None,
         },
     ))));
 
     // 3. Named set of open (addr, proto, port) tuples — IPv4 addresses only.
     let v4_elements = set_elements_for(&resolved, |s| s.addr.is_ipv4());
-    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(Set {
-        family: FAMILY,
-        table: TABLE.to_owned(),
-        name: "real_v4".to_owned(),
-        handle: None,
-        set_type: SetTypeValue::Concatenated(vec![
-            SetType::Ipv4Addr,
-            SetType::InetProto,
-            SetType::InetService,
-        ]),
-        policy: None,
-        flags: None,
-        elem: Some(v4_elements),
-        timeout: None,
-        gc_interval: None,
-        size: None,
-        comment: None,
-    }))));
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(
+        Box::new(Set {
+            family: FAMILY,
+            table: TABLE.into(),
+            name: "real_v4".into(),
+            handle: None,
+            set_type: SetTypeValue::Concatenated(
+                vec![SetType::Ipv4Addr, SetType::InetProto, SetType::InetService].into(),
+            ),
+            policy: None,
+            flags: None,
+            elem: Some(v4_elements.into()),
+            timeout: None,
+            gc_interval: None,
+            size: None,
+            comment: None,
+        }),
+    ))));
 
     // 4. Named set of open (addr, proto, port) tuples — IPv6 addresses only.
     //    Uses SetType::Ipv6Addr for the address field.
     let v6_elements = set_elements_for(&resolved, |s| s.addr.is_ipv6());
-    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(Set {
-        family: FAMILY,
-        table: TABLE.to_owned(),
-        name: "real_v6".to_owned(),
-        handle: None,
-        set_type: SetTypeValue::Concatenated(vec![
-            SetType::Ipv6Addr,
-            SetType::InetProto,
-            SetType::InetService,
-        ]),
-        policy: None,
-        flags: None,
-        elem: Some(v6_elements),
-        timeout: None,
-        gc_interval: None,
-        size: None,
-        comment: None,
-    }))));
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(
+        Box::new(Set {
+            family: FAMILY,
+            table: TABLE.into(),
+            name: "real_v6".into(),
+            handle: None,
+            set_type: SetTypeValue::Concatenated(
+                vec![SetType::Ipv6Addr, SetType::InetProto, SetType::InetService].into(),
+            ),
+            policy: None,
+            flags: None,
+            elem: Some(v6_elements.into()),
+            timeout: None,
+            gc_interval: None,
+            size: None,
+            comment: None,
+        }),
+    ))));
 
     // 5. Prerouting base chain.
     //
@@ -140,14 +140,14 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(
         Chain {
             family: FAMILY,
-            table: TABLE.to_owned(),
-            name: "prerouting".to_owned(),
+            table: TABLE.into(),
+            name: "prerouting".into(),
             newname: None,
             handle: None,
             _type: Some(NfChainType::Filter),
             hook: Some(NfHook::Prerouting),
             prio: Some(-300),
-            dev: Some(policy.interface.clone()),
+            dev: Some(policy.interface.clone().into()),
             policy: Some(chain_policy),
         },
     ))));
@@ -164,15 +164,15 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
         let daddr_field = if set_name == "real_v4" { "ip" } else { "ip6" };
         let accept_rule = Rule {
             family: FAMILY,
-            table: TABLE.to_owned(),
-            chain: "prerouting".to_owned(),
+            table: TABLE.into(),
+            chain: "prerouting".into(),
             expr: vec![
                 // meta nfproto == ipv4/ipv6
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
                         key: MetaKey::Nfproto,
                     })),
-                    right: Expression::String(nfproto.to_owned()),
+                    right: Expression::String(nfproto.into()),
                     op: Operator::EQ,
                 }),
                 // daddr . l4proto . dport in @real_vN
@@ -180,8 +180,8 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
                     left: Expression::Named(NamedExpression::Concat(vec![
                         Expression::Named(NamedExpression::Payload(Payload::PayloadField(
                             PayloadField {
-                                protocol: daddr_field.to_owned(),
-                                field: "daddr".to_owned(),
+                                protocol: daddr_field.into(),
+                                field: "daddr".into(),
                             },
                         ))),
                         Expression::Named(NamedExpression::Meta(Meta {
@@ -189,20 +189,21 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
                         })),
                         Expression::Named(NamedExpression::Payload(Payload::PayloadField(
                             PayloadField {
-                                protocol: "th".to_owned(),
-                                field: "dport".to_owned(),
+                                protocol: "th".into(),
+                                field: "dport".into(),
                             },
                         ))),
                     ])),
-                    right: Expression::String(format!("@{set_name}")),
+                    right: Expression::String(format!("@{set_name}").into()),
                     op: Operator::IN,
                 }),
                 // accept — DNAT to backend deferred to M3
                 Statement::Accept(None),
-            ],
+            ]
+            .into(),
             handle: None,
             index: None,
-            comment: Some("real service: accept (DNAT to backend deferred to M3)".to_owned()),
+            comment: Some("real service: accept (DNAT to backend deferred to M3)".into()),
         };
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
             accept_rule,
@@ -211,61 +212,57 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
 
     // 7. Rule: deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
     //
-    //    nftables-0.4.1 does not provide a typed `tproxy` Statement variant.
-    //    We emit it via `Statement::XT` (the crate's generic/verbatim escape
-    //    hatch for unsupported statement types), which produces JSON of the form
-    //    `{"xt": {"tproxy": ...}}`.  This is not the canonical nftables JSON
-    //    form — the correct form is `{"tproxy": {"port": <n>}}` — so this rule
-    //    requires a crate patch (adding a typed Tproxy variant) to be accepted
-    //    verbatim by the nft binary.  The XT wrapper is intentional and is the
-    //    only option within the crate's current type system; see task-8 report.
+    //    nftables-0.6 provides a typed `Statement::TProxy` variant that
+    //    serializes as `{"tproxy": {"family": "<f>", "port": <n>}}`.
     for prefix in &policy.prefixes {
-        let (addr_family, proto_name) = if prefix.addr().is_ipv4() {
+        let (addr_family, proto_name): (&'static str, &'static str) = if prefix.addr().is_ipv4() {
             ("ip", "ip")
         } else {
             ("ip6", "ip6")
         };
+        let prefix_str = prefix.addr().to_string();
         let prefix_len = prefix.prefix_len();
         let tproxy_rule = Rule {
             family: FAMILY,
-            table: TABLE.to_owned(),
-            chain: "prerouting".to_owned(),
+            table: TABLE.into(),
+            chain: "prerouting".into(),
             expr: vec![
                 // meta l4proto tcp
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
                         key: MetaKey::L4proto,
                     })),
-                    right: Expression::String("tcp".to_owned()),
+                    right: Expression::String("tcp".into()),
                     op: Operator::EQ,
                 }),
                 // daddr in managed prefix
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
                         PayloadField {
-                            protocol: proto_name.to_owned(),
-                            field: "daddr".to_owned(),
+                            protocol: proto_name.into(),
+                            field: "daddr".into(),
                         },
                     ))),
                     right: Expression::Named(NamedExpression::Prefix(Prefix {
-                        addr: Box::new(Expression::String(prefix.addr().to_string())),
+                        addr: Box::new(Expression::String(prefix_str.into())),
                         len: u32::from(prefix_len),
                     })),
                     op: Operator::EQ,
                 }),
-                // tproxy to ENGINE_TPROXY_PORT (emitted via XT; see comment above)
-                Statement::XT(Some(serde_json::json!({
-                    "tproxy": {
-                        "family": addr_family,
-                        "port": ENGINE_TPROXY_PORT
-                    }
-                }))),
-            ],
+                // tproxy to ENGINE_TPROXY_PORT — typed variant, serializes as
+                // {"tproxy": {"family": "<f>", "port": <n>}}
+                Statement::TProxy(TProxy {
+                    family: Some(addr_family.into()),
+                    port: ENGINE_TPROXY_PORT,
+                    addr: None,
+                }),
+            ]
+            .into(),
             handle: None,
             index: None,
-            comment: Some(format!(
-                "deception TCP: tproxy to engine port {ENGINE_TPROXY_PORT}"
-            )),
+            comment: Some(
+                format!("deception TCP: tproxy to engine port {ENGINE_TPROXY_PORT}").into(),
+            ),
         };
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
             tproxy_rule,
@@ -274,34 +271,35 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
 
     // 8. Rule: deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
     //
-    //    `Statement::Queue` is a typed variant in nftables-0.4.1; it serializes
-    //    as `{"queue": {"num": <n>}}`.
+    //    `Statement::Queue` is a typed variant; it serializes as
+    //    `{"queue": {"num": <n>}}`.
     for prefix in &policy.prefixes {
-        let proto_name = if prefix.addr().is_ipv4() { "ip" } else { "ip6" };
+        let proto_name: &'static str = if prefix.addr().is_ipv4() { "ip" } else { "ip6" };
+        let prefix_str = prefix.addr().to_string();
         let prefix_len = prefix.prefix_len();
         let queue_rule = Rule {
             family: FAMILY,
-            table: TABLE.to_owned(),
-            chain: "prerouting".to_owned(),
+            table: TABLE.into(),
+            chain: "prerouting".into(),
             expr: vec![
                 // meta l4proto != tcp  (i.e. ICMP and UDP)
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
                         key: MetaKey::L4proto,
                     })),
-                    right: Expression::String("tcp".to_owned()),
+                    right: Expression::String("tcp".into()),
                     op: Operator::NEQ,
                 }),
                 // daddr in managed prefix
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
                         PayloadField {
-                            protocol: proto_name.to_owned(),
-                            field: "daddr".to_owned(),
+                            protocol: proto_name.into(),
+                            field: "daddr".into(),
                         },
                     ))),
                     right: Expression::Named(NamedExpression::Prefix(Prefix {
-                        addr: Box::new(Expression::String(prefix.addr().to_string())),
+                        addr: Box::new(Expression::String(prefix_str.into())),
                         len: u32::from(prefix_len),
                     })),
                     op: Operator::EQ,
@@ -311,33 +309,34 @@ pub fn render(policy: &Policy) -> Result<Nftables, PolicyError> {
                     num: Expression::Number(u32::from(DECEPTION_QUEUE)),
                     flags: None,
                 }),
-            ],
+            ]
+            .into(),
             handle: None,
             index: None,
-            comment: Some(format!(
-                "deception ICMP/UDP: queue to nfqueue {DECEPTION_QUEUE}"
-            )),
+            comment: Some(format!("deception ICMP/UDP: queue to nfqueue {DECEPTION_QUEUE}").into()),
         };
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
             queue_rule,
         ))));
     }
 
-    Ok(Nftables { objects })
+    Ok(Nftables {
+        objects: objects.into(),
+    })
 }
 
 /// Build set elements for services matching `predicate`.
 fn set_elements_for(
     resolved: &[blackwall_core::ResolvedService],
     predicate: impl Fn(&blackwall_core::ResolvedService) -> bool,
-) -> Vec<Expression> {
+) -> Vec<Expression<'static>> {
     resolved
         .iter()
         .filter(|s| predicate(s))
         .map(|s| {
             Expression::Named(NamedExpression::Concat(vec![
-                Expression::String(s.addr.to_string()),
-                Expression::String(s.proto.to_string()),
+                Expression::String(s.addr.to_string().into()),
+                Expression::String(s.proto.to_string().into()),
                 Expression::Number(u32::from(s.port)),
             ]))
         })
@@ -476,6 +475,10 @@ mod tests {
         let json = ruleset_json(&sample()).expect("render json");
         assert!(json.contains("tproxy"), "rendered JSON must contain tproxy");
         assert!(json.contains("queue"), "rendered JSON must contain queue");
+        assert!(
+            !json.contains("\"xt\""),
+            "rendered JSON must NOT contain xt"
+        );
     }
 
     #[test]

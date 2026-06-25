@@ -214,11 +214,9 @@ expression: json
               }
             },
             {
-              "xt": {
-                "tproxy": {
-                  "family": "ip",
-                  "port": 61000
-                }
+              "tproxy": {
+                "family": "ip",
+                "port": 61000
               }
             }
           ],
