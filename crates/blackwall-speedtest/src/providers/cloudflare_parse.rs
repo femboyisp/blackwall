@@ -13,7 +13,9 @@ pub fn server_timing_latency(header: &str) -> Option<f64> {
             let kv = kv.trim();
             if let Some(v) = kv.strip_prefix("dur=") {
                 if let Ok(ms) = v.trim().parse::<f64>() {
-                    return Some(ms);
+                    if ms.is_finite() {
+                        return Some(ms);
+                    }
                 }
             }
         }
@@ -44,5 +46,6 @@ mod tests {
             Some(8.0)
         );
         assert_eq!(server_timing_latency("nothing-here"), None);
+        assert_eq!(server_timing_latency("cfRequestDuration;dur=NaN"), None);
     }
 }

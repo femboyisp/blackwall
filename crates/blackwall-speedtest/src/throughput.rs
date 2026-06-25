@@ -22,23 +22,24 @@ pub fn mbps_from(bytes: u64, elapsed: Duration) -> f64 {
 
 /// Trimmed mean: drop one minimum and one maximum when there are at least three
 /// values (rejecting a single wild outlier on each side), otherwise the plain
-/// mean. `None` for an empty slice.
+/// mean. `None` for an empty slice. Non-finite values (`NaN`, `±inf`) are
+/// discarded before trimming.
 pub fn trimmed_mean(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
         return None;
     }
-    if values.len() < 3 {
-        let sum: f64 = values.iter().sum();
+    if finite.len() < 3 {
+        let sum: f64 = finite.iter().sum();
         #[expect(
             clippy::cast_precision_loss,
             reason = "slice length is a small sample \
             count, well within f64's exact-integer range"
         )]
-        return Some(sum / (values.len() as f64));
+        return Some(sum / (finite.len() as f64));
     }
-    let mut sorted: Vec<f64> = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let trimmed = &sorted[1..sorted.len() - 1];
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let trimmed = &finite[1..finite.len() - 1];
     let sum: f64 = trimmed.iter().sum();
     #[expect(
         clippy::cast_precision_loss,
@@ -76,5 +77,14 @@ mod tests {
         assert_eq!(trimmed_mean(&[]), None);
         assert_eq!(trimmed_mean(&[100.0]), Some(100.0));
         assert_eq!(trimmed_mean(&[100.0, 200.0]), Some(150.0));
+    }
+
+    #[test]
+    fn trimmed_mean_discards_non_finite() {
+        // NaN and inf are dropped before trimming.
+        let v = trimmed_mean(&[900.0, f64::NAN, 50.0, 870.0, f64::INFINITY]).unwrap();
+        assert!(v.is_finite());
+        // all non-finite -> None
+        assert_eq!(trimmed_mean(&[f64::NAN, f64::INFINITY]), None);
     }
 }
