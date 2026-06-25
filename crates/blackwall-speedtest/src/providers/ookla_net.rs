@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
-use crate::throughput::mbps_from;
+use crate::throughput::{keep_downloading, mbps_from};
 
 use super::ookla_parse::{download_command, parse_hello, parse_servers};
 
@@ -18,8 +18,7 @@ use super::ookla_parse::{download_command, parse_hello, parse_servers};
 const MAX_OOKLA_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Server list URL for Ookla/speedtest.net.
-const SERVER_LIST_URL: &str =
-    "https://www.speedtest.net/api/js/servers.json?engine=js&https_functional=1&limit=5";
+const SERVER_LIST_URL: &str = "https://www.speedtest.net/api/js/servers?engine=js&limit=5";
 
 /// Speedtest provider backed by the Ookla/speedtest.net TCP protocol.
 pub struct OoklaProvider {
@@ -103,7 +102,7 @@ impl SpeedtestProvider for OoklaProvider {
                 break;
             }
             received = received.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
-            if received >= bytes {
+            if !keep_downloading(received, bytes, start.elapsed(), cfg.measure_window) {
                 break;
             }
         }

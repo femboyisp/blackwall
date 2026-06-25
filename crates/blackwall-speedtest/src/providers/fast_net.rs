@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
-use crate::throughput::mbps_from;
+use crate::throughput::{keep_downloading, mbps_from};
 
 use super::fast_parse::{api_url, extract_js_url, extract_token, parse_targets};
 
@@ -108,7 +108,12 @@ impl SpeedtestProvider for FastProvider {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| SpeedtestError::Http(e.to_string()))?;
             received += u64::try_from(chunk.len()).unwrap_or(0);
-            if received >= cfg.max_bytes {
+            if !keep_downloading(
+                received,
+                cfg.max_bytes,
+                dl_start.elapsed(),
+                cfg.measure_window,
+            ) {
                 break;
             }
         }

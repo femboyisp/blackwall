@@ -13,4 +13,4 @@ pub use error::SpeedtestError;
 pub use provider::{SpeedtestConfig, SpeedtestProvider};
 pub use reading::{Aggregate, ProviderReading};
 pub use runner::Speedtest;
-pub use throughput::{mbps_from, trimmed_mean};
+pub use throughput::{keep_downloading, mbps_from, trimmed_mean};
