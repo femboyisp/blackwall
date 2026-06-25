@@ -14,7 +14,7 @@ use crate::reading::ProviderReading;
 use crate::source::SpeedtestSource;
 use crate::throughput::{keep_downloading, mbps_from};
 
-use super::ookla_parse::{download_command, parse_hello, parse_servers};
+use super::ookla_parse::{download_command, parse_hello, parse_servers, upload_command};
 
 /// Maximum bytes to request in a single Ookla download (25 MiB).
 const MAX_OOKLA_BYTES: u64 = 25 * 1024 * 1024;
@@ -184,10 +184,49 @@ impl SpeedtestProvider for OoklaProvider {
 
         let download_mbps = mbps_from(received, elapsed);
 
+        // Open a fresh connection for the upload measurement; the post-download
+        // socket state is unreliable for reuse.
+        let upload_mbps = 'upload: {
+            let mut up_stream = match connect_bound(&server.host, &self.source).await {
+                Ok(s) => s,
+                Err(_) => break 'upload None,
+            };
+            // Perform HI/HELLO handshake on the new connection.
+            if up_stream.write_all(b"HI\n").await.is_err() {
+                break 'upload None;
+            }
+            if read_line(&mut up_stream).await.is_err() {
+                break 'upload None;
+            }
+            // Send the UPLOAD command.
+            let up_cmd = upload_command(bytes);
+            if up_stream.write_all(up_cmd.as_bytes()).await.is_err() {
+                break 'upload None;
+            }
+            // Write data until the time/byte window expires.
+            let up_start = Instant::now();
+            let buf = vec![0u8; 65536];
+            let mut sent: u64 = 0;
+            loop {
+                if let Err(err) = up_stream.write_all(&buf).await {
+                    tracing::debug!(%err, "ookla upload write failed");
+                    break 'upload None;
+                }
+                sent = sent.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+                if !keep_downloading(sent, bytes, up_start.elapsed(), cfg.measure_window) {
+                    break;
+                }
+            }
+            if sent == 0 {
+                break 'upload None;
+            }
+            Some(mbps_from(sent, up_start.elapsed()))
+        };
+
         Ok(ProviderReading {
             provider: self.name().to_owned(),
             download_mbps,
-            upload_mbps: None,
+            upload_mbps,
             latency_ms,
         })
     }
