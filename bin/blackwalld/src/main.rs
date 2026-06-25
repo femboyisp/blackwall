@@ -114,69 +114,82 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let registry = std::sync::Arc::new(default_registry(shared.current()));
 
             // TPROXY listener binds on port 61000 (ENGINE_TPROXY_PORT in blackwall-nft).
-            let listener = TproxyListener::bind("0.0.0.0:61000".parse()?)?;
-
-            let (tx, mut rx) = mpsc::channel(256);
-
-            // Spawn the async TPROXY accept loop (IPv4).
-            tokio::spawn(serve(
-                listener,
-                registry.clone(),
-                tx.clone(),
-                EngineLimits::default(),
-            ));
+            let listener_v4 = TproxyListener::bind("0.0.0.0:61000".parse()?)?;
 
             // Attempt to bind an IPv6 TPROXY listener for the ip6 tproxy nft rule.
-            match TproxyListener::bind("[::]:61000".parse()?) {
-                Ok(v6_listener) => {
-                    tokio::spawn(serve(
-                        v6_listener,
-                        registry.clone(),
-                        tx.clone(),
-                        EngineLimits::default(),
-                    ));
-                }
+            let listener_v6 = match TproxyListener::bind("[::]:61000".parse()?) {
+                Ok(v6_listener) => Some(v6_listener),
                 Err(err) => {
                     tracing::warn!(
                         %err,
                         "failed to bind IPv6 TPROXY listener on [::]:61000 \
                          (IPv6 may be disabled on this host); continuing with IPv4 only"
                     );
+                    None
                 }
+            };
+
+            let (tx, mut rx) = mpsc::channel(256);
+
+            let mut transports = tokio::task::JoinSet::new();
+            transports.spawn(serve(
+                listener_v4,
+                registry.clone(),
+                tx.clone(),
+                EngineLimits::default(),
+            ));
+            if let Some(v6) = listener_v6 {
+                transports.spawn(serve(
+                    v6,
+                    registry.clone(),
+                    tx.clone(),
+                    EngineLimits::default(),
+                ));
             }
-
-            // Drop the controller's tx so the drain loop terminates when both serve tasks exit.
-            drop(tx);
-
-            // Run the blocking NFQUEUE loop on a dedicated thread (queue 0).
-            tokio::task::spawn_blocking(|| {
-                if let Err(err) = run_nfqueue(0) {
-                    tracing::error!(%err, "nfqueue loop exited");
-                }
+            transports.spawn(async move {
+                // run_nfqueue is blocking/sync; run it on a blocking thread.
+                let _ = tokio::task::spawn_blocking(|| {
+                    if let Err(err) = run_nfqueue(0) {
+                        tracing::error!(%err, "nfqueue loop exited");
+                    }
+                })
+                .await;
             });
+
+            // Drop the controller's tx so the drain loop terminates when all serve clones are gone.
+            drop(tx);
 
             tracing::info!(
                 "deception engine running (TPROXY 0.0.0.0:61000 + [::]:61000, NFQUEUE 0)"
             );
 
-            // Drain the session channel, persisting each record.
-            while let Some(rec) = rx.recv().await {
-                let row = SessionRow {
-                    local_addr: rec.meta.local.ip(),
-                    local_port: rec.meta.local.port(),
-                    peer_addr: rec.meta.peer.ip(),
-                    proto: rec.meta.proto.to_string(),
-                    emulator: rec.emulator,
-                    bytes_in: i64::try_from(rec.outcome.bytes_in).unwrap_or(i64::MAX),
-                    bytes_out: i64::try_from(rec.outcome.bytes_out).unwrap_or(i64::MAX),
-                    note: rec.outcome.note,
-                };
-                if let Err(err) = store.record_session(&row).await {
-                    tracing::warn!(%err, "failed to record deception session");
+            let drain = async {
+                while let Some(rec) = rx.recv().await {
+                    let row = SessionRow {
+                        local_addr: rec.meta.local.ip(),
+                        local_port: rec.meta.local.port(),
+                        peer_addr: rec.meta.peer.ip(),
+                        proto: rec.meta.proto.to_string(),
+                        emulator: rec.emulator,
+                        bytes_in: i64::try_from(rec.outcome.bytes_in).unwrap_or(i64::MAX),
+                        bytes_out: i64::try_from(rec.outcome.bytes_out).unwrap_or(i64::MAX),
+                        note: rec.outcome.note,
+                    };
+                    if let Err(err) = store.record_session(&row).await {
+                        tracing::warn!(%err, "failed to record deception session");
+                    }
+                }
+            };
+
+            tokio::select! {
+                _ = drain => {
+                    tracing::warn!("session channel closed; all transports exited");
+                }
+                joined = transports.join_next() => {
+                    tracing::error!(?joined, "a transport task exited; shutting down");
                 }
             }
-
-            Ok(())
+            Err("deception engine transport exited".into())
         }
     }
 }
