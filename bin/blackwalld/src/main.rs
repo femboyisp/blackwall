@@ -14,6 +14,7 @@ use blackwall_speedtest::{Speedtest, SpeedtestConfig, SpeedtestProvider};
 use blackwall_state::SessionRow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 /// Blackwall deception firewall control binary.
 #[derive(Parser)]
@@ -74,6 +75,18 @@ enum Command {
         /// Path to the Incus unix socket.
         #[arg(long, default_value = "/var/lib/incus/unix.socket")]
         incus_socket: PathBuf,
+        /// How often (in seconds) to re-run the speedtest and re-apply Auto shaping rules.
+        ///
+        /// Defaults to 21600 (6 hours).  Only relevant when at least one shaping rule uses
+        /// `Auto` bandwidth.
+        #[arg(long, default_value_t = 21_600_u64)]
+        shape_interval_secs: u64,
+        /// LibreSpeed backend server URL used when running speedtests for Auto shaping rules.
+        ///
+        /// Defaults to `https://lon.speedtest.clouvider.net`.  Pass a different URL to test
+        /// against your own LibreSpeed deployment.
+        #[arg(long, default_value = "https://lon.speedtest.clouvider.net")]
+        librespeed_server: String,
     },
 }
 
@@ -156,6 +169,119 @@ async fn build_discovered(
     discovered
 }
 
+/// Build the four speedtest providers used for Auto shaping rules.
+///
+/// Returns a `Vec<Arc<dyn SpeedtestProvider>>` containing Cloudflare, LibreSpeed (at
+/// `librespeed_server`), Fast.com, and Ookla, in that order.
+fn build_speedtest_providers(librespeed_server: &str) -> Vec<Arc<dyn SpeedtestProvider>> {
+    vec![
+        Arc::new(CloudflareProvider::new()),
+        Arc::new(LibreSpeedProvider::new(librespeed_server.to_owned())),
+        Arc::new(FastProvider::new()),
+        Arc::new(OoklaProvider::new()),
+    ]
+}
+
+/// Apply CAKE shaping derived from `policy.shaping`.
+///
+/// For rules where both directions are `Fixed`, the plan is computed and applied synchronously.
+/// For rules containing any `Auto` direction a speedtest is run first, then the plan is applied.
+/// After the initial apply a detached `tokio::spawn` loop re-tunes every `interval_secs`
+/// seconds; failures inside that loop are logged as warnings and never propagate to the caller.
+async fn apply_shaping(
+    policy: &blackwall_core::Policy,
+    librespeed_server: String,
+    interval_secs: u64,
+) {
+    use blackwall_core::ShapeBandwidth;
+    use std::time::Duration;
+
+    for (i, rule) in policy.shaping.iter().enumerate() {
+        let ifb = format!("ifb{i}");
+        let needs_speedtest = matches!(rule.download, ShapeBandwidth::Auto)
+            || matches!(rule.upload, ShapeBandwidth::Auto);
+
+        if needs_speedtest {
+            // Run an initial speedtest and apply the plan.
+            let providers = build_speedtest_providers(&librespeed_server);
+            let runner = Speedtest::new(providers);
+            match runner.run(&SpeedtestConfig::default()).await {
+                Err(err) => {
+                    tracing::warn!(%err, iface = rule.iface, "initial speedtest failed; skipping Auto shaping for this rule");
+                }
+                Ok(aggregate) => match blackwall_shaper::plan_for(rule, Some(&aggregate)) {
+                    Err(err) => {
+                        tracing::warn!(%err, iface = rule.iface, "plan_for failed; skipping Auto shaping for this rule");
+                    }
+                    Ok(plan) => {
+                        tracing::info!(
+                            iface = %plan.iface,
+                            ingress_mbit = plan.ingress_mbit,
+                            egress_mbit = plan.egress_mbit,
+                            "applying CAKE shaping (Auto)"
+                        );
+                        if let Err(err) = blackwall_shaper::apply(&plan, &ifb) {
+                            tracing::warn!(%err, iface = rule.iface, "shaper apply failed");
+                        }
+                    }
+                },
+            }
+
+            // Spawn a detached re-tune loop; failures never affect the engine.
+            let rule_clone = rule.clone();
+            let librespeed_clone = librespeed_server.clone();
+            tokio::spawn(async move {
+                loop {
+                    sleep(Duration::from_secs(interval_secs)).await;
+                    let providers = build_speedtest_providers(&librespeed_clone);
+                    let runner = Speedtest::new(providers);
+                    match runner.run(&SpeedtestConfig::default()).await {
+                        Err(err) => {
+                            tracing::warn!(%err, iface = rule_clone.iface, "re-tune speedtest failed; keeping previous shaping");
+                        }
+                        Ok(aggregate) => {
+                            match blackwall_shaper::plan_for(&rule_clone, Some(&aggregate)) {
+                                Err(err) => {
+                                    tracing::warn!(%err, iface = rule_clone.iface, "re-tune plan_for failed; keeping previous shaping");
+                                }
+                                Ok(plan) => {
+                                    tracing::info!(
+                                        iface = %plan.iface,
+                                        ingress_mbit = plan.ingress_mbit,
+                                        egress_mbit = plan.egress_mbit,
+                                        "re-applied CAKE shaping (Auto)"
+                                    );
+                                    if let Err(err) = blackwall_shaper::apply(&plan, &ifb) {
+                                        tracing::warn!(%err, iface = rule_clone.iface, "re-tune shaper apply failed; keeping previous shaping");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        } else {
+            // Both directions are Fixed; apply once, no speedtest needed.
+            match blackwall_shaper::plan_for(rule, None) {
+                Err(err) => {
+                    tracing::warn!(%err, iface = rule.iface, "plan_for failed for Fixed shaping rule");
+                }
+                Ok(plan) => {
+                    tracing::info!(
+                        iface = %plan.iface,
+                        ingress_mbit = plan.ingress_mbit,
+                        egress_mbit = plan.egress_mbit,
+                        "applying CAKE shaping (Fixed)"
+                    );
+                    if let Err(err) = blackwall_shaper::apply(&plan, &ifb) {
+                        tracing::warn!(%err, iface = rule.iface, "shaper apply failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Core dispatch logic; returns `Err` on any failure.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -224,6 +350,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             banners,
             discover_host,
             incus_socket,
+            shape_interval_secs,
+            librespeed_server,
         } => {
             // TPROXY and NFQUEUE both require CAP_NET_ADMIN; warn unconditionally
             // so the operator knows what is needed even before a bind failure.
@@ -378,6 +506,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
+
+            // Apply CAKE shaping for each rule in policy.shaping.
+            // Rules with both directions Fixed are applied once; any rule with an Auto direction
+            // runs an initial speedtest and then spawns a detached re-tune loop.
+            apply_shaping(&policy, librespeed_server, shape_interval_secs).await;
 
             // Drop the controller's tx so the drain loop terminates when all serve clones are gone.
             drop(tx);
