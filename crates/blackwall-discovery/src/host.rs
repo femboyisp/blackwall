@@ -104,4 +104,85 @@ mod tests {
         let bad = "header\n   0: 057100CB:ZZZZ 00000000:0000 0A x x x x x x 1\n";
         assert!(parse_proc_net(bad, L4Proto::Tcp, false).is_err());
     }
+
+    // UDP: remote address word = 00000000 means UNCONN (listening).
+    // 0.0.0.0 = 00000000. Port 5353 = 14E9.
+    const UDP_FIXTURE: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 99 1 0000 100
+   1: 00000000:14E9 01020304:1234 07 00000000:00000000 00:00000000 00000000     0        0 100 1 0000 100
+";
+
+    #[test]
+    fn parses_udp_unconn_only() {
+        let socks = parse_proc_net(UDP_FIXTURE, L4Proto::Udp, false).expect("parse");
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].proto, L4Proto::Udp);
+        assert_eq!(socks[0].port, 0x14E9);
+    }
+
+    // IPv6: ::1 in /proc/net/tcp6 is stored as one 32-bit word per group.
+    // 00000000000000000000000001000000 represents ::1 in little-endian groups.
+    const TCP6_FIXTURE: &str = "\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000001000000:0050 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 0 1 0000 100
+";
+
+    #[test]
+    fn parses_ipv6_listening_tcp() {
+        let socks = parse_proc_net(TCP6_FIXTURE, L4Proto::Tcp, true).expect("parse");
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].port, 80);
+        assert_eq!(socks[0].addr, "::1".parse::<IpAddr>().unwrap());
+    }
+
+    // IPv6 UDP with 32-char hex remote word = unconn.
+    const UDP6_FIXTURE: &str = "\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000001000000:14E9 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 0 0 0 1 0000 100
+";
+
+    #[test]
+    fn parses_ipv6_udp_unconn() {
+        let socks = parse_proc_net(UDP6_FIXTURE, L4Proto::Udp, true).expect("parse");
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].proto, L4Proto::Udp);
+    }
+
+    #[test]
+    fn skips_short_lines() {
+        // A line with fewer than 4 whitespace-separated columns is silently skipped.
+        let input = "header\ntoo short\n";
+        let socks = parse_proc_net(input, L4Proto::Tcp, false).expect("parse");
+        assert_eq!(socks.len(), 0);
+    }
+
+    #[test]
+    fn rejects_bad_local_address_format() {
+        // No colon separator between addr and port.
+        let bad = "header\n   0: NOCOLON 00000000:0000 0A x x x x x x 1\n";
+        assert!(parse_proc_net(bad, L4Proto::Tcp, false).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_ipv4_hex() {
+        // Non-hex characters in address field.
+        let bad = "header\n   0: ZZZZZZZZ:01BB 00000000:0000 0A x x x x x x 1\n";
+        assert!(parse_proc_net(bad, L4Proto::Tcp, false).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_ipv6_length() {
+        // Address field is not exactly 32 hex chars.
+        let bad =
+            "header\n   0: DEADBEEF:01BB 00000000000000000000000000000000:0000 0A x x x x x x 1\n";
+        assert!(parse_proc_net(bad, L4Proto::Tcp, true).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_ipv6_word() {
+        // 32 chars but with invalid hex.
+        let bad = "header\n   0: ZZZZZZZZ000000000000000000000000:01BB 00000000000000000000000000000000:0000 0A x x x x x x 1\n";
+        assert!(parse_proc_net(bad, L4Proto::Tcp, true).is_err());
+    }
 }
