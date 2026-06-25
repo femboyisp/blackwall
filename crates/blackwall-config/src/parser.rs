@@ -3,7 +3,9 @@
 
 use crate::error::ConfigError;
 use crate::lexer::Line;
-use blackwall_core::{AllowRule, L4Proto, Policy, PortState, ServiceTarget, Tenant};
+use blackwall_core::{
+    AllowRule, L4Proto, Policy, PortState, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
+};
 use std::net::{IpAddr, SocketAddr};
 
 /// Parse pre-lexed lines into a [`Policy`].
@@ -12,6 +14,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut prefixes = Vec::new();
     let mut default_state = PortState::Deception;
     let mut tenants = Vec::new();
+    let mut shaping = Vec::new();
 
     let mut i = 0;
     while i < lines.len() {
@@ -46,6 +49,9 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 i = next;
                 continue;
             }
+            "shape" => {
+                shaping.push(parse_shape(line)?);
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -68,7 +74,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         prefixes,
         default_state,
         tenants,
-        shaping: Vec::new(),
+        shaping,
     })
 }
 
@@ -190,6 +196,112 @@ fn parse_cidr(line: &Line, raw: &str) -> Result<ipnet::IpNet, ConfigError> {
         line: line.number,
         what: "cidr",
         value: raw.to_owned(),
+    })
+}
+
+fn parse_mbit(line: &Line, token: &str) -> Result<u32, ConfigError> {
+    token
+        .strip_suffix("mbit")
+        .and_then(|n| n.parse::<u32>().ok())
+        .ok_or_else(|| ConfigError::BadValue {
+            line: line.number,
+            what: "bandwidth",
+            value: token.to_owned(),
+        })
+}
+
+fn parse_ms(line: &Line, token: &str) -> Result<u32, ConfigError> {
+    token
+        .strip_suffix("ms")
+        .and_then(|n| n.parse::<u32>().ok())
+        .ok_or_else(|| ConfigError::BadValue {
+            line: line.number,
+            what: "rtt",
+            value: token.to_owned(),
+        })
+}
+
+/// Parse `shape <iface> (auto | bandwidth <N>mbit) [up (auto | <N>mbit)] [rtt <N>ms]`.
+fn parse_shape(line: &Line) -> Result<ShapeRule, ConfigError> {
+    // words[0] = "shape", words[1] = iface, words[2] = "auto"|"bandwidth"
+    if line.words.len() < 3 {
+        return Err(ConfigError::UnexpectedToken {
+            line: line.number,
+            found: line.words.join(" "),
+            expected: "shape <iface> (auto | bandwidth <N>mbit) [up (auto | <N>mbit)] [rtt <N>ms]",
+        });
+    }
+    let iface = line.words[1].clone();
+
+    let (download, mut idx) = match line.words[2].as_str() {
+        "auto" => (ShapeBandwidth::Auto, 3),
+        "bandwidth" => {
+            if line.words.len() < 4 {
+                return Err(ConfigError::UnexpectedToken {
+                    line: line.number,
+                    found: line.words.join(" "),
+                    expected: "bandwidth <N>mbit",
+                });
+            }
+            let bw = parse_mbit(line, &line.words[3])?;
+            (ShapeBandwidth::Fixed(bw), 4)
+        }
+        other => {
+            return Err(ConfigError::BadValue {
+                line: line.number,
+                what: "bandwidth mode",
+                value: other.to_owned(),
+            })
+        }
+    };
+
+    let mut upload: Option<ShapeBandwidth> = None;
+    let mut rtt_ms: Option<u32> = None;
+
+    while idx < line.words.len() {
+        match line.words[idx].as_str() {
+            "up" => {
+                idx += 1;
+                if idx >= line.words.len() {
+                    return Err(ConfigError::UnexpectedToken {
+                        line: line.number,
+                        found: line.words.join(" "),
+                        expected: "up (auto | <N>mbit)",
+                    });
+                }
+                upload = Some(match line.words[idx].as_str() {
+                    "auto" => ShapeBandwidth::Auto,
+                    token => ShapeBandwidth::Fixed(parse_mbit(line, token)?),
+                });
+                idx += 1;
+            }
+            "rtt" => {
+                idx += 1;
+                if idx >= line.words.len() {
+                    return Err(ConfigError::UnexpectedToken {
+                        line: line.number,
+                        found: line.words.join(" "),
+                        expected: "rtt <N>ms",
+                    });
+                }
+                rtt_ms = Some(parse_ms(line, &line.words[idx])?);
+                idx += 1;
+            }
+            other => {
+                return Err(ConfigError::UnexpectedToken {
+                    line: line.number,
+                    found: other.to_owned(),
+                    expected: "up | rtt",
+                });
+            }
+        }
+    }
+
+    Ok(ShapeRule {
+        iface,
+        download,
+        upload: upload.unwrap_or(download),
+        rtt_ms,
     })
 }
 
@@ -411,6 +523,38 @@ tenant t {
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn parses_shape_auto() {
+        let p = parse_text("interface wan eth0\nshape eth0 auto\n").unwrap();
+        assert_eq!(p.shaping.len(), 1);
+        let s = &p.shaping[0];
+        assert_eq!(s.iface, "eth0");
+        assert_eq!(s.download, blackwall_core::ShapeBandwidth::Auto);
+        assert_eq!(s.upload, blackwall_core::ShapeBandwidth::Auto);
+    }
+
+    #[test]
+    fn parses_shape_fixed_with_up_and_rtt() {
+        let p = parse_text("interface wan eth0\nshape eth0 auto up 50mbit rtt 50ms\n").unwrap();
+        let s = &p.shaping[0];
+        assert_eq!(s.download, blackwall_core::ShapeBandwidth::Auto);
+        assert_eq!(s.upload, blackwall_core::ShapeBandwidth::Fixed(50));
+        assert_eq!(s.rtt_ms, Some(50));
+    }
+
+    #[test]
+    fn parses_shape_bandwidth_symmetric() {
+        let p = parse_text("interface wan eth0\nshape eth0 bandwidth 1000mbit\n").unwrap();
+        let s = &p.shaping[0];
+        assert_eq!(s.download, blackwall_core::ShapeBandwidth::Fixed(1000));
+        assert_eq!(s.upload, blackwall_core::ShapeBandwidth::Fixed(1000));
+    }
+
+    #[test]
+    fn rejects_bad_shape_bandwidth() {
+        assert!(parse_text("interface wan eth0\nshape eth0 bandwidth lots\n").is_err());
     }
 
     #[test]
