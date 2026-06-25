@@ -2,6 +2,7 @@
 //! with realistic, interactive protocol emulators.
 
 mod banner;
+mod banner_reload;
 mod conn;
 mod emulator;
 mod error;
@@ -10,6 +11,7 @@ pub mod emulators;
 pub mod transport;
 
 pub use banner::BannerStore;
+pub use banner_reload::SharedBanners;
 pub use conn::{AsyncStream, DeceptionConn, DeceptionMeta};
 pub use emulator::{EmulatorOutcome, EmulatorRegistry, ServiceEmulator};
 pub use error::DeceptionError;
