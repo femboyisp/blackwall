@@ -7,11 +7,12 @@ repository.workspace = true
 
 [dependencies]
 blackwall-core = { path = "../blackwall-core" }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "sync"] }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 arc-swap = { workspace = true }
+socket2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
