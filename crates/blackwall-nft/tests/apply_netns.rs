@@ -22,6 +22,7 @@ fn sample() -> Policy {
                 target: ServiceTarget::Host,
             }],
         }],
+        shaping: Vec::new(),
     }
 }
 
@@ -67,6 +68,7 @@ fn stale_set_elements_removed_on_second_apply() {
         prefixes: vec!["203.0.113.0/24".parse().expect("prefix")],
         default_state: PortState::Deception,
         tenants: vec![],
+        shaping: Vec::new(),
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 
