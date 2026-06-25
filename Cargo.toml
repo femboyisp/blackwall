@@ -26,6 +26,7 @@ socket2 = { version = "0.5.10", features = ["all"] }
 etherparse = "0.20.2"
 nfq = "0.2.5"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures-util = "0.3.32"
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
