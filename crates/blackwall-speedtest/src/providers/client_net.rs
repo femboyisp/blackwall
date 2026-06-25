@@ -7,7 +7,6 @@ use crate::source::SpeedtestSource;
 ///
 /// Falls back to a default client if the builder fails (e.g. an interface that
 /// cannot be bound without privileges) so a measurement is still attempted.
-#[expect(dead_code, reason = "called by providers added in subsequent tasks")]
 pub fn build_client(source: &SpeedtestSource) -> reqwest::Client {
     let builder = match source {
         SpeedtestSource::Default => reqwest::Client::builder(),

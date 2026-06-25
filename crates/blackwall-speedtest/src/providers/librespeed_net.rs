@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
+use crate::source::SpeedtestSource;
 use crate::throughput::{keep_downloading, mbps_from};
 
 use super::librespeed_parse::{download_url, ping_url, upload_url};
@@ -25,11 +26,16 @@ pub struct LibreSpeedProvider {
 }
 
 impl LibreSpeedProvider {
-    /// Create a new [`LibreSpeedProvider`] pointed at `server`.
+    /// Create a [`LibreSpeedProvider`] pointed at `server` using the host's default route.
     pub fn new(server: impl Into<String>) -> Self {
+        Self::with_source(server.into(), SpeedtestSource::Default)
+    }
+
+    /// Create a [`LibreSpeedProvider`] pointed at `server` whose connections bind to `source`.
+    pub fn with_source(server: String, source: SpeedtestSource) -> Self {
         LibreSpeedProvider {
-            client: reqwest::Client::new(),
-            server: server.into(),
+            client: super::build_client(&source),
+            server,
         }
     }
 }

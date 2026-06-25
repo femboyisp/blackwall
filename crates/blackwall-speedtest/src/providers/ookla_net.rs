@@ -3,6 +3,7 @@
 //! All parsing lives in [`super::ookla_parse`]; all math in [`crate::throughput::mbps_from`].
 
 use async_trait::async_trait;
+use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -10,6 +11,7 @@ use tokio::net::TcpStream;
 use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
+use crate::source::SpeedtestSource;
 use crate::throughput::{keep_downloading, mbps_from};
 
 use super::ookla_parse::{download_command, parse_hello, parse_servers};
@@ -23,13 +25,23 @@ const SERVER_LIST_URL: &str = "https://www.speedtest.net/api/js/servers?engine=j
 /// Speedtest provider backed by the Ookla/speedtest.net TCP protocol.
 pub struct OoklaProvider {
     client: reqwest::Client,
+    source: SpeedtestSource,
 }
 
 impl OoklaProvider {
-    /// Create a new [`OoklaProvider`] with a default [`reqwest::Client`].
+    /// Create an [`OoklaProvider`] using the host's default route.
     pub fn new() -> Self {
+        Self::with_source(SpeedtestSource::Default)
+    }
+
+    /// Create an [`OoklaProvider`] whose connections bind to `source`.
+    ///
+    /// The HTTP client used to fetch the server list is also bound to `source`.
+    /// The raw TCP measurement connection is bound via [`connect_bound`].
+    pub fn with_source(source: SpeedtestSource) -> Self {
         OoklaProvider {
-            client: reqwest::Client::new(),
+            client: super::build_client(&source),
+            source,
         }
     }
 }
@@ -38,6 +50,63 @@ impl Default for OoklaProvider {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Resolve `host` (e.g. `"host:port"`) to a single [`SocketAddr`].
+async fn resolve_one(host: &str) -> Result<SocketAddr, SpeedtestError> {
+    tokio::net::lookup_host(host)
+        .await
+        .map_err(|e| SpeedtestError::Http(e.to_string()))?
+        .next()
+        .ok_or(SpeedtestError::NoResult)
+}
+
+/// Connect to `host` and bind the local side according to `source`.
+async fn connect_bound(host: &str, source: &SpeedtestSource) -> Result<TcpStream, SpeedtestError> {
+    match source {
+        SpeedtestSource::Default => TcpStream::connect(host)
+            .await
+            .map_err(|e| SpeedtestError::Http(e.to_string())),
+        SpeedtestSource::Ip(ip) => {
+            let addr = resolve_one(host).await?;
+            let sock = if ip.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()
+            } else {
+                tokio::net::TcpSocket::new_v6()
+            }
+            .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+            sock.bind(SocketAddr::new(*ip, 0))
+                .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+            sock.connect(addr)
+                .await
+                .map_err(|e| SpeedtestError::Http(e.to_string()))
+        }
+        SpeedtestSource::Iface(name) => connect_bound_device(host, name).await,
+    }
+}
+
+/// Connect to `host` binding the socket to network interface `iface_name`
+/// via `SO_BINDTODEVICE` (Linux; requires `CAP_NET_RAW`).
+///
+/// Uses a blocking `socket2` connect then converts to a tokio `TcpStream`.
+async fn connect_bound_device(host: &str, iface_name: &str) -> Result<TcpStream, SpeedtestError> {
+    let addr = resolve_one(host).await?;
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)
+        .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+    sock.bind_device(Some(iface_name.as_bytes()))
+        .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+    // Blocking connect; acceptable for a one-shot measurement.
+    sock.connect(&addr.into())
+        .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+    sock.set_nonblocking(true)
+        .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+    let std_stream: std::net::TcpStream = sock.into();
+    TcpStream::from_std(std_stream).map_err(|e| SpeedtestError::Http(e.to_string()))
 }
 
 #[async_trait]
@@ -50,7 +119,8 @@ impl SpeedtestProvider for OoklaProvider {
     ///
     /// Fetches the server list, connects to the first server, performs the
     /// `HI`/`DOWNLOAD` handshake, and times the transfer. Download is capped
-    /// at `min(cfg.max_bytes, 25 MiB)`.
+    /// at `min(cfg.max_bytes, 25 MiB)`. The TCP connection is bound to
+    /// the provider's configured [`SpeedtestSource`].
     async fn measure(&self, cfg: &SpeedtestConfig) -> Result<ProviderReading, SpeedtestError> {
         // Fetch and parse the server list.
         let json = self
@@ -66,10 +136,8 @@ impl SpeedtestProvider for OoklaProvider {
         let servers = parse_servers(&json)?;
         let server = servers.into_iter().next().ok_or(SpeedtestError::NoResult)?;
 
-        // Connect via raw TCP.
-        let mut stream = TcpStream::connect(&server.host)
-            .await
-            .map_err(|e| SpeedtestError::Http(e.to_string()))?;
+        // Connect via raw TCP, bound to the configured source.
+        let mut stream = connect_bound(&server.host, &self.source).await?;
 
         // Send HI greeting and time the HELLO response as latency.
         let hi_start = Instant::now();
