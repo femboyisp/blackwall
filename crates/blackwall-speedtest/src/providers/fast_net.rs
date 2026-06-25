@@ -9,6 +9,7 @@ use std::time::Instant;
 use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
+use crate::source::SpeedtestSource;
 use crate::throughput::{keep_downloading, mbps_from};
 
 use super::fast_parse::{api_url, extract_js_url, extract_token, parse_targets};
@@ -22,10 +23,15 @@ pub struct FastProvider {
 }
 
 impl FastProvider {
-    /// Create a new [`FastProvider`] with a default [`reqwest::Client`].
+    /// Create a [`FastProvider`] using the host's default route.
     pub fn new() -> Self {
+        Self::with_source(SpeedtestSource::Default)
+    }
+
+    /// Create a [`FastProvider`] whose connections bind to `source`.
+    pub fn with_source(source: SpeedtestSource) -> Self {
         FastProvider {
-            client: reqwest::Client::new(),
+            client: super::build_client(&source),
         }
     }
 }

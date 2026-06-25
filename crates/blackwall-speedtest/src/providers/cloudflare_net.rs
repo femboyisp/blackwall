@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
+use crate::source::SpeedtestSource;
 use crate::throughput::{keep_downloading, mbps_from};
 
 use super::cloudflare_parse::{download_url, server_timing_latency, upload_url};
@@ -24,10 +25,15 @@ pub struct CloudflareProvider {
 }
 
 impl CloudflareProvider {
-    /// Create a new [`CloudflareProvider`] with a default [`reqwest::Client`].
+    /// Create a [`CloudflareProvider`] using the host's default route.
     pub fn new() -> Self {
+        Self::with_source(SpeedtestSource::Default)
+    }
+
+    /// Create a [`CloudflareProvider`] whose connections bind to `source`.
+    pub fn with_source(source: SpeedtestSource) -> Self {
         CloudflareProvider {
-            client: reqwest::Client::new(),
+            client: super::build_client(&source),
         }
     }
 }
