@@ -1,5 +1,10 @@
 //! Pure parsing helpers for the Cloudflare provider.
 
+/// The Cloudflare upload (POST) endpoint.
+pub fn upload_url() -> String {
+    "https://speed.cloudflare.com/__up".to_owned()
+}
+
 /// Build the Cloudflare download URL for `bytes`.
 pub fn download_url(bytes: u64) -> String {
     format!("https://speed.cloudflare.com/__down?bytes={bytes}")
@@ -26,6 +31,11 @@ pub fn server_timing_latency(header: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_upload_url() {
+        assert_eq!(upload_url(), "https://speed.cloudflare.com/__up");
+    }
 
     #[test]
     fn builds_download_url() {
