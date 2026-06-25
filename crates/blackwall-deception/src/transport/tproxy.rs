@@ -4,12 +4,13 @@
 use crate::conn::{AsyncStream, DeceptionConn, DeceptionMeta};
 use crate::emulator::{EmulatorOutcome, EmulatorRegistry};
 use crate::error::DeceptionError;
+use crate::limits::EngineLimits;
 use blackwall_core::L4Proto;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 /// A TPROXY-enabled TCP listener that preserves the original destination address
 /// of each diverted connection.
@@ -77,21 +78,32 @@ pub async fn serve(
     listener: TproxyListener,
     registry: Arc<EmulatorRegistry>,
     sessions: mpsc::Sender<SessionRecord>,
+    limits: EngineLimits,
 ) {
+    let permits = Arc::new(Semaphore::new(limits.max_concurrent));
     loop {
         match listener.accept().await {
             Ok((stream, meta)) => {
+                let permit = match permits.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::debug!(port = meta.local.port(), "at connection cap; dropping");
+                        continue;
+                    }
+                };
                 let registry = registry.clone();
                 let sessions = sessions.clone();
+                let timeout = limits.session_timeout;
                 tokio::spawn(async move {
+                    let _permit = permit; // released when the task ends
                     let emulator = registry.for_port(meta.local.port());
                     let name = emulator.name().to_owned();
                     let conn = DeceptionConn {
                         stream: Box::new(stream) as Box<dyn AsyncStream>,
                         meta,
                     };
-                    match emulator.handle(conn).await {
-                        Ok(outcome) => {
+                    match tokio::time::timeout(timeout, emulator.handle(conn)).await {
+                        Ok(Ok(outcome)) => {
                             let _ = sessions
                                 .send(SessionRecord {
                                     meta,
@@ -100,12 +112,11 @@ pub async fn serve(
                                 })
                                 .await;
                         }
-                        Err(err) => {
-                            tracing::debug!(
-                                %err,
-                                port = meta.local.port(),
-                                "emulator error",
-                            );
+                        Ok(Err(err)) => {
+                            tracing::debug!(%err, port = meta.local.port(), "emulator error");
+                        }
+                        Err(_) => {
+                            tracing::debug!(port = meta.local.port(), "session timed out");
                         }
                     }
                 });

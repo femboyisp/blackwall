@@ -6,6 +6,7 @@ mod banner_reload;
 mod conn;
 mod emulator;
 mod error;
+mod limits;
 
 pub mod emulators;
 pub mod transport;
@@ -16,6 +17,7 @@ pub use conn::{AsyncStream, DeceptionConn, DeceptionMeta};
 pub use emulator::{EmulatorOutcome, EmulatorRegistry, ServiceEmulator};
 pub use emulators::{GenericBannerEmulator, HttpEmulator};
 pub use error::DeceptionError;
+pub use limits::EngineLimits;
 
 use std::sync::Arc;
 
