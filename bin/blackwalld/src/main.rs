@@ -118,8 +118,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let (tx, mut rx) = mpsc::channel(256);
 
-            // Spawn the async TPROXY accept loop.
-            tokio::spawn(serve(listener, registry, tx));
+            // Spawn the async TPROXY accept loop (IPv4).
+            tokio::spawn(serve(listener, registry.clone(), tx.clone()));
+
+            // Attempt to bind an IPv6 TPROXY listener for the ip6 tproxy nft rule.
+            match TproxyListener::bind("[::]:61000".parse()?) {
+                Ok(v6_listener) => {
+                    tokio::spawn(serve(v6_listener, registry.clone(), tx.clone()));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "failed to bind IPv6 TPROXY listener on [::]:61000 \
+                         (IPv6 may be disabled on this host); continuing with IPv4 only"
+                    );
+                }
+            }
+
+            // Drop the controller's tx so the drain loop terminates when both serve tasks exit.
+            drop(tx);
 
             // Run the blocking NFQUEUE loop on a dedicated thread (queue 0).
             tokio::task::spawn_blocking(|| {
@@ -128,7 +145,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            tracing::info!("deception engine running (TPROXY :61000, NFQUEUE 0)");
+            tracing::info!(
+                "deception engine running (TPROXY 0.0.0.0:61000 + [::]:61000, NFQUEUE 0)"
+            );
 
             // Drain the session channel, persisting each record.
             while let Some(rec) = rx.recv().await {
