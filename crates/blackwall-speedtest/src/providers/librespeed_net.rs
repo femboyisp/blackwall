@@ -91,6 +91,7 @@ impl LibreSpeedProvider {
             .map_err(|e| SpeedtestError::Http(e.to_string()))?;
         let elapsed = upload_start.elapsed();
 
+        // Note: `sent` counts bytes generated into the body stream (a close proxy for transmitted); on a timeout-abort some buffered bytes may not have hit the wire.
         let total = sent.load(Ordering::Relaxed);
         Ok(mbps_from(total, elapsed))
     }
