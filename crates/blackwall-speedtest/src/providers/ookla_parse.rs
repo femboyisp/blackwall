@@ -31,6 +31,11 @@ pub fn download_command(bytes: u64) -> String {
     format!("DOWNLOAD {bytes}\n")
 }
 
+/// The Ookla `UPLOAD` command requesting the server accept `bytes` bytes.
+pub fn upload_command(bytes: u64) -> String {
+    format!("UPLOAD {bytes}\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +56,10 @@ mod tests {
     #[test]
     fn builds_download_command() {
         assert_eq!(download_command(1000), "DOWNLOAD 1000\n");
+    }
+
+    #[test]
+    fn builds_upload_command() {
+        assert_eq!(upload_command(2048), "UPLOAD 2048\n");
     }
 }
