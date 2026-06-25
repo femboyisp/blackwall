@@ -550,4 +550,43 @@ mod tests {
         let e = NftError::Apply("permission denied".to_owned());
         assert!(e.to_string().contains("permission denied"));
     }
+
+    #[test]
+    fn open_default_state_sets_chain_policy_to_accept() {
+        let mut policy = sample();
+        policy.default_state = PortState::Open;
+        let ruleset = render(&policy).expect("render");
+        let chain = match &ruleset.objects[4] {
+            NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(c))) => c,
+            other => panic!("expected chain, got {other:?}"),
+        };
+        assert_eq!(chain.policy, Some(NfChainPolicy::Accept));
+    }
+
+    #[test]
+    fn renders_multiple_prefixes_produces_tproxy_and_queue_per_prefix() {
+        let mut policy = sample();
+        policy.prefixes = vec![
+            "203.0.113.0/24".parse().unwrap(),
+            "198.51.100.0/24".parse().unwrap(),
+        ];
+        let ruleset = render(&policy).expect("render");
+        // 2 accept rules (real_v4, real_v6) + 2 tproxy rules + 2 queue rules = 6 rules
+        // plus table, flush-table, real_v4, real_v6, chain = 5 structural → 11 total
+        assert_eq!(ruleset.objects.len(), 11);
+    }
+
+    #[test]
+    fn empty_tenant_list_produces_empty_sets() {
+        let policy = Policy {
+            interface: "eth0".to_owned(),
+            prefixes: vec!["203.0.113.0/24".parse().expect("prefix")],
+            default_state: PortState::Deception,
+            tenants: vec![],
+        };
+        let ruleset = render(&policy).expect("render empty");
+        // No resolved services, so real_v4 and real_v6 sets are empty.
+        // Objects: table + flush + real_v4 + real_v6 + chain + 2 accept + 1 tproxy + 1 queue = 9
+        assert_eq!(ruleset.objects.len(), 9);
+    }
 }

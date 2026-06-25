@@ -15,4 +15,12 @@ All notable changes to this project are documented here, following
 - nftables kernel application via the `nftables` crate (`blackwall-nft::apply`).
 - `blackwalld` CLI with `render` and `apply` subcommands wiring config, state, and nftables.
 - Coverage gate: ≥ 90% line coverage enforced via `cargo llvm-cov --fail-under-lines 90`.
-- Deception engine (`blackwall-deception`): TPROXY-terminated interactive emulators (HTTP, generic/tarpit), NFQUEUE ICMP responder, session audit, and `blackwalld run`.
+- Deception engine (`blackwall-deception`): `ServiceEmulator` framework + `EmulatorRegistry` dispatch.
+- HTTP emulator: captures request line, returns configurable fake response.
+- Generic/tarpit emulator: sends port-appropriate banner from `BannerStore`, optional tarpit delay.
+- Banner store + hot-reload: `BannerStore::from_text`, `SharedBanners`, inotify-backed `watch_banners` hot-reload.
+- TPROXY transport: `TproxyListener::bind` + `serve` loop terminating real TCP connections transparently.
+- NFQUEUE transport + ICMP responders: `run_nfqueue` loop; ICMPv4/v6 echo-reply packet builders.
+- Session persistence: `SessionRow` + `Store::record_session` audit table in `blackwall-state`.
+- nftables enforcement: real TPROXY and NFQUEUE redirect rules replace M1 placeholder (`blackwall-nft::render`).
+- `blackwalld run` subcommand: wires TPROXY listener, NFQUEUE loop, banner hot-reload, and session drain.

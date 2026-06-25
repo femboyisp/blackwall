@@ -226,4 +226,60 @@ mod tests {
             "TCP packet should return None"
         );
     }
+
+    #[test]
+    fn non_echo_icmpv4_returns_none() {
+        // Build an ICMPv4 EchoReply (not EchoRequest) and feed it to icmp_echo_reply.
+        // The function must return None because the type is not EchoRequest.
+        let echo = IcmpEchoHeader { id: 1, seq: 1 };
+        let icmp = Icmpv4Header::with_checksum(Icmpv4Type::EchoReply(echo), b"");
+        let payload_len = u16::try_from(icmp.header_len()).unwrap();
+        let mut ip =
+            Ipv4Header::new(payload_len, 64, IpNumber::ICMP, [1, 2, 3, 4], [5, 6, 7, 8]).unwrap();
+        ip.header_checksum = ip.calc_header_checksum();
+        let mut pkt = Vec::new();
+        ip.write(&mut pkt).unwrap();
+        icmp.write(&mut pkt).unwrap();
+        assert!(
+            icmp_echo_reply(&pkt).is_none(),
+            "EchoReply packet should return None for icmp_echo_reply"
+        );
+    }
+
+    #[test]
+    fn ipv4_packet_returns_none_for_icmpv6() {
+        // An IPv4 packet fed into icmpv6_echo_reply must return None (no IPv6 header).
+        let request = build_icmpv4_request([1, 2, 3, 4], [5, 6, 7, 8], 1, 1, b"");
+        assert!(
+            icmpv6_echo_reply(&request).is_none(),
+            "IPv4 packet should return None for icmpv6_echo_reply"
+        );
+    }
+
+    #[test]
+    fn non_echo_icmpv6_returns_none() {
+        // Build a ICMPv6 EchoReply and feed it to icmpv6_echo_reply.
+        let src = [0u8; 16];
+        let dst = [0u8; 15].iter().chain(&[2u8]).cloned().collect::<Vec<_>>();
+        let dst: [u8; 16] = dst.try_into().unwrap();
+        let echo = IcmpEchoHeader { id: 5, seq: 5 };
+        let icmp = Icmpv6Header::with_checksum(Icmpv6Type::EchoReply(echo), src, dst, b"").unwrap();
+        let payload_len = u16::try_from(icmp.header_len()).unwrap();
+        let ip = Ipv6Header {
+            traffic_class: 0,
+            flow_label: Ipv6FlowLabel::ZERO,
+            payload_length: payload_len,
+            next_header: IpNumber::IPV6_ICMP,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+        };
+        let mut pkt = Vec::new();
+        ip.write(&mut pkt).unwrap();
+        icmp.write(&mut pkt).unwrap();
+        assert!(
+            icmpv6_echo_reply(&pkt).is_none(),
+            "EchoReply should return None for icmpv6_echo_reply"
+        );
+    }
 }

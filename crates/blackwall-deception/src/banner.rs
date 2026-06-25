@@ -85,4 +85,40 @@ mod tests {
         let err = BannerStore::from_text("nonsense").expect_err("should fail");
         assert!(matches!(err, DeceptionError::Protocol(_)));
     }
+
+    #[test]
+    fn rejects_bad_port_number() {
+        let err = BannerStore::from_text("notaport = banner").expect_err("should fail");
+        assert!(matches!(err, DeceptionError::Protocol(_)));
+    }
+
+    #[test]
+    fn unescape_tab_and_backslash() {
+        // \t → tab, \\ → literal backslash
+        let store = BannerStore::from_text("* = col1\\tcol2\\\\col3").expect("valid");
+        assert_eq!(store.banner_for(0), b"col1\tcol2\\col3");
+    }
+
+    #[test]
+    fn unescape_unknown_sequence_passthrough() {
+        // \x is unknown → kept as \x (backslash + x)
+        let store = BannerStore::from_text("* = \\xAB").expect("valid");
+        assert_eq!(store.banner_for(0), b"\\xAB");
+    }
+
+    #[test]
+    fn unescape_trailing_backslash() {
+        // lone backslash at end of string → kept as single backslash byte
+        let store = BannerStore::from_text("* = end\\").expect("valid");
+        assert_eq!(store.banner_for(0), b"end\\");
+    }
+
+    #[test]
+    fn skips_comments_and_blank_lines() {
+        let input = "\n# this is a comment\n\n22 = SSH\\r\\n\n";
+        let store = BannerStore::from_text(input).expect("valid");
+        assert_eq!(store.banner_for(22), b"SSH\r\n");
+        // port not defined → fallback \r\n
+        assert_eq!(store.banner_for(80), b"\r\n");
+    }
 }

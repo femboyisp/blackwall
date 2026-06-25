@@ -86,4 +86,25 @@ mod tests {
         assert_eq!(reg.for_port(80).name(), "http");
         assert_eq!(reg.for_port(12345).name(), "default");
     }
+
+    #[test]
+    fn emulator_outcome_default_is_zero() {
+        let o = EmulatorOutcome::default();
+        assert_eq!(o.bytes_in, 0);
+        assert_eq!(o.bytes_out, 0);
+        assert_eq!(o.note, None);
+    }
+
+    #[test]
+    fn emulator_outcome_equality() {
+        let a = EmulatorOutcome {
+            bytes_in: 10,
+            bytes_out: 20,
+            note: Some("test".to_owned()),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = EmulatorOutcome::default();
+        assert_ne!(a, c);
+    }
 }
