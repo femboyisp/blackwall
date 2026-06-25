@@ -13,5 +13,12 @@ pub fn build_client(source: &SpeedtestSource) -> reqwest::Client {
         SpeedtestSource::Ip(ip) => reqwest::Client::builder().local_address(*ip),
         SpeedtestSource::Iface(name) => reqwest::Client::builder().interface(name),
     };
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder.build().unwrap_or_else(|err| {
+        tracing::warn!(
+            ?source,
+            %err,
+            "failed to build source-bound speedtest client; falling back to the default route"
+        );
+        reqwest::Client::new()
+    })
 }
