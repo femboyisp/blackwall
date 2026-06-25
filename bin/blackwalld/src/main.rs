@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use blackwall_deception::transport::{run_nfqueue, serve, TproxyListener};
-use blackwall_deception::{default_registry, SharedBanners};
+use blackwall_deception::{default_registry, EngineLimits, SharedBanners};
 use blackwall_state::SessionRow;
 use tokio::sync::mpsc;
 
@@ -119,12 +119,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (tx, mut rx) = mpsc::channel(256);
 
             // Spawn the async TPROXY accept loop (IPv4).
-            tokio::spawn(serve(listener, registry.clone(), tx.clone()));
+            tokio::spawn(serve(
+                listener,
+                registry.clone(),
+                tx.clone(),
+                EngineLimits::default(),
+            ));
 
             // Attempt to bind an IPv6 TPROXY listener for the ip6 tproxy nft rule.
             match TproxyListener::bind("[::]:61000".parse()?) {
                 Ok(v6_listener) => {
-                    tokio::spawn(serve(v6_listener, registry.clone(), tx.clone()));
+                    tokio::spawn(serve(
+                        v6_listener,
+                        registry.clone(),
+                        tx.clone(),
+                        EngineLimits::default(),
+                    ));
                 }
                 Err(err) => {
                     tracing::warn!(
