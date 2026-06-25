@@ -554,7 +554,14 @@ tenant t {
 
     #[test]
     fn rejects_bad_shape_bandwidth() {
-        assert!(parse_text("interface wan eth0\nshape eth0 bandwidth lots\n").is_err());
+        let err = parse_text("interface wan eth0\nshape eth0 bandwidth lots\n").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::BadValue {
+                what: "bandwidth",
+                ..
+            }
+        ));
     }
 
     #[test]
