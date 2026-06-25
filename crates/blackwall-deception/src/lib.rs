@@ -3,6 +3,7 @@
 
 mod banner;
 mod banner_reload;
+mod banner_source;
 mod conn;
 mod emulator;
 mod error;
@@ -13,22 +14,21 @@ pub mod transport;
 
 pub use banner::BannerStore;
 pub use banner_reload::SharedBanners;
+pub use banner_source::BannerSource;
 pub use conn::{AsyncStream, DeceptionConn, DeceptionMeta};
 pub use emulator::{EmulatorOutcome, EmulatorRegistry, ServiceEmulator};
 pub use emulators::{GenericBannerEmulator, HttpEmulator};
 pub use error::DeceptionError;
 pub use limits::EngineLimits;
 
-use std::sync::Arc;
-
 /// Build the default emulator registry used by `blackwalld run`.
 ///
 /// Registers an [`HttpEmulator`] on ports 80 and 8080 and uses a
 /// [`GenericBannerEmulator`] (no tarpit delay) as the fallback for every other
 /// port.
-pub fn default_registry(banners: Arc<BannerStore>) -> EmulatorRegistry {
-    let http = Arc::new(HttpEmulator::new("nginx/1.24.0"));
-    let generic = Arc::new(GenericBannerEmulator::new(banners, None));
+pub fn default_registry(banners: impl Into<BannerSource>) -> EmulatorRegistry {
+    let http = std::sync::Arc::new(HttpEmulator::new("nginx/1.24.0"));
+    let generic = std::sync::Arc::new(GenericBannerEmulator::new(banners, None));
     let mut reg = EmulatorRegistry::new(generic);
     reg.register(80, http.clone());
     reg.register(8080, http);
@@ -38,6 +38,7 @@ pub fn default_registry(banners: Arc<BannerStore>) -> EmulatorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn default_registry_maps_http_and_generic() {
