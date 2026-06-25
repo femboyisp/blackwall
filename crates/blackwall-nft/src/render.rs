@@ -526,6 +526,18 @@ mod tests {
     }
 
     #[test]
+    fn renders_ipv6_deception_tproxy() {
+        let json = ruleset_json(&sample_v6()).expect("render ipv6 json");
+        assert!(json.contains("\"ip6\""), "rendered JSON must contain ip6");
+        assert!(json.contains("tproxy"), "rendered JSON must contain tproxy");
+        assert!(json.contains("queue"), "rendered JSON must contain queue");
+        assert!(
+            !json.contains("\"xt\""),
+            "rendered JSON must NOT contain xt"
+        );
+    }
+
+    #[test]
     fn ruleset_json_is_valid_json() {
         let json = ruleset_json(&sample()).expect("render json");
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
