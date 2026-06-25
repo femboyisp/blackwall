@@ -7,7 +7,9 @@ repository.workspace = true
 
 [dependencies]
 blackwall-config = { path = "../../crates/blackwall-config" }
+blackwall-core = { path = "../../crates/blackwall-core" }
 blackwall-deception = { path = "../../crates/blackwall-deception" }
+blackwall-discovery = { path = "../../crates/blackwall-discovery" }
 blackwall-state = { path = "../../crates/blackwall-state" }
 blackwall-nft = { path = "../../crates/blackwall-nft" }
 clap = { workspace = true }

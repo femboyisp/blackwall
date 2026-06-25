@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use blackwall_deception::transport::{run_nfqueue, serve, TproxyListener};
 use blackwall_deception::{default_registry, EngineLimits, SharedBanners};
+use blackwall_discovery::IncusClient;
 use blackwall_state::SessionRow;
 use tokio::sync::mpsc;
 
@@ -46,6 +47,12 @@ enum Command {
         /// Path to the banner definitions file.
         #[arg(long)]
         banners: PathBuf,
+        /// Also scan host sockets from /proc/net when building the discovered set.
+        #[arg(long)]
+        discover_host: bool,
+        /// Path to the Incus unix socket.
+        #[arg(long, default_value = "/var/lib/incus/unix.socket")]
+        incus_socket: PathBuf,
     },
 }
 
@@ -59,6 +66,73 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Apply the effective policy derived from `base` merged with `discovered`.
+///
+/// Calls [`blackwall_discovery::reconcile`] to compute the effective policy,
+/// persists it via [`blackwall_state::Store::apply_policy`], and then pushes it
+/// to the kernel via [`blackwall_nft::apply`].
+async fn apply_effective(
+    base: &blackwall_core::Policy,
+    discovered: &[blackwall_discovery::DiscoveredService],
+    store: &blackwall_state::Store,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let effective = blackwall_discovery::reconcile(base, discovered);
+    store.apply_policy(&effective, "discovery").await?;
+    blackwall_nft::apply(&effective)?;
+    Ok(())
+}
+
+/// Build the discovered-service list from host sockets and/or an Incus client.
+///
+/// If `discover_host` is true, scans `/proc/net` sockets and converts them to
+/// [`blackwall_discovery::DiscoveredService`] entries with
+/// [`blackwall_core::ServiceTarget::Host`].  If `incus` is `Some`, calls
+/// `list_instances` and expands each instance via
+/// [`blackwall_discovery::instance_services`].
+async fn build_discovered(
+    discover_host: bool,
+    incus: Option<&blackwall_discovery::UnixIncusClient>,
+) -> Vec<blackwall_discovery::DiscoveredService> {
+    use blackwall_core::ServiceTarget;
+    use blackwall_discovery::{DiscoveredService, DiscoverySource};
+
+    let mut discovered: Vec<DiscoveredService> = Vec::new();
+
+    if discover_host {
+        match blackwall_discovery::scan_host_sockets(std::path::Path::new("/proc")) {
+            Ok(sockets) => {
+                for sock in sockets {
+                    discovered.push(DiscoveredService {
+                        addr: sock.addr,
+                        proto: sock.proto,
+                        port: sock.port,
+                        target: ServiceTarget::Host,
+                        source: DiscoverySource::Host,
+                    });
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "host socket scan failed; skipping host discovery");
+            }
+        }
+    }
+
+    if let Some(client) = incus {
+        match client.list_instances().await {
+            Ok(instances) => {
+                for inst in &instances {
+                    discovered.extend(blackwall_discovery::instance_services(inst));
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "Incus list_instances failed; skipping Incus discovery");
+            }
+        }
+    }
+
+    discovered
 }
 
 /// Core dispatch logic; returns `Err` on any failure.
@@ -94,6 +168,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config,
             database_url,
             banners,
+            discover_host,
+            incus_socket,
         } => {
             // TPROXY and NFQUEUE both require CAP_NET_ADMIN; warn unconditionally
             // so the operator knows what is needed even before a bind failure.
@@ -104,11 +180,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let policy = blackwall_config::parse_file(&config)?;
-            blackwall_nft::apply(&policy)?;
-            tracing::info!("ruleset applied");
 
+            // Connect and migrate the store early so discovery can persist its results.
             let store = blackwall_state::Store::connect(&database_url).await?;
             store.migrate().await?;
+
+            // Attempt to connect to Incus; log a warning and continue without it on failure.
+            let incus_client = match blackwall_discovery::UnixIncusClient::connect(&incus_socket) {
+                Ok(client) => {
+                    tracing::info!(socket = %incus_socket.display(), "connected to Incus");
+                    Some(client)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        socket = %incus_socket.display(),
+                        "failed to connect to Incus; continuing with base policy only"
+                    );
+                    None
+                }
+            };
+
+            // Build the initial discovered set and apply the reconciled effective policy.
+            let initial_discovered = build_discovered(discover_host, incus_client.as_ref()).await;
+            apply_effective(&policy, &initial_discovered, &store).await?;
+            tracing::info!(
+                services = initial_discovered.len(),
+                "initial effective policy applied"
+            );
 
             let shared = SharedBanners::load(&banners)?;
             let registry = std::sync::Arc::new(default_registry(shared.clone()));
@@ -170,6 +269,61 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await;
             });
+
+            // Spawn the Incus discovery event loop as a supervised task (non-fatal exit).
+            if let Some(mut client) = incus_client {
+                let policy_for_task = policy.clone();
+                let store_for_task = store.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match client.next_event().await {
+                            Ok(Some(ev)) => {
+                                use blackwall_discovery::InstanceChange;
+                                match ev.change {
+                                    InstanceChange::Started
+                                    | InstanceChange::Stopped
+                                    | InstanceChange::Updated => {
+                                        tracing::info!(
+                                            instance = %ev.instance,
+                                            change = ?ev.change,
+                                            "Incus lifecycle event; reconciling"
+                                        );
+                                        let discovered =
+                                            build_discovered(discover_host, Some(&client)).await;
+                                        if let Err(err) = apply_effective(
+                                            &policy_for_task,
+                                            &discovered,
+                                            &store_for_task,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                %err,
+                                                "reconcile after Incus event failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!("Incus event stream ended; discovery loop exiting");
+                                break;
+                            }
+                            Err(blackwall_discovery::DiscoveryError::Parse(msg)) => {
+                                tracing::warn!(%msg, "skipping malformed Incus event");
+                                continue;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    %err,
+                                    "Incus event stream error; discovery stopping"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
 
             // Drop the controller's tx so the drain loop terminates when all serve clones are gone.
             drop(tx);
