@@ -24,3 +24,11 @@ All notable changes to this project are documented here, following
 - Session persistence: `SessionRow` + `Store::record_session` audit table in `blackwall-state`.
 - nftables enforcement: real TPROXY and NFQUEUE redirect rules replace M1 placeholder (`blackwall-nft::render`).
 - `blackwalld run` subcommand: wires IPv4 and IPv6 TPROXY listeners (port 61000), NFQUEUE loop, banners loaded at startup, and session drain.
+- Deception engine hardening: connection cap and session timeout via `EngineLimits`; supervised transports with `JoinSet`/`select!` and non-zero exit on transport death.
+- Live banner hot-reload: `BannerSource::Live` read-through with inotify-backed `SharedBanners::reload` wired into `blackwalld run`.
+- SSH emulator: believable KEXINIT + banner exchange capturing client version string.
+- SMTP emulator: ESMTP greeting, `EHLO`/`MAIL`/`RCPT`/`DATA`/`QUIT` handling capturing sender and recipient.
+- Redis emulator: RESP array and inline command parsing; handles `PING`, `INFO`, and unknown commands.
+- MySQL emulator: static handshake packet + error response capturing client login attempt.
+- PostgreSQL emulator: `ErrorResponse` framing capturing startup message.
+- Emulator port registration: SSH (22), SMTP (25), Redis (6379), MySQL (3306), PostgreSQL (5432) registered in `default_registry`.
