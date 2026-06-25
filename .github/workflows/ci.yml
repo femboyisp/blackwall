@@ -33,9 +33,7 @@ jobs:
         run: cargo test --workspace
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      # These files are excluded from coverage because they require CAP_NET_ADMIN / a live kernel
-      # (TPROXY transparent sockets, NFQUEUE + raw sockets, nftables kernel apply, and the daemon's
-      # process/runtime glue) and cannot be exercised in CI. All of their non-trivial pure logic is
-      # delegated to unit-tested helpers (e.g. transport/packet.rs, render.rs).
+      # The coverage gate (90%) and its exclusion list live in scripts/coverage.sh,
+      # the single source of truth shared by CI and local runs so the two cannot drift.
       - name: Test with coverage gate
-        run: cargo llvm-cov --workspace --fail-under-lines 90 --ignore-filename-regex '(transport/(tproxy|nfqueue)\.rs|blackwall-nft/src/apply\.rs|blackwalld/src/main\.rs)'
+        run: bash scripts/coverage.sh
