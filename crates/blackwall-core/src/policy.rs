@@ -41,4 +41,6 @@ pub struct Policy {
     pub tenants: Vec<Tenant>,
     /// Traffic-shaping rules (empty if the config defines none).
     pub shaping: Vec<crate::ShapeRule>,
+    /// Banner fast-flux config (rotate the deception persona over time); `None` disables it.
+    pub banner_flux: Option<crate::BannerFluxConfig>,
 }

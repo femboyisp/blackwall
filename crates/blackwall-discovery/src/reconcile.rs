@@ -111,6 +111,7 @@ mod tests {
             default_state: PortState::Deception,
             tenants,
             shaping: Vec::new(),
+            banner_flux: None,
         }
     }
 

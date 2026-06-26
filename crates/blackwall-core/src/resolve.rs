@@ -124,6 +124,7 @@ mod tests {
             default_state: PortState::Deception,
             tenants,
             shaping: Vec::new(),
+            banner_flux: None,
         }
     }
 
@@ -256,6 +257,7 @@ mod tests {
             default_state: PortState::Deception,
             tenants: vec![],
             shaping: Vec::new(),
+            banner_flux: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
