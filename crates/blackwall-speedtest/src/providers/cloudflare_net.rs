@@ -12,7 +12,7 @@ use crate::error::SpeedtestError;
 use crate::provider::{SpeedtestConfig, SpeedtestProvider};
 use crate::reading::ProviderReading;
 use crate::source::SpeedtestSource;
-use crate::throughput::{keep_downloading, mbps_from};
+use crate::throughput::mbps_from;
 
 use super::cloudflare_parse::{download_url, server_timing_latency, upload_url};
 
@@ -115,44 +115,63 @@ impl SpeedtestProvider for CloudflareProvider {
 
     /// Measure download throughput and latency via Cloudflare's speed endpoint.
     ///
-    /// Download is capped at `min(cfg.max_bytes, 25 MiB)`. Latency is the
-    /// `Server-Timing: cfRequestDuration;dur=X` header value when present;
-    /// otherwise it falls back to the TTFB of a `__down?bytes=1` probe request.
+    /// Download loops `min(cfg.max_bytes, 25 MiB)` requests until the
+    /// measurement window elapses, accumulating total bytes across all
+    /// requests. Latency is the `Server-Timing: cfRequestDuration;dur=X`
+    /// header value from the first response when present; otherwise it falls
+    /// back to the TTFB of a `__down?bytes=1` probe request.
     async fn measure(&self, cfg: &SpeedtestConfig) -> Result<ProviderReading, SpeedtestError> {
-        let bytes = cfg.max_bytes.min(MAX_CF_BYTES);
-        let url = download_url(bytes);
+        let per_req = cfg.max_bytes.min(MAX_CF_BYTES);
+        let url = download_url(per_req);
 
         let start = Instant::now();
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| SpeedtestError::Http(e.to_string()))?;
-        let ttfb_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        let server_timing = resp
-            .headers()
-            .get("server-timing")
-            .and_then(|v| v.to_str().ok())
-            .and_then(server_timing_latency);
-
-        // Prefer the Server-Timing header (server-side RTT proxy); fall back to
-        // TTFB of this same request, which is the real network round-trip time.
-        let latency_ms = server_timing.unwrap_or(ttfb_ms);
-
-        let cap = bytes;
-        let mut stream = resp.bytes_stream();
-        let mut received: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| SpeedtestError::Http(e.to_string()))?;
-            received = received.saturating_add(chunk.len() as u64);
-            if !keep_downloading(received, cap, start.elapsed(), cfg.measure_window) {
-                break;
+        let mut total: u64 = 0;
+        let mut server_timing: Option<f64> = None;
+        let mut first = true;
+        while start.elapsed() < cfg.measure_window {
+            let resp = match self.client.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if first {
+                        return Err(SpeedtestError::Http(e.to_string()));
+                    }
+                    break; // a later request failing just ends the measurement
+                }
+            };
+            if first {
+                server_timing = resp
+                    .headers()
+                    .get("server-timing")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(server_timing_latency);
+                first = false;
+            }
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                total = total.saturating_add(u64::try_from(chunk.len()).unwrap_or(0));
+                if start.elapsed() >= cfg.measure_window {
+                    break;
+                }
             }
         }
         let elapsed = start.elapsed();
-        let download_mbps = mbps_from(received, elapsed);
+        let download_mbps = mbps_from(total, elapsed);
+
+        // Prefer the Server-Timing header (server-side RTT proxy); fall back to
+        // TTFB of a 1-byte probe request, which is the real network round-trip time.
+        let latency_ms = match server_timing {
+            Some(ms) => ms,
+            None => {
+                let probe_url = download_url(1);
+                let probe_start = Instant::now();
+                let _ = self.client.get(&probe_url).send().await;
+                probe_start.elapsed().as_secs_f64() * 1000.0
+            }
+        };
 
         // --- Upload measurement ---
         let upload_mbps = match self.measure_upload(cfg).await {
