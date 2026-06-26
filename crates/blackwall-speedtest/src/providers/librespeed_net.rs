@@ -139,7 +139,9 @@ impl SpeedtestProvider for LibreSpeedProvider {
             .await
             .map_err(|e| SpeedtestError::Http(e.to_string()))?;
 
-        let cap = cfg.max_bytes;
+        // Use a high byte ceiling so the measurement window — not max_bytes —
+        // bounds the download on a fast link.
+        let cap = cfg.max_bytes.max(2u64 * 1024 * 1024 * 1024);
         let mut received: u64 = 0;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -151,7 +153,7 @@ impl SpeedtestProvider for LibreSpeedProvider {
         }
         let elapsed = dl_start.elapsed();
 
-        let download_mbps = mbps_from(received.min(cap), elapsed);
+        let download_mbps = mbps_from(received, elapsed);
 
         // --- Upload measurement ---
         let upload_mbps = match self.measure_upload(cfg).await {
