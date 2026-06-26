@@ -5,6 +5,9 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Changed
+- Speedtest now runs providers sequentially, measures each download over the full window, and reports the fastest clean provider — fixing wildly variable, under-reporting results on fast links.
+
 ### Added
 - Workspace scaffold, CI, and lint configuration (`Cargo.toml` resolver v2, `rustfmt.toml`, workspace-level Clippy lints).
 - Core domain types: `Policy`, `Tenant`, `AllowRule`, `PortState`, `L4Proto`, `ServiceTarget`, `ResolvedService`, and `PolicyError` (`blackwall-core`).

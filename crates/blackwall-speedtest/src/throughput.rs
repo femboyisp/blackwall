@@ -31,33 +31,22 @@ pub fn mbps_from(bytes: u64, elapsed: Duration) -> f64 {
     bits / 1_000_000.0 / secs
 }
 
-/// Trimmed mean: drop one minimum and one maximum when there are at least three
-/// values (rejecting a single wild outlier on each side), otherwise the plain
-/// mean. `None` for an empty slice. Non-finite values (`NaN`, `±inf`) are
-/// discarded before trimming.
-pub fn trimmed_mean(values: &[f64]) -> Option<f64> {
-    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.is_empty() {
-        return None;
-    }
-    if finite.len() < 3 {
-        let sum: f64 = finite.iter().sum();
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "slice length is a small sample \
-            count, well within f64's exact-integer range"
-        )]
-        return Some(sum / (finite.len() as f64));
-    }
-    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let trimmed = &finite[1..finite.len() - 1];
-    let sum: f64 = trimmed.iter().sum();
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "trimmed slice length is a small \
-        sample count, well within f64's exact-integer range"
-    )]
-    Some(sum / (trimmed.len() as f64))
+/// The largest finite value in `values`, or `None` if none are finite.
+pub fn max_finite(values: &[f64]) -> Option<f64> {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v))))
+}
+
+/// The smallest finite value in `values`, or `None` if none are finite.
+pub fn min_finite(values: &[f64]) -> Option<f64> {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.min(v))))
 }
 
 #[cfg(test)]
@@ -90,25 +79,20 @@ mod tests {
     }
 
     #[test]
-    fn trimmed_mean_drops_extremes() {
-        // [50, 870, 905, 920] -> drop 50 and 920 -> mean(870, 905) = 887.5
-        let v = trimmed_mean(&[920.0, 50.0, 870.0, 905.0]).unwrap();
-        assert!((v - 887.5).abs() < 0.001);
+    fn max_finite_picks_largest_ignoring_non_finite() {
+        assert_eq!(max_finite(&[100.0, 500.0, 200.0]), Some(500.0));
+        assert_eq!(
+            max_finite(&[100.0, f64::NAN, f64::INFINITY, 300.0]),
+            Some(300.0)
+        );
+        assert_eq!(max_finite(&[f64::NAN, f64::INFINITY]), None);
+        assert_eq!(max_finite(&[]), None);
     }
 
     #[test]
-    fn trimmed_mean_small_inputs() {
-        assert_eq!(trimmed_mean(&[]), None);
-        assert_eq!(trimmed_mean(&[100.0]), Some(100.0));
-        assert_eq!(trimmed_mean(&[100.0, 200.0]), Some(150.0));
-    }
-
-    #[test]
-    fn trimmed_mean_discards_non_finite() {
-        // NaN and inf are dropped before trimming.
-        let v = trimmed_mean(&[900.0, f64::NAN, 50.0, 870.0, f64::INFINITY]).unwrap();
-        assert!(v.is_finite());
-        // all non-finite -> None
-        assert_eq!(trimmed_mean(&[f64::NAN, f64::INFINITY]), None);
+    fn min_finite_picks_smallest_ignoring_non_finite() {
+        assert_eq!(min_finite(&[100.0, 20.0, 200.0]), Some(20.0));
+        assert_eq!(min_finite(&[f64::NAN, 50.0, f64::NEG_INFINITY]), Some(50.0));
+        assert_eq!(min_finite(&[f64::NAN]), None);
     }
 }

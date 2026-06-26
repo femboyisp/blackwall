@@ -18,6 +18,12 @@ pub struct SpeedtestConfig {
     /// Per-provider timeout.
     pub timeout: Duration,
     /// Maximum providers to run concurrently.
+    ///
+    /// Defaults to `1` (sequential) on purpose: every provider measures the
+    /// *same* uplink, so running them at once makes them compete for bandwidth
+    /// and each sees only its fraction of the link — badly under-reporting and
+    /// giving wildly variable readings. One at a time, each measures the full,
+    /// unshared link.
     pub concurrency: usize,
     /// Maximum wall-clock time spent transferring data for one download
     /// measurement. The download stops at whichever comes first: this
@@ -30,7 +36,7 @@ impl Default for SpeedtestConfig {
         SpeedtestConfig {
             max_bytes: 100 * 1024 * 1024,
             timeout: Duration::from_secs(30),
-            concurrency: 4,
+            concurrency: 1,
             measure_window: Duration::from_secs(10),
         }
     }
@@ -71,6 +77,11 @@ mod tests {
         let r = p.measure(&SpeedtestConfig::default()).await.unwrap();
         assert_eq!(r.provider, "stub");
         assert_eq!(r.download_mbps, 500.0);
+    }
+
+    #[test]
+    fn default_concurrency_is_sequential() {
+        assert_eq!(SpeedtestConfig::default().concurrency, 1);
     }
 
     #[test]
