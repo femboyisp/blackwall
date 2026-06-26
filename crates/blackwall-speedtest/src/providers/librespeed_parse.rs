@@ -21,9 +21,10 @@ fn base(server: &str) -> &str {
     server.trim_end_matches('/')
 }
 
-/// The garbage (download) URL for `server`, requesting ~100 MB worth of chunks.
+/// The garbage (download) URL for `server`, requesting a large chunk count so
+/// the measurement window — not the transfer size — bounds the download.
 pub fn download_url(server: &str) -> String {
-    format!("{}/backend/garbage.php?ckSize=100", base(server))
+    format!("{}/backend/garbage.php?ckSize=1024", base(server))
 }
 
 /// The empty (ping/latency) URL for `server`.
@@ -63,7 +64,7 @@ mod tests {
     fn builds_urls_trimming_slash() {
         assert_eq!(
             download_url("https://ls.example.com/"),
-            "https://ls.example.com/backend/garbage.php?ckSize=100"
+            "https://ls.example.com/backend/garbage.php?ckSize=1024"
         );
         assert_eq!(
             ping_url("https://ls.example.com"),

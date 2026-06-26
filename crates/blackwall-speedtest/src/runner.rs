@@ -18,7 +18,8 @@ impl Speedtest {
         Speedtest { providers }
     }
 
-    /// Measure with every provider concurrently and aggregate the successes.
+    /// Measure with every provider (sequentially by default; see
+    /// [`SpeedtestConfig::concurrency`]) and aggregate the successes.
     /// Per-provider errors and timeouts are logged and skipped; the run fails
     /// only if no provider produced a reading.
     pub async fn run(&self, cfg: &SpeedtestConfig) -> Result<Aggregate, SpeedtestError> {

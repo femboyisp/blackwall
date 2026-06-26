@@ -118,9 +118,10 @@ impl SpeedtestProvider for OoklaProvider {
     /// Measure download throughput via the Ookla TCP text protocol.
     ///
     /// Fetches the server list, connects to the first server, performs the
-    /// `HI`/`DOWNLOAD` handshake, and times the transfer. Download is capped
-    /// at `min(cfg.max_bytes, 25 MiB)`. The TCP connection is bound to
-    /// the provider's configured [`SpeedtestSource`].
+    /// `HI`/`DOWNLOAD` handshake, and times the transfer. A 2 GiB byte
+    /// ceiling is requested so the measurement window — not the byte count —
+    /// bounds the download. The TCP connection is bound to the provider's
+    /// configured [`SpeedtestSource`].
     async fn measure(&self, cfg: &SpeedtestConfig) -> Result<ProviderReading, SpeedtestError> {
         // Fetch and parse the server list.
         let json = self
@@ -151,8 +152,12 @@ impl SpeedtestProvider for OoklaProvider {
         let latency_ms = hi_start.elapsed().as_secs_f64() * 1000.0;
         let _version = parse_hello(&hello_line);
 
-        // Request the download.
-        let bytes = cfg.max_bytes.min(MAX_OOKLA_BYTES);
+        // Request far more than the window can transfer so the server keeps
+        // streaming; the measurement window (not the byte count) bounds the read.
+        let bytes = cfg
+            .max_bytes
+            .max(MAX_OOKLA_BYTES)
+            .max(2u64 * 1024 * 1024 * 1024);
         let cmd = download_command(bytes);
         stream
             .write_all(cmd.as_bytes())

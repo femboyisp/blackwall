@@ -171,7 +171,9 @@ impl SpeedtestProvider for FastProvider {
         let targets = parse_targets(&api_json)?;
         let target = targets.into_iter().next().ok_or(SpeedtestError::NoResult)?;
 
-        // Download the first target, stream-capped at cfg.max_bytes.
+        // Download the first target; read until the measurement window.
+        // Use a high byte ceiling so the window — not max_bytes — bounds a fast link.
+        let cap = cfg.max_bytes.max(2u64 * 1024 * 1024 * 1024);
         let dl_start = Instant::now();
         let resp = self
             .client
@@ -185,12 +187,7 @@ impl SpeedtestProvider for FastProvider {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| SpeedtestError::Http(e.to_string()))?;
             received += u64::try_from(chunk.len()).unwrap_or(0);
-            if !keep_downloading(
-                received,
-                cfg.max_bytes,
-                dl_start.elapsed(),
-                cfg.measure_window,
-            ) {
+            if !keep_downloading(received, cap, dl_start.elapsed(), cfg.measure_window) {
                 break;
             }
         }
