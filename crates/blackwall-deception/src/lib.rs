@@ -7,6 +7,7 @@ mod banner_source;
 mod conn;
 mod emulator;
 mod error;
+mod flux;
 mod limits;
 
 pub mod emulators;
@@ -22,6 +23,7 @@ pub use emulators::{
     SmtpEmulator, SshEmulator,
 };
 pub use error::DeceptionError;
+pub use flux::{flux_index, next_boundary_delay, BannerFlux, BannerPool};
 pub use limits::EngineLimits;
 
 /// Build the default emulator registry used by `blackwalld run`.
