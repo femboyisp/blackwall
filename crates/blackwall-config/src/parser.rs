@@ -4,7 +4,8 @@
 use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
-    AllowRule, L4Proto, Policy, PortState, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
+    AllowRule, BannerFluxConfig, L4Proto, Policy, PortState, ServiceTarget, ShapeBandwidth,
+    ShapeRule, Tenant,
 };
 use std::net::{IpAddr, SocketAddr};
 
@@ -15,6 +16,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut default_state = PortState::Deception;
     let mut tenants = Vec::new();
     let mut shaping = Vec::new();
+    let mut banner_flux: Option<BannerFluxConfig> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -52,6 +54,28 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
             "shape" => {
                 shaping.push(parse_shape(line)?);
             }
+            "banner-flux" => {
+                if banner_flux.is_some() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "banner-flux",
+                        value: "duplicate".to_owned(),
+                    });
+                }
+                let dir = line.words.get(1).ok_or_else(|| ConfigError::BadValue {
+                    line: line.number,
+                    what: "banner-flux",
+                    value: "missing dir".to_owned(),
+                })?;
+                let period = match line.words.get(2) {
+                    Some(tok) => parse_duration(line, tok)?,
+                    None => std::time::Duration::from_secs(6 * 3600),
+                };
+                banner_flux = Some(BannerFluxConfig {
+                    dir: std::path::PathBuf::from(dir.as_str()),
+                    period,
+                });
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -75,6 +99,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         default_state,
         tenants,
         shaping,
+        banner_flux,
     })
 }
 
@@ -208,6 +233,28 @@ fn parse_mbit(line: &Line, token: &str) -> Result<u32, ConfigError> {
             what: "bandwidth",
             value: token.to_owned(),
         })
+}
+
+fn parse_duration(line: &Line, token: &str) -> Result<std::time::Duration, ConfigError> {
+    let (digits, mult) = if let Some(d) = token.strip_suffix('h') {
+        (d, 3600_u64)
+    } else if let Some(d) = token.strip_suffix('m') {
+        (d, 60_u64)
+    } else if let Some(d) = token.strip_suffix('s') {
+        (d, 1_u64)
+    } else {
+        return Err(ConfigError::BadValue {
+            line: line.number,
+            what: "duration",
+            value: token.to_owned(),
+        });
+    };
+    let n: u64 = digits.parse().map_err(|_| ConfigError::BadValue {
+        line: line.number,
+        what: "duration",
+        value: token.to_owned(),
+    })?;
+    Ok(std::time::Duration::from_secs(n * mult))
 }
 
 fn parse_ms(line: &Line, token: &str) -> Result<u32, ConfigError> {
@@ -562,6 +609,32 @@ tenant t {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_banner_flux_dir_only_defaults_period() {
+        let p = parse_text("interface wan eth0\nbanner-flux /etc/bw/banners.d\n").unwrap();
+        let f = p.banner_flux.unwrap();
+        assert_eq!(f.dir, std::path::PathBuf::from("/etc/bw/banners.d"));
+        assert_eq!(f.period, std::time::Duration::from_secs(6 * 3600));
+    }
+
+    #[test]
+    fn parses_banner_flux_with_period() {
+        let p = parse_text("interface wan eth0\nbanner-flux /var/b 30m\n").unwrap();
+        let f = p.banner_flux.unwrap();
+        assert_eq!(f.dir, std::path::PathBuf::from("/var/b"));
+        assert_eq!(f.period, std::time::Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn rejects_bad_banner_flux_period() {
+        assert!(parse_text("interface wan eth0\nbanner-flux /var/b 5x\n").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_banner_flux() {
+        assert!(parse_text("interface wan eth0\nbanner-flux /a\nbanner-flux /b\n").is_err());
     }
 
     #[test]

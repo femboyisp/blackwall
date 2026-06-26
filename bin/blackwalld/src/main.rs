@@ -417,22 +417,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "initial effective policy applied"
             );
 
-            let shared = SharedBanners::load(&banners)?;
-            let registry = std::sync::Arc::new(default_registry(shared.clone()));
-            // Reload banners on file change (best-effort; a parse error keeps the old set).
-            let watch_path = banners.clone();
-            let watch_shared = shared.clone();
-            let mut watcher =
-                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                    if res.is_ok() {
-                        if let Err(err) = watch_shared.reload(&watch_path) {
-                            tracing::warn!(%err, "banner reload failed");
-                        } else {
-                            tracing::info!("banners reloaded");
-                        }
+            let (shared, _banner_watcher) = if let Some(flux_cfg) = &policy.banner_flux {
+                // Flux mode: rotation drives banners; file watcher is not used.
+                let pool = blackwall_deception::BannerPool::from_dir(&flux_cfg.dir)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let flux = blackwall_deception::BannerFlux::seeded(pool, flux_cfg.period, now);
+                let shared = flux.shared();
+                // Detached, non-fatal rotation task (NOT in the transports JoinSet).
+                tokio::spawn(async move {
+                    loop {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        flux.apply(now);
+                        tokio::time::sleep(flux.next_delay(now)).await;
                     }
-                })?;
-            notify::Watcher::watch(&mut watcher, &banners, notify::RecursiveMode::NonRecursive)?;
+                });
+                (shared, None)
+            } else {
+                // Static mode: load banners from file and watch for changes.
+                let shared = SharedBanners::load(&banners)?;
+                let watch_path = banners.clone();
+                let watch_shared = shared.clone();
+                let mut watcher =
+                    notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                        if res.is_ok() {
+                            if let Err(err) = watch_shared.reload(&watch_path) {
+                                tracing::warn!(%err, "banner reload failed");
+                            } else {
+                                tracing::info!("banners reloaded");
+                            }
+                        }
+                    })?;
+                notify::Watcher::watch(
+                    &mut watcher,
+                    &banners,
+                    notify::RecursiveMode::NonRecursive,
+                )?;
+                (shared, Some(watcher))
+            };
+            let registry = std::sync::Arc::new(default_registry(shared.clone()));
 
             // TPROXY listener binds on port 61000 (ENGINE_TPROXY_PORT in blackwall-nft).
             let listener_v4 = TproxyListener::bind("0.0.0.0:61000".parse()?)?;

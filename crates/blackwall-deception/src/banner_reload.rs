@@ -33,6 +33,18 @@ impl SharedBanners {
         self.inner.store(Arc::new(store));
         Ok(())
     }
+
+    /// Seed a shared store from an in-memory [`BannerStore`] (no file backing).
+    pub fn from_store(store: Arc<BannerStore>) -> SharedBanners {
+        SharedBanners {
+            inner: Arc::new(ArcSwap::new(store)),
+        }
+    }
+
+    /// Atomically replace the current store with `store`.
+    pub fn swap(&self, store: Arc<BannerStore>) {
+        self.inner.store(store);
+    }
 }
 
 fn read_store(path: &Path) -> Result<BannerStore, DeceptionError> {
@@ -66,5 +78,15 @@ mod tests {
         assert_eq!(shared.current().banner_for(80), b"TWO\r\n");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_store_then_swap_changes_current() {
+        let a = Arc::new(BannerStore::from_text("80 = A\\r\\n\n* = X\\r\\n").unwrap());
+        let b = Arc::new(BannerStore::from_text("80 = B\\r\\n\n* = X\\r\\n").unwrap());
+        let shared = SharedBanners::from_store(a);
+        assert_eq!(shared.current().banner_for(80), b"A\r\n");
+        shared.swap(b);
+        assert_eq!(shared.current().banner_for(80), b"B\r\n");
     }
 }

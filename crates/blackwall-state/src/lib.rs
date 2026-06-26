@@ -356,6 +356,7 @@ mod tests {
                 ],
             }],
             shaping: Vec::new(),
+            banner_flux: None,
         }
     }
 }
