@@ -45,11 +45,15 @@ impl BannerPool {
     /// index→persona mapping) as a [`BannerStore`] variant. Errors if the
     /// directory is empty or any file fails to parse.
     pub fn from_dir(dir: &Path) -> Result<BannerPool, DeceptionError> {
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file())
-            .collect();
-        entries.sort();
+        let mut entries: Vec<std::path::PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?; // propagate a DirEntry error rather than skipping it
+            let path = entry.path();
+            if path.is_file() {
+                entries.push(path);
+            }
+        }
+        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
         let mut variants = Vec::with_capacity(entries.len());
         for path in entries {
             let text = std::fs::read_to_string(&path)?;
@@ -167,5 +171,48 @@ mod tests {
         flux.apply(150);
         assert_eq!(shared.current().banner_for(80), b"b\r\n");
         assert_eq!(flux.next_delay(150), Duration::from_secs(50));
+    }
+
+    /// Covers `BannerPool::from_dir` (real temp-dir I/O) and verifies that
+    /// rotation actually swaps the persona seen by callers (AAA -> BBB).
+    #[test]
+    fn from_dir_rotation_smoke() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!(
+            "bw-flux-smoke-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Two banner files: sorted by name so 01.txt -> index 0, 02.txt -> index 1.
+        fs::write(dir.join("01.txt"), "80 = AAA\\r\\n\n* = X\\r\\n").unwrap();
+        fs::write(dir.join("02.txt"), "80 = BBB\\r\\n\n* = X\\r\\n").unwrap();
+
+        let pool = BannerPool::from_dir(&dir).unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // period=1s, now=0 -> bucket 0 -> "AAA\r\n"
+        let flux = BannerFlux::seeded(pool, Duration::from_secs(1), 0);
+        let shared = flux.shared();
+        let before = shared.current().banner_for(80).to_vec();
+        assert_eq!(before, b"AAA\r\n", "before: expected AAA\\r\\n");
+
+        // advance to bucket 1 -> "BBB\r\n"
+        flux.apply(1);
+        let after = shared.current().banner_for(80).to_vec();
+        assert_eq!(after, b"BBB\r\n", "after: expected BBB\\r\\n");
+
+        // empty dir should error
+        let empty = dir.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(BannerPool::from_dir(&empty).is_err());
+
+        // non-existent dir should error
+        assert!(BannerPool::from_dir(&dir.join("no_such_dir")).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
