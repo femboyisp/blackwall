@@ -10,7 +10,7 @@ use blackwall_discovery::IncusClient;
 use blackwall_speedtest::providers::{
     CloudflareProvider, FastProvider, LibreSpeedProvider, OoklaProvider,
 };
-use blackwall_speedtest::{Speedtest, SpeedtestConfig, SpeedtestProvider};
+use blackwall_speedtest::{Speedtest, SpeedtestConfig, SpeedtestProvider, SpeedtestSource};
 use blackwall_state::SessionRow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -57,6 +57,12 @@ enum Command {
         /// Per-request timeout in seconds (overrides SpeedtestConfig default).
         #[arg(long)]
         timeout_secs: Option<u64>,
+        /// Bind the test to this local source IP (e.g. 203.0.113.5).
+        #[arg(long)]
+        source_ip: Option<std::net::IpAddr>,
+        /// Bind the test to this interface (Linux SO_BINDTODEVICE; needs CAP_NET_RAW).
+        #[arg(long)]
+        interface: Option<String>,
     },
     /// Apply the ruleset and start the deception engine (requires CAP_NET_ADMIN).
     Run {
@@ -172,13 +178,21 @@ async fn build_discovered(
 /// Build the four speedtest providers used for Auto shaping rules.
 ///
 /// Returns a `Vec<Arc<dyn SpeedtestProvider>>` containing Cloudflare, LibreSpeed (at
-/// `librespeed_server`), Fast.com, and Ookla, in that order.
-fn build_speedtest_providers(librespeed_server: &str) -> Vec<Arc<dyn SpeedtestProvider>> {
+/// `librespeed_server`), Fast.com, and Ookla, in that order.  Each provider is
+/// constructed with `source` so measurements are bound to the requested local IP or
+/// interface.
+fn build_speedtest_providers(
+    librespeed_server: &str,
+    source: &SpeedtestSource,
+) -> Vec<Arc<dyn SpeedtestProvider>> {
     vec![
-        Arc::new(CloudflareProvider::new()),
-        Arc::new(LibreSpeedProvider::new(librespeed_server.to_owned())),
-        Arc::new(FastProvider::new()),
-        Arc::new(OoklaProvider::new()),
+        Arc::new(CloudflareProvider::with_source(source.clone())),
+        Arc::new(LibreSpeedProvider::with_source(
+            librespeed_server.to_owned(),
+            source.clone(),
+        )),
+        Arc::new(FastProvider::with_source(source.clone())),
+        Arc::new(OoklaProvider::with_source(source.clone())),
     ]
 }
 
@@ -203,7 +217,10 @@ async fn apply_shaping(
 
         if needs_speedtest {
             // Run an initial speedtest and apply the plan.
-            let providers = build_speedtest_providers(&librespeed_server);
+            let providers = build_speedtest_providers(
+                &librespeed_server,
+                &SpeedtestSource::Iface(rule.iface.clone()),
+            );
             let runner = Speedtest::new(providers);
             match runner.run(&SpeedtestConfig::default()).await {
                 Err(err) => {
@@ -233,7 +250,10 @@ async fn apply_shaping(
             tokio::spawn(async move {
                 loop {
                     sleep(Duration::from_secs(interval_secs)).await;
-                    let providers = build_speedtest_providers(&librespeed_clone);
+                    let providers = build_speedtest_providers(
+                        &librespeed_clone,
+                        &SpeedtestSource::Iface(rule_clone.iface.clone()),
+                    );
                     let runner = Speedtest::new(providers);
                     match runner.run(&SpeedtestConfig::default()).await {
                         Err(err) => {
@@ -296,13 +316,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             librespeed_server,
             max_bytes,
             timeout_secs,
+            source_ip,
+            interface,
         } => {
-            let providers: Vec<Arc<dyn SpeedtestProvider>> = vec![
-                Arc::new(CloudflareProvider::new()),
-                Arc::new(LibreSpeedProvider::new(librespeed_server)),
-                Arc::new(FastProvider::new()),
-                Arc::new(OoklaProvider::new()),
-            ];
+            let source = match (source_ip, interface) {
+                (Some(ip), Some(_)) => {
+                    tracing::warn!("both --source-ip and --interface given; using --source-ip");
+                    SpeedtestSource::Ip(ip)
+                }
+                (Some(ip), None) => SpeedtestSource::Ip(ip),
+                (None, Some(name)) => SpeedtestSource::Iface(name),
+                (None, None) => SpeedtestSource::Default,
+            };
+            let providers = build_speedtest_providers(&librespeed_server, &source);
             let mut cfg = SpeedtestConfig::default();
             if let Some(b) = max_bytes {
                 cfg.max_bytes = b;
