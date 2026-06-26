@@ -75,6 +75,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         default_state,
         tenants,
         shaping,
+        banner_flux: None,
     })
 }
 
