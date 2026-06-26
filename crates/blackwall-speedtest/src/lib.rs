@@ -15,4 +15,4 @@ pub use provider::{SpeedtestConfig, SpeedtestProvider};
 pub use reading::{Aggregate, ProviderReading};
 pub use runner::Speedtest;
 pub use source::SpeedtestSource;
-pub use throughput::{keep_downloading, mbps_from, trimmed_mean};
+pub use throughput::{keep_downloading, max_finite, mbps_from, min_finite};
