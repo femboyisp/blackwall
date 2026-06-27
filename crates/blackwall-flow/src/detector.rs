@@ -183,7 +183,11 @@ impl Detector for ThresholdDetector {
         let bps_threshold = self.bps_threshold;
         let hold_down_ms = self.hold_down_ms;
 
-        let window_secs = window_ms as f64 / 1000.0;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "window_ms to f64 divisor; ms-scale precision loss acceptable"
+        )]
+        let window_secs = window_ms.max(1) as f64 / 1000.0;
 
         let mut events = Vec::new();
         let mut to_remove = Vec::new();
@@ -292,10 +296,10 @@ struct DetectionParams<'a> {
 
 /// Build a [`Detection`] from the current window of samples.
 fn build_detection(p: DetectionParams<'_>) -> Detection {
-    // Dominant protocol: the one with the most samples.
-    let mut proto_counts: HashMap<u8, usize> = HashMap::new();
+    // Dominant protocol: the one with the most estimated packets.
+    let mut proto_counts: HashMap<u8, u64> = HashMap::new();
     for s in p.samples {
-        *proto_counts.entry(s.proto).or_insert(0) += 1;
+        *proto_counts.entry(s.proto).or_insert(0u64) += s.est_packets;
     }
     let proto = proto_counts
         .into_iter()
@@ -540,6 +544,28 @@ mod tests {
         } else {
             panic!("expected Opened");
         }
+    }
+
+    #[test]
+    fn window_zero_does_not_produce_inf_rates() {
+        // window_ms = 0 must be clamped to 1 ms, not produce inf rates.
+        let mut d = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1e15, // impossibly high pps threshold
+            1e15, // impossibly high bps threshold
+            0,    // zero window — the fix clamps this to 1ms
+            2000,
+        );
+        // A modest number of samples that should not cross 1e15 threshold.
+        for _ in 0..10 {
+            d.observe(&obs([203, 0, 113, 9], [10, 0, 0, 1], 1, 100), 0);
+        }
+        let events = d.tick(0);
+        // No detection should be opened (rates must be finite and below threshold).
+        assert!(
+            events.is_empty(),
+            "expected no detection with zero window_ms; got {events:?}"
+        );
     }
 
     #[test]
