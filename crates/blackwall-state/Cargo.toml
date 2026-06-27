@@ -7,10 +7,13 @@ repository.workspace = true
 
 [dependencies]
 blackwall-core = { path = "../blackwall-core" }
+blackwall-flow = { path = "../blackwall-flow" }
+async-trait = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 ipnet = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
