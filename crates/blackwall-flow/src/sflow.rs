@@ -70,7 +70,11 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
     let agent_addr_len: usize = match agent_addr_type {
         1 => 4,
         2 => 16,
-        _ => 0,
+        t => {
+            return Err(FlowError::Decode(format!(
+                "unknown sFlow agent address type {t}"
+            )))
+        }
     };
     cur.take(agent_addr_len)?; // skip agent address
     let _sub_agent = cur.read_u32()?;
@@ -80,7 +84,8 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
 
     for _ in 0..num_samples {
         let sample_type = cur.read_u32()?;
-        let sample_length = cur.read_u32()? as usize;
+        let sample_length = usize::try_from(cur.read_u32()?)
+            .map_err(|_| FlowError::Decode("length overflow".into()))?;
         let sample_body = cur.take(sample_length)?;
 
         // Only process flow samples (enterprise=0, format=1).
@@ -88,63 +93,34 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
             continue;
         }
 
-        decode_flow_sample(sample_body, &mut observations);
+        decode_flow_sample(sample_body, &mut observations)?;
     }
 
     Ok(observations)
 }
 
 /// Parse a flow-sample body and append any decoded observations.
-fn decode_flow_sample(body: &[u8], out: &mut Vec<FlowObservation>) {
+///
+/// Returns `Err(FlowError::Decode)` only when a length field in the sample
+/// runs past the sample body (structural truncation).  Non-raw records,
+/// non-Ethernet header protocols, and etherparse failures are skipped.
+fn decode_flow_sample(body: &[u8], out: &mut Vec<FlowObservation>) -> Result<(), FlowError> {
     let mut cur = Cursor::new(body);
 
-    // Flow sample header — ignore errors silently; malformed bodies are skipped.
-    let _sequence = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let _source_id = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let sampling_rate = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let _sample_pool = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let _drops = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let _input = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let _output = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let num_records = match cur.read_u32() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    let _sequence = cur.read_u32()?;
+    let _source_id = cur.read_u32()?;
+    let sampling_rate = cur.read_u32()?;
+    let _sample_pool = cur.read_u32()?;
+    let _drops = cur.read_u32()?;
+    let _input = cur.read_u32()?;
+    let _output = cur.read_u32()?;
+    let num_records = cur.read_u32()?;
 
     for _ in 0..num_records {
-        let record_type = match cur.read_u32() {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let record_length = match cur.read_u32() {
-            Ok(v) => v as usize,
-            Err(_) => return,
-        };
-        let record_body = match cur.take(record_length) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+        let record_type = cur.read_u32()?;
+        let record_length = usize::try_from(cur.read_u32()?)
+            .map_err(|_| FlowError::Decode("length overflow".into()))?;
+        let record_body = cur.take(record_length)?;
 
         // Only raw packet header records (enterprise=0, format=1).
         if record_type & 0xFFF != 1 {
@@ -155,6 +131,8 @@ fn decode_flow_sample(body: &[u8], out: &mut Vec<FlowObservation>) {
             out.push(obs);
         }
     }
+
+    Ok(())
 }
 
 /// Parse one raw-header record body and return an observation if possible.
@@ -164,7 +142,7 @@ fn decode_raw_header_record(body: &[u8], sampling_rate: u32) -> Option<FlowObser
     let header_protocol = cur.read_u32().ok()?;
     let frame_len = cur.read_u32().ok()?;
     let _stripped = cur.read_u32().ok()?;
-    let header_length = cur.read_u32().ok()? as usize;
+    let header_length = usize::try_from(cur.read_u32().ok()?).ok()?;
     let header_bytes = cur.take(header_length).ok()?;
 
     // Only Ethernet (ISO 88023) is supported.
@@ -348,5 +326,53 @@ mod tests {
         dd.extend_from_slice(&1000u32.to_be_bytes()); // uptime
         dd.extend_from_slice(&0u32.to_be_bytes()); // num_samples = 0
         assert!(decode_datagram(&dd).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inner_record_length_past_sample_errors() {
+        // Build a datagram whose flow sample has num_records=1, record_length=9999
+        // (far past the sample body end) — must propagate as Err.
+        let mut d = Vec::new();
+        d.extend_from_slice(&be(5)); // version
+        d.extend_from_slice(&be(1)); // agent type ipv4
+        d.extend_from_slice(&[10, 0, 0, 1]); // agent addr
+        d.extend_from_slice(&be(0)); // sub agent
+        d.extend_from_slice(&be(1)); // seq
+        d.extend_from_slice(&be(1000)); // uptime
+        d.extend_from_slice(&be(1)); // num_samples
+
+        // Flow sample body: header fields + 1 record claiming huge length
+        let mut flow = Vec::new();
+        flow.extend_from_slice(&be(1)); // flow seq
+        flow.extend_from_slice(&be(0)); // source_id
+        flow.extend_from_slice(&be(1)); // sampling_rate
+        flow.extend_from_slice(&be(0)); // sample_pool
+        flow.extend_from_slice(&be(0)); // drops
+        flow.extend_from_slice(&be(0)); // input
+        flow.extend_from_slice(&be(0)); // output
+        flow.extend_from_slice(&be(1)); // num_records
+        flow.extend_from_slice(&be(1)); // record_type = raw header
+        flow.extend_from_slice(&be(9999)); // record_length — far past body
+
+        d.extend_from_slice(&be(1)); // sample_type = flow sample
+        d.extend_from_slice(&be(u32::try_from(flow.len()).unwrap()));
+        d.extend_from_slice(&flow);
+
+        assert!(decode_datagram(&d).is_err());
+    }
+
+    #[test]
+    fn unknown_agent_type_errors() {
+        // agent_address_type = 3 (invalid) — must return Err.
+        let mut d = Vec::new();
+        d.extend_from_slice(&be(5)); // version
+        d.extend_from_slice(&be(3)); // agent type unknown
+                                     // no agent addr bytes — decoder should error before reading them
+        d.extend_from_slice(&be(0)); // sub agent (garbage but shouldn't be reached)
+        d.extend_from_slice(&be(1)); // seq
+        d.extend_from_slice(&be(1000)); // uptime
+        d.extend_from_slice(&be(0)); // num_samples
+
+        assert!(decode_datagram(&d).is_err());
     }
 }
