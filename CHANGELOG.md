@@ -9,6 +9,7 @@ All notable changes to this project are documented here, following
 - Speedtest now runs providers sequentially, measures each download over the full window, and reports the fastest clean provider — fixing wildly variable, under-reporting results on fast links.
 
 ### Added
+- Flow detection (sub-project D, M1): a `blackwalld flow` subcommand ingests sFlow v5, estimates per-destination pps/bps over a sliding window, and records volumetric attacks against the operator's prefixes to a `detections` table (new `blackwall-flow` crate).
 - Workspace scaffold, CI, and lint configuration (`Cargo.toml` resolver v2, `rustfmt.toml`, workspace-level Clippy lints).
 - Core domain types: `Policy`, `Tenant`, `AllowRule`, `PortState`, `L4Proto`, `ServiceTarget`, `ResolvedService`, and `PolicyError` (`blackwall-core`).
 - Policy resolution: validates prefix containment, duplicate ownership, and duplicate services (`blackwall-core::resolve`).
