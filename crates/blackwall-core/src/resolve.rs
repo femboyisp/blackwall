@@ -125,6 +125,7 @@ mod tests {
             tenants,
             shaping: Vec::new(),
             banner_flux: None,
+            dns_flux: None,
         }
     }
 
@@ -258,6 +259,7 @@ mod tests {
             tenants: vec![],
             shaping: Vec::new(),
             banner_flux: None,
+            dns_flux: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
