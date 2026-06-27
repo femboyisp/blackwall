@@ -10,6 +10,8 @@ thiserror = { workspace = true }
 ipnet = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
+domain = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
