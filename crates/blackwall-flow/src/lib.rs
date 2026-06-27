@@ -3,6 +3,8 @@
 
 mod error;
 mod observation;
+mod sflow;
 
 pub use error::FlowError;
 pub use observation::FlowObservation;
+pub use sflow::decode_datagram;
