@@ -64,6 +64,27 @@ enum Command {
         #[arg(long)]
         interface: Option<String>,
     },
+    /// Run the sFlow collector and volumetric attack detector.
+    Flow {
+        /// Policy config file (its prefixes scope which destinations are detection candidates).
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// UDP listen address for sFlow datagrams.
+        #[arg(long, default_value = "0.0.0.0:6343")]
+        listen: std::net::SocketAddr,
+        /// Per-destination packets-per-second threshold.
+        #[arg(long)]
+        pps_threshold: f64,
+        /// Per-destination bits-per-second threshold.
+        #[arg(long)]
+        bps_threshold: f64,
+        /// Sliding window in seconds.
+        #[arg(long, default_value_t = 10)]
+        window_secs: u64,
+        /// Hold-down in seconds before clearing a detection.
+        #[arg(long, default_value_t = 30)]
+        hold_down_secs: u64,
+    },
     /// Apply the ruleset and start the deception engine (requires CAP_NET_ADMIN).
     Run {
         /// Path to the Blackwall config file.
@@ -350,6 +371,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(err) => Err(err.into()),
             }
+        }
+        Command::Flow {
+            config,
+            listen,
+            pps_threshold,
+            bps_threshold,
+            window_secs,
+            hold_down_secs,
+        } => {
+            let policy = blackwall_config::parse_file(&config)?;
+            let database_url = std::env::var("DATABASE_URL")
+                .map_err(|_| "DATABASE_URL must be set for the flow detector")?;
+            let store = std::sync::Arc::new(blackwall_state::Store::connect(&database_url).await?);
+            store.migrate().await?;
+            let detector = blackwall_flow::ThresholdDetector::new(
+                policy.prefixes.clone(),
+                pps_threshold,
+                bps_threshold,
+                window_secs * 1000,
+                hold_down_secs * 1000,
+            );
+            let sink = std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store));
+            tracing::info!(%listen, "sflow collector starting");
+            blackwall_flow::run_collector(listen, Box::new(detector), sink, 1000).await?;
+            Ok(())
         }
         Command::Apply {
             config,
