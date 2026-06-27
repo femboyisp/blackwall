@@ -209,17 +209,25 @@ impl Detector for ThresholdDetector {
             }
 
             // Aggregate totals.
-            let total_packets: u64 = state.samples.iter().map(|s| s.est_packets).sum();
-            let total_bytes: u64 = state.samples.iter().map(|s| s.est_bytes).sum();
+            // Use u128 with saturating addition: est_bytes per sample can be up to
+            // u32::MAX * u32::MAX ≈ u64::MAX, so summing many samples overflows u64.
+            // Widening to u128 (saturating) prevents overflow/panic on attacker-influenced input.
+            let total_packets: u128 = state.samples.iter().fold(0u128, |acc, s| {
+                acc.saturating_add(u128::from(s.est_packets))
+            });
+            let total_bytes: u128 = state
+                .samples
+                .iter()
+                .fold(0u128, |acc, s| acc.saturating_add(u128::from(s.est_bytes)));
 
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "u64 packet/byte sums may exceed f64 mantissa; acceptable for rate estimates"
+                reason = "u128 packet/byte sums to f64; precision loss acceptable for rate estimates"
             )]
             let pps = total_packets as f64 / window_secs;
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "u64 byte sums may exceed f64 mantissa; acceptable for rate estimates"
+                reason = "u128 byte sums to f64; precision loss acceptable for rate estimates"
             )]
             let bps = (total_bytes as f64) * 8.0 / window_secs;
 
@@ -297,9 +305,11 @@ struct DetectionParams<'a> {
 /// Build a [`Detection`] from the current window of samples.
 fn build_detection(p: DetectionParams<'_>) -> Detection {
     // Dominant protocol: the one with the most estimated packets.
-    let mut proto_counts: HashMap<u8, u64> = HashMap::new();
+    // Use u128 with saturating addition to avoid overflow with attacker-influenced values.
+    let mut proto_counts: HashMap<u8, u128> = HashMap::new();
     for s in p.samples {
-        *proto_counts.entry(s.proto).or_insert(0u64) += s.est_packets;
+        let entry = proto_counts.entry(s.proto).or_insert(0u128);
+        *entry = entry.saturating_add(u128::from(s.est_packets));
     }
     let proto = proto_counts
         .into_iter()
@@ -308,11 +318,13 @@ fn build_detection(p: DetectionParams<'_>) -> Detection {
         .unwrap_or(0);
 
     // Top-3 sources by summed est_packets.
-    let mut src_map: HashMap<IpAddr, u64> = HashMap::new();
+    // Use u128 with saturating addition to match the widened window totals and avoid overflow.
+    let mut src_map: HashMap<IpAddr, u128> = HashMap::new();
     for s in p.samples {
-        *src_map.entry(s.src).or_insert(0) += s.est_packets;
+        let entry = src_map.entry(s.src).or_insert(0u128);
+        *entry = entry.saturating_add(u128::from(s.est_packets));
     }
-    let mut src_vec: Vec<(IpAddr, u64)> = src_map.into_iter().collect();
+    let mut src_vec: Vec<(IpAddr, u128)> = src_map.into_iter().collect();
     src_vec.sort_by_key(|e| std::cmp::Reverse(e.1));
     let top_sources: Vec<(IpAddr, f64)> = src_vec
         .into_iter()
@@ -320,7 +332,7 @@ fn build_detection(p: DetectionParams<'_>) -> Detection {
         .map(|(addr, pkts)| {
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "u64 packet sum to f64 for pps display; precision loss acceptable"
+                reason = "u128 packet sum to f64 for pps display; precision loss acceptable"
             )]
             let src_pps = pkts as f64 / p.window_secs;
             (addr, src_pps)
@@ -328,11 +340,13 @@ fn build_detection(p: DetectionParams<'_>) -> Detection {
         .collect();
 
     // Top-3 ports by summed est_packets.
-    let mut port_map: HashMap<u16, u64> = HashMap::new();
+    // Use u128 with saturating addition to match the widened window totals and avoid overflow.
+    let mut port_map: HashMap<u16, u128> = HashMap::new();
     for s in p.samples {
-        *port_map.entry(s.dst_port).or_insert(0) += s.est_packets;
+        let entry = port_map.entry(s.dst_port).or_insert(0u128);
+        *entry = entry.saturating_add(u128::from(s.est_packets));
     }
-    let mut port_vec: Vec<(u16, u64)> = port_map.into_iter().collect();
+    let mut port_vec: Vec<(u16, u128)> = port_map.into_iter().collect();
     port_vec.sort_by_key(|e| std::cmp::Reverse(e.1));
     let top_ports: Vec<(u16, f64)> = port_vec
         .into_iter()
@@ -340,7 +354,7 @@ fn build_detection(p: DetectionParams<'_>) -> Detection {
         .map(|(port, pkts)| {
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "u64 packet sum to f64 for pps display; precision loss acceptable"
+                reason = "u128 packet sum to f64 for pps display; precision loss acceptable"
             )]
             let port_pps = pkts as f64 / p.window_secs;
             (port, port_pps)
@@ -583,5 +597,44 @@ mod tests {
         let ev = d.tick(0);
         assert_eq!(ev.len(), 1);
         assert!(matches!(ev[0], DetectionEvent::Opened(_)));
+    }
+
+    #[test]
+    fn wide_sums_do_not_overflow() {
+        // Each sample: est_packets = u32::MAX ≈ 4.3e9, est_bytes = u32::MAX * u32::MAX ≈ 1.8e19.
+        // 64 such samples would overflow u64 for both est_packets and est_bytes.
+        // With u128 saturating sums this must NOT panic and must produce a finite, very large rate.
+        let mut d = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0, // very low pps threshold so a detection opens
+            1.0, // very low bps threshold
+            1000,
+            2000,
+        );
+        let max_rate = u32::MAX;
+        let max_len = u32::MAX;
+        for _ in 0..64 {
+            d.observe(&obs([203, 0, 113, 10], [10, 0, 0, 1], max_rate, max_len), 0);
+        }
+        // Must not panic (in debug builds u64 overflow would panic).
+        let ev = d.tick(0);
+        // A detection must have been opened (rates are astronomically above threshold).
+        assert_eq!(ev.len(), 1, "expected exactly one Opened event; got {ev:?}");
+        match &ev[0] {
+            DetectionEvent::Opened(det) => {
+                assert!(
+                    det.observed_bps.is_finite(),
+                    "observed_bps must be finite, got {}",
+                    det.observed_bps
+                );
+                assert!(
+                    det.observed_pps.is_finite(),
+                    "observed_pps must be finite, got {}",
+                    det.observed_pps
+                );
+                assert!(det.observed_bps > 1.0, "expected very large bps");
+            }
+            other => panic!("expected Opened, got {other:?}"),
+        }
     }
 }
