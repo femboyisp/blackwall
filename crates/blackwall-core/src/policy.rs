@@ -43,4 +43,6 @@ pub struct Policy {
     pub shaping: Vec<crate::ShapeRule>,
     /// Banner fast-flux config (rotate the deception persona over time); `None` disables it.
     pub banner_flux: Option<crate::BannerFluxConfig>,
+    /// DNS fast-flux config (rotate a name's records over time); `None` disables it.
+    pub dns_flux: Option<crate::DnsFluxConfig>,
 }
