@@ -25,7 +25,21 @@ pub struct TsigKey {
     pub secret: Vec<u8>,
 }
 
-/// Parse a BIND `key "name" { algorithm <alg>; secret "<base64>"; };` file.
+/// Parse a single `tsig-keygen`-style BIND key stanza.
+///
+/// Expected input format:
+/// ```text
+/// key "<name>" {
+///     algorithm <alg>;
+///     secret "<base64>";
+/// };
+/// ```
+///
+/// The parser reads the **first** key block only; comments and extra stanzas
+/// after the first `};` are not supported and are ignored.  The
+/// `algorithm` and `secret` tokens are scoped to the key block body (the
+/// text between the first `{` and its matching `}`), preventing a stray
+/// occurrence of either keyword outside the block from being picked up.
 ///
 /// Returns [`DnsError::Config`] if the key name, algorithm, or secret is
 /// missing or the algorithm string is unrecognised.
@@ -34,7 +48,12 @@ pub fn parse_tsig_key(text: &str) -> Result<TsigKey, DnsError> {
         .map(|s| s.trim().trim_matches('"').to_owned())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| DnsError::Config("tsig key: missing key name".to_owned()))?;
-    let alg_tok = field(text, "algorithm")
+
+    // Scope algorithm/secret scanning to the key block body only.
+    let body = between(text, "{", "}")
+        .ok_or_else(|| DnsError::Config("tsig key: missing key block body".to_owned()))?;
+
+    let alg_tok = field(body, "algorithm")
         .ok_or_else(|| DnsError::Config("tsig key: missing algorithm".to_owned()))?;
     let algorithm = match alg_tok.as_str() {
         "hmac-sha256" => TsigAlgorithm::HmacSha256,
@@ -46,7 +65,7 @@ pub fn parse_tsig_key(text: &str) -> Result<TsigKey, DnsError> {
             )));
         }
     };
-    let secret_b64 = field(text, "secret")
+    let secret_b64 = field(body, "secret")
         .map(|s| s.trim_matches('"').to_owned())
         .ok_or_else(|| DnsError::Config("tsig key: missing secret".to_owned()))?;
     let secret = base64::engine::general_purpose::STANDARD
@@ -116,5 +135,27 @@ key "bw-key" {
         assert!(parse_tsig_key("not a key file").is_err());
         assert!(parse_tsig_key("key \"k\" { algorithm hmac-sha256; };").is_err());
         // no secret
+    }
+
+    /// Regression: algorithm/secret keywords appearing outside the first key
+    /// block (in a trailing comment or a second stanza) must not influence the
+    /// parse result of the first block.
+    #[test]
+    fn parses_key_ignoring_text_outside_block() {
+        let text = r#"
+key "bw-key" {
+    algorithm hmac-sha256;
+    secret "dGVzdC1zZWNyZXQtMTIzNA==";
+};
+// algorithm hmac-sha512; secret "AAAAAAAAAAAAAAAA";
+key "other" {
+    algorithm hmac-sha512;
+    secret "AAAAAAAAAAAAAAAA";
+};
+"#;
+        let k = parse_tsig_key(text).unwrap();
+        assert_eq!(k.name, "bw-key");
+        assert_eq!(k.algorithm, TsigAlgorithm::HmacSha256);
+        assert_eq!(k.secret, b"test-secret-1234");
     }
 }
