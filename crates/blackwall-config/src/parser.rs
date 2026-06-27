@@ -4,8 +4,8 @@
 use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
-    AllowRule, BannerFluxConfig, L4Proto, Policy, PortState, ServiceTarget, ShapeBandwidth,
-    ShapeRule, Tenant,
+    AllowRule, BannerFluxConfig, DnsFluxConfig, L4Proto, Policy, PortState, ServiceTarget,
+    ShapeBandwidth, ShapeRule, Tenant,
 };
 use std::net::{IpAddr, SocketAddr};
 
@@ -17,6 +17,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut tenants = Vec::new();
     let mut shaping = Vec::new();
     let mut banner_flux: Option<BannerFluxConfig> = None;
+    let mut dns_flux: Option<DnsFluxConfig> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -76,6 +77,103 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     period,
                 });
             }
+            "dns-flux" => {
+                if dns_flux.is_some() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "dns-flux",
+                        value: "duplicate".to_owned(),
+                    });
+                }
+                let mut kv: std::collections::HashMap<&str, &str> =
+                    std::collections::HashMap::new();
+                for tok in &line.words[1..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "dns-flux",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    if !matches!(
+                        k,
+                        "server"
+                            | "zone"
+                            | "name"
+                            | "from"
+                            | "count"
+                            | "set"
+                            | "period"
+                            | "ttl"
+                            | "tsig"
+                    ) {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "dns-flux key",
+                            value: k.to_owned(),
+                        });
+                    }
+                    kv.insert(k, v);
+                }
+                let get = |k: &str| -> Result<&str, ConfigError> {
+                    kv.get(k).copied().ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "dns-flux missing key",
+                        value: k.to_owned(),
+                    })
+                };
+                let bad = |what: &'static str, v: &str| ConfigError::BadValue {
+                    line: line.number,
+                    what,
+                    value: v.to_owned(),
+                };
+
+                let server_tok = get("server")?;
+                let server: SocketAddr = server_tok
+                    .parse::<SocketAddr>()
+                    .or_else(|_| {
+                        server_tok
+                            .parse::<IpAddr>()
+                            .map(|ip| SocketAddr::new(ip, 53))
+                    })
+                    .map_err(|_| bad("server", server_tok))?;
+                let prefix: ipnet::IpNet = {
+                    let v = get("from")?;
+                    v.parse().map_err(|_| bad("from", v))?
+                };
+                let count: usize = {
+                    let v = get("count")?;
+                    v.parse().map_err(|_| bad("count", v))?
+                };
+                let set: usize = {
+                    let v = get("set")?;
+                    v.parse().map_err(|_| bad("set", v))?
+                };
+                if set < 1 || count < set {
+                    return Err(bad(
+                        "dns-flux set/count",
+                        &format!("set={set} count={count}"),
+                    ));
+                }
+                let period = match kv.get("period") {
+                    Some(t) => parse_duration(line, t)?,
+                    None => std::time::Duration::from_secs(300),
+                };
+                let ttl: u32 = match kv.get("ttl") {
+                    Some(t) => u32::try_from(parse_duration(line, t)?.as_secs())
+                        .map_err(|_| bad("ttl", t))?,
+                    None => 30,
+                };
+                dns_flux = Some(DnsFluxConfig {
+                    server,
+                    zone: get("zone")?.to_owned(),
+                    name: get("name")?.to_owned(),
+                    prefix,
+                    count,
+                    set,
+                    period,
+                    ttl,
+                    tsig_path: std::path::PathBuf::from(get("tsig")?),
+                });
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -100,7 +198,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         tenants,
         shaping,
         banner_flux,
-        dns_flux: None,
+        dns_flux,
     })
 }
 
@@ -636,6 +734,59 @@ tenant t {
     #[test]
     fn rejects_duplicate_banner_flux() {
         assert!(parse_text("interface wan eth0\nbanner-flux /a\nbanner-flux /b\n").is_err());
+    }
+
+    #[test]
+    fn parses_dns_flux_full_with_defaults() {
+        let p = parse_text(
+            "interface wan eth0\n\
+             dns-flux server=192.0.2.53 zone=example.com name=www.example.com from=203.0.113.0/24 count=8 set=3 tsig=/etc/bw/knot.tsig\n",
+        )
+        .unwrap();
+        let d = p.dns_flux.unwrap();
+        assert_eq!(d.server, "192.0.2.53:53".parse().unwrap());
+        assert_eq!(d.zone, "example.com");
+        assert_eq!(d.name, "www.example.com");
+        assert_eq!(d.prefix, "203.0.113.0/24".parse().unwrap());
+        assert_eq!(d.count, 8);
+        assert_eq!(d.set, 3);
+        assert_eq!(d.period, std::time::Duration::from_secs(300));
+        assert_eq!(d.ttl, 30);
+        assert_eq!(d.tsig_path, std::path::PathBuf::from("/etc/bw/knot.tsig"));
+    }
+
+    #[test]
+    fn parses_dns_flux_with_explicit_port_period_ttl() {
+        let p = parse_text(
+            "interface wan eth0\n\
+             dns-flux server=192.0.2.53:5353 zone=z name=n from=2001:db8::/64 count=4 set=2 period=1m ttl=10s tsig=/k\n",
+        )
+        .unwrap();
+        let d = p.dns_flux.unwrap();
+        assert_eq!(d.server, "192.0.2.53:5353".parse().unwrap());
+        assert_eq!(d.period, std::time::Duration::from_secs(60));
+        assert_eq!(d.ttl, 10);
+        assert_eq!(d.prefix, "2001:db8::/64".parse().unwrap());
+    }
+
+    #[test]
+    fn rejects_dns_flux_set_gt_count() {
+        assert!(parse_text("interface wan eth0\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=2 set=5 tsig=/k\n").is_err());
+    }
+
+    #[test]
+    fn rejects_dns_flux_unknown_key() {
+        assert!(parse_text("interface wan eth0\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=2 set=1 tsig=/k bogus=1\n").is_err());
+    }
+
+    #[test]
+    fn rejects_dns_flux_missing_required() {
+        assert!(parse_text("interface wan eth0\ndns-flux server=192.0.2.53 zone=z\n").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_dns_flux() {
+        assert!(parse_text("interface wan eth0\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=2 set=1 tsig=/k\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=2 set=1 tsig=/k\n").is_err());
     }
 
     #[test]
