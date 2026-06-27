@@ -566,6 +566,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // runs an initial speedtest and then spawns a detached re-tune loop.
             apply_shaping(&policy, librespeed_server, shape_interval_secs).await;
 
+            // dns-flux: load key + pool (fatal on failure), then push each period.
+            if let Some(dns_cfg) = policy.dns_flux.clone() {
+                // Fatal at startup: bad key or a prefix too small for `count`.
+                let key = blackwall_dns::read_tsig_key(&dns_cfg.tsig_path)?;
+                let pool = blackwall_dns::flux_pool(&dns_cfg.prefix, dns_cfg.count)?;
+                tokio::spawn(async move {
+                    loop {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let ips = blackwall_dns::flux_window(
+                            &pool,
+                            dns_cfg.set,
+                            now,
+                            dns_cfg.period.as_secs(),
+                        );
+                        let plan = blackwall_dns::build_update(dns_cfg.ttl, &ips);
+                        match blackwall_dns::send_update(
+                            dns_cfg.server,
+                            &dns_cfg.zone,
+                            &dns_cfg.name,
+                            &plan,
+                            &key,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(name = %dns_cfg.name, count = ips.len(), "dns-flux updated")
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "dns-flux update failed; will retry next period")
+                            }
+                        }
+                        tokio::time::sleep(blackwall_dns::next_boundary_delay(
+                            now,
+                            dns_cfg.period.as_secs(),
+                        ))
+                        .await;
+                    }
+                });
+            }
+
             // Drop the controller's tx so the drain loop terminates when all serve clones are gone.
             drop(tx);
 
