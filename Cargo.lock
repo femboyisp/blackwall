@@ -192,6 +192,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-flow"
+version = "0.1.0"
+dependencies = [
+ "etherparse",
+ "ipnet",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "blackwall-nft"
 version = "0.1.0"
 dependencies = [
@@ -247,6 +257,7 @@ dependencies = [
  "blackwall-core",
  "blackwall-deception",
  "blackwall-discovery",
+ "blackwall-dns",
  "blackwall-nft",
  "blackwall-shaper",
  "blackwall-speedtest",
