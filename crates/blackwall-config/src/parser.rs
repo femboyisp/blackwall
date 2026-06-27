@@ -100,6 +100,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         tenants,
         shaping,
         banner_flux,
+        dns_flux: None,
     })
 }
 
