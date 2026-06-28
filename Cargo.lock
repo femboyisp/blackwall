@@ -192,6 +192,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-flow"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "etherparse",
+ "ipnet",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "blackwall-nft"
 version = "0.1.0"
 dependencies = [
@@ -231,12 +243,15 @@ dependencies = [
 name = "blackwall-state"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blackwall-core",
+ "blackwall-flow",
  "ipnet",
  "serde_json",
  "sqlx",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -247,6 +262,8 @@ dependencies = [
  "blackwall-core",
  "blackwall-deception",
  "blackwall-discovery",
+ "blackwall-dns",
+ "blackwall-flow",
  "blackwall-nft",
  "blackwall-shaper",
  "blackwall-speedtest",
