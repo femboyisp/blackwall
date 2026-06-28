@@ -1,5 +1,5 @@
 //! PostgreSQL persistence for Blackwall: tenants, IP assignments, services,
-//! and the audit log.
+//! the audit log, and flow-based attack detections.
 
 mod audit;
 mod error;
@@ -12,10 +12,12 @@ pub use services::StoredService;
 pub use sessions::SessionRow;
 
 use blackwall_core::{L4Proto, Policy, ServiceTarget};
+use blackwall_flow::{Detection, DetectionEvent, MitigationSink, Severity};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// A handle to the Blackwall state database.
 #[derive(Clone)]
@@ -190,11 +192,138 @@ impl Store {
             .await?;
         Ok(row.0)
     }
+
+    /// Insert a new active detection row.
+    pub async fn open_detection(&self, d: &Detection) -> Result<(), StateError> {
+        let target = ipnetwork_addr(d.target);
+        let proto = i32::from(d.proto);
+        let severity = severity_str(d.severity);
+        let top_sources = serde_json::Value::Array(
+            d.top_sources
+                .iter()
+                .map(|(ip, pps)| serde_json::json!({ "ip": ip.to_string(), "pps": pps }))
+                .collect(),
+        );
+        let top_ports = serde_json::Value::Array(
+            d.top_ports
+                .iter()
+                .map(|(port, pps)| serde_json::json!({ "port": port, "pps": pps }))
+                .collect(),
+        );
+        let first_seen_ms = i64::try_from(d.first_seen_ms).unwrap_or(i64::MAX);
+        let last_seen_ms = i64::try_from(d.last_seen_ms).unwrap_or(i64::MAX);
+        sqlx::query(
+            "INSERT INTO detections \
+             (target, kind, observed_pps, observed_bps, proto, top_sources, top_ports, severity, first_seen, last_seen) \
+             VALUES ($1, 'volumetric', $2, $3, $4, $5, $6, $7, \
+                     to_timestamp($8::bigint / 1000.0), to_timestamp($9::bigint / 1000.0))",
+        )
+        .bind(target)
+        .bind(d.observed_pps)
+        .bind(d.observed_bps)
+        .bind(proto)
+        .bind(top_sources)
+        .bind(top_ports)
+        .bind(severity)
+        .bind(first_seen_ms)
+        .bind(last_seen_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update the active detection row for `target`.
+    pub async fn update_detection(
+        &self,
+        target: IpAddr,
+        pps: f64,
+        bps: f64,
+        last_seen_ms: u64,
+    ) -> Result<(), StateError> {
+        let target = ipnetwork_addr(target);
+        let last_seen_ms = i64::try_from(last_seen_ms).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE detections \
+             SET observed_pps = $2, observed_bps = $3, last_seen = to_timestamp($4::bigint / 1000.0) \
+             WHERE target = $1 AND cleared_at IS NULL",
+        )
+        .bind(target)
+        .bind(pps)
+        .bind(bps)
+        .bind(last_seen_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark the active detection row for `target` as cleared.
+    pub async fn clear_detection(&self, target: IpAddr, at_ms: u64) -> Result<(), StateError> {
+        let target = ipnetwork_addr(target);
+        let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE detections \
+             SET cleared_at = to_timestamp($2::bigint / 1000.0) \
+             WHERE target = $1 AND cleared_at IS NULL",
+        )
+        .bind(target)
+        .bind(at_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Convert an [`IpAddr`] into the `sqlx` INET wire type as a /32 or /128 host.
 fn ipnetwork_addr(addr: IpAddr) -> sqlx::types::ipnetwork::IpNetwork {
     sqlx::types::ipnetwork::IpNetwork::from_str(&addr.to_string()).expect("host address is valid")
+}
+
+/// Map a [`Severity`] to its database text representation.
+fn severity_str(s: Severity) -> &'static str {
+    match s {
+        Severity::Warning => "warning",
+        Severity::High => "high",
+        Severity::Critical => "critical",
+    }
+}
+
+/// A [`MitigationSink`] that persists detection events to Postgres.
+pub struct PgMitigationSink {
+    store: Arc<Store>,
+}
+
+impl PgMitigationSink {
+    /// Create a new sink wrapping `store`.
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait::async_trait]
+impl MitigationSink for PgMitigationSink {
+    async fn handle(&self, event: &DetectionEvent) {
+        let res = match event {
+            DetectionEvent::Opened(d) => self.store.open_detection(d).await,
+            DetectionEvent::Updated(d) => {
+                self.store
+                    .update_detection(d.target, d.observed_pps, d.observed_bps, d.last_seen_ms)
+                    .await
+            }
+            DetectionEvent::Cleared { target, at_ms } => {
+                self.store.clear_detection(*target, *at_ms).await
+            }
+        };
+        if let Err(err) = res {
+            tracing::warn!(%err, "failed to persist detection event");
+        } else if let DetectionEvent::Opened(d) = event {
+            tracing::warn!(
+                target = %d.target,
+                pps = d.observed_pps,
+                severity = ?d.severity,
+                "attack detected"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
