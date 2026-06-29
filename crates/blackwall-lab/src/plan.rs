@@ -97,7 +97,11 @@ pub fn netns_name(run_id: &str, node: &str) -> String {
 /// using a short run id (6 chars) plus link index and side character.
 #[must_use]
 pub fn iface_name(run_id: &str, link_idx: usize, side: char) -> String {
-    format!("v{run_id}{link_idx}{side}")
+    let name = format!("v{run_id}{link_idx}{side}");
+    // Linux caps interface names at 15 bytes; run ids are 6 chars and link
+    // counts are tiny, so this holds by construction — assert it anyway.
+    debug_assert!(name.len() <= 15, "iface name `{name}` exceeds 15 bytes");
+    name
 }
 
 /// Resolve the namespace for a node (explicit override or per-run default).
@@ -246,6 +250,11 @@ mod tests {
         let first_veth = plan.ops.iter().position(|o| matches!(o, Op::CreateVethPair { .. })).unwrap();
         let last_netns = plan.ops.iter().rposition(|o| matches!(o, Op::CreateNetns(_))).unwrap();
         assert!(last_netns < first_veth);
+
+        // ordering: every link op (addr assignment) precedes the first daemon/run.
+        let last_link_op = plan.ops.iter().rposition(|o| matches!(o, Op::MoveIface { .. } | Op::AddAddr { .. })).unwrap();
+        let first_spawn = plan.ops.iter().position(|o| matches!(o, Op::SpawnDaemon { .. } | Op::SpawnRun { .. })).unwrap();
+        assert!(last_link_op < first_spawn);
     }
 
     #[test]
