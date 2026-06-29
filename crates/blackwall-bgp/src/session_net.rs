@@ -22,11 +22,12 @@
 
 use crate::{
     build_announce, build_withdraw, decode_message, encode_keepalive, encode_notification,
-    encode_open, BgpMessage, NotificationMsg, OpenMsg, Route,
+    encode_open, parse_header, BgpMessage, NotificationMsg, OpenMsg, Route, HEADER_LEN,
 };
 use ipnet::IpNet;
 use std::{
     collections::HashMap,
+    future,
     net::{Ipv4Addr, SocketAddr},
 };
 use tokio::{
@@ -140,6 +141,11 @@ enum SessionOutcome {
     CommandsExhausted,
 }
 
+/// Read buffer ceiling: 64 KiB.  A single BGP message is ≤ 4096 bytes, so if
+/// the buffer grows past this the peer is dribbling bytes without completing
+/// frames — treat it as corruption and reconnect.
+const READ_BUF_LIMIT: usize = 65536;
+
 /// Apply pending commands to `active` without writing anything on the wire.
 ///
 /// Called while no session is up, so we just update the local state.
@@ -193,9 +199,9 @@ async fn session_once(
     }
     debug!(peer = %cfg.peer_addr, "OPEN sent");
 
-    // ── 3. Read peer's OPEN (with partial-frame buffering) ─────────────────
+    // ── 3. Read peer's OPEN (length-based framing) ─────────────────────────
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    let peer_open = loop {
+    let peer_open = 'handshake: loop {
         let mut tmp = [0u8; 4096];
         let n = match stream.read(&mut tmp).await {
             Ok(0) => {
@@ -210,32 +216,63 @@ async fn session_once(
         };
         buf.extend_from_slice(&tmp[..n]);
 
-        match decode_message(&buf) {
-            Ok((BgpMessage::Open(o), consumed)) => {
-                buf.drain(..consumed);
-                break o;
+        // Fix 2: reject runaway buffers.
+        if buf.len() > READ_BUF_LIMIT {
+            error!(peer = %cfg.peer_addr, "read buffer overflow during handshake");
+            return SessionOutcome::Reconnect("read buffer overflow".to_owned());
+        }
+
+        // Fix 1: length-based framing — try to consume all complete frames.
+        loop {
+            if buf.len() < HEADER_LEN {
+                // Not enough bytes for a header yet; read more.
+                break;
             }
-            Ok((BgpMessage::Notification(n), _)) => {
-                warn!(
-                    peer = %cfg.peer_addr,
-                    code = n.code,
-                    subcode = n.subcode,
-                    "NOTIFICATION during handshake"
-                );
-                return SessionOutcome::Reconnect(format!(
-                    "NOTIFICATION during handshake code={} subcode={}",
-                    n.code, n.subcode
-                ));
+            let (ty, total_len) = match parse_header(&buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(peer = %cfg.peer_addr, "bad BGP header during handshake: {e}");
+                    return SessionOutcome::Reconnect(format!(
+                        "decode error during handshake: {e}"
+                    ));
+                }
+            };
+            if buf.len() < total_len {
+                // Frame is incomplete; read more bytes.
+                break;
             }
-            Ok(_) => {
-                // Unexpected Keepalive/Update before OPEN — ignore, keep waiting.
-                warn!(peer = %cfg.peer_addr, "unexpected non-OPEN message during handshake");
-            }
-            Err(e) if is_partial(&e) => {
-                // Partial frame — keep reading.
-            }
-            Err(e) => {
-                return SessionOutcome::Reconnect(format!("decode error during handshake: {e}"));
+            // We have a complete frame — decode it.
+            match decode_message(&buf[..total_len]) {
+                Ok((BgpMessage::Open(o), _)) => {
+                    buf.drain(..total_len);
+                    break 'handshake o;
+                }
+                Ok((BgpMessage::Notification(n), _)) => {
+                    warn!(
+                        peer = %cfg.peer_addr,
+                        code = n.code,
+                        subcode = n.subcode,
+                        "NOTIFICATION during handshake"
+                    );
+                    return SessionOutcome::Reconnect(format!(
+                        "NOTIFICATION during handshake code={} subcode={}",
+                        n.code, n.subcode
+                    ));
+                }
+                Ok(_) => {
+                    // Unexpected Keepalive/Update before OPEN — skip and keep waiting.
+                    warn!(
+                        peer = %cfg.peer_addr,
+                        msg_type = ty,
+                        "unexpected non-OPEN message during handshake"
+                    );
+                    buf.drain(..total_len);
+                }
+                Err(e) => {
+                    return SessionOutcome::Reconnect(format!(
+                        "decode error during handshake: {e}"
+                    ));
+                }
             }
         }
     };
@@ -269,12 +306,6 @@ async fn session_once(
     established_loop(cfg, commands, active, &mut stream, &mut buf, hold_secs).await
 }
 
-/// Return `true` when a decode error means the buffer is simply incomplete.
-fn is_partial(e: &crate::BgpError) -> bool {
-    let s = e.to_string();
-    s.contains("buffer too short") || s.contains("short header")
-}
-
 /// The established-state event loop.
 ///
 /// Drives keepalive/hold timers and processes both inbound frames and outbound
@@ -288,12 +319,13 @@ async fn established_loop(
     buf: &mut Vec<u8>,
     hold_secs: u16,
 ) -> SessionOutcome {
-    // Keepalive interval = hold/3, minimum 1 s.  RFC 4271 §6.7.
-    // If hold_secs == 0, no hold timer; use a 30 s keepalive to stay alive.
+    // Fix 3: when hold_secs == 0 (RFC 4271: no keepalive/hold timers), park the
+    // keepalive arm on `pending()` so we never send unsolicited KEEPALIVEs.
+    // When hold_secs > 0, keepalive every hold/3 (min 1 s).  RFC 4271 §6.7.
     let ka_interval = if hold_secs == 0 {
-        Duration::from_secs(30)
+        None
     } else {
-        Duration::from_secs((u64::from(hold_secs) / 3).max(1))
+        Some(Duration::from_secs((u64::from(hold_secs) / 3).max(1)))
     };
     let hold_dur = if hold_secs == 0 {
         None
@@ -301,15 +333,29 @@ async fn established_loop(
         Some(Duration::from_secs(u64::from(hold_secs)))
     };
 
-    let mut ka_deadline = Instant::now() + ka_interval;
+    let mut ka_deadline = ka_interval.map(|d| Instant::now() + d);
     let mut hold_deadline = hold_dur.map(|d| Instant::now() + d);
 
     loop {
-        // Drain all completely buffered frames before sleeping.
+        // Fix 1: length-based framing — drain all complete buffered frames.
         loop {
-            match decode_message(buf) {
-                Ok((msg, consumed)) => {
-                    buf.drain(..consumed);
+            if buf.len() < HEADER_LEN {
+                break;
+            }
+            let (_, total_len) = match parse_header(buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(peer = %cfg.peer_addr, "bad BGP header: {e}");
+                    return SessionOutcome::Reconnect(format!("frame decode error: {e}"));
+                }
+            };
+            if buf.len() < total_len {
+                // Incomplete frame — wait for more bytes.
+                break;
+            }
+            match decode_message(&buf[..total_len]) {
+                Ok((msg, _)) => {
+                    buf.drain(..total_len);
                     match msg {
                         BgpMessage::Keepalive | BgpMessage::Update => {
                             debug!(peer = %cfg.peer_addr, "inbound KEEPALIVE/UPDATE — reset hold timer");
@@ -335,7 +381,6 @@ async fn established_loop(
                         }
                     }
                 }
-                Err(e) if is_partial(&e) => break,
                 Err(e) => {
                     error!(peer = %cfg.peer_addr, "frame decode error: {e}");
                     return SessionOutcome::Reconnect(format!("frame decode error: {e}"));
@@ -345,28 +390,35 @@ async fn established_loop(
 
         // Compute remaining time until each deadline.
         let now = Instant::now();
-        let ka_wait = ka_deadline.saturating_duration_since(now);
 
-        // Compute hold timer wait; if hold_secs == 0, hold_deadline is None.
+        // Keepalive wait: None → park on pending() (hold == 0 case).
+        let ka_remaining = ka_deadline.map(|d| d.saturating_duration_since(now));
+
+        // Hold timer wait; if hold_secs == 0, hold_deadline is None → pending().
         let hold_remaining = hold_deadline.map(|d| d.saturating_duration_since(now));
 
         tokio::select! {
             biased;
 
-            // Keepalive timer: send KEEPALIVE.
-            () = tokio::time::sleep(ka_wait) => {
+            // Keepalive timer: send KEEPALIVE, or park forever when hold == 0.
+            () = async {
+                match ka_remaining {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => future::pending().await,
+                }
+            } => {
                 if let Err(e) = stream.write_all(&encode_keepalive()).await {
                     return SessionOutcome::Reconnect(format!("keepalive write failed: {e}"));
                 }
                 debug!(peer = %cfg.peer_addr, "KEEPALIVE sent");
-                ka_deadline = Instant::now() + ka_interval;
+                ka_deadline = ka_interval.map(|d| Instant::now() + d);
             }
 
             // Hold timer: send NOTIFICATION code 4 sub 0 and reconnect.
             () = async {
                 match hold_remaining {
                     Some(d) => tokio::time::sleep(d).await,
-                    None => std::future::pending().await,
+                    None => future::pending().await,
                 }
             } => {
                 warn!(peer = %cfg.peer_addr, "hold timer expired — sending NOTIFICATION");
@@ -386,6 +438,11 @@ async fn established_loop(
                         return SessionOutcome::Reconnect("peer closed connection".to_owned());
                     }
                     Ok(_) => {
+                        // Fix 2: reject runaway buffers.
+                        if buf.len() > READ_BUF_LIMIT {
+                            error!(peer = %cfg.peer_addr, "read buffer overflow");
+                            return SessionOutcome::Reconnect("read buffer overflow".to_owned());
+                        }
                         // Data appended; next iteration decodes.
                     }
                     Err(e) => {
