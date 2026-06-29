@@ -55,8 +55,14 @@ mod tests {
         settings.insert("zone".to_owned(), "lab.test".to_owned());
         settings.insert("tsig-name".to_owned(), "lab-key".to_owned());
         settings.insert("tsig-algo".to_owned(), "hmac-sha256".to_owned());
-        settings.insert("tsig-secret".to_owned(), "aGVsbG8tdGhpcy1pcy1hLWxhYi1rZXk=".to_owned());
-        Daemon { kind: DaemonKind::Knot, settings }
+        settings.insert(
+            "tsig-secret".to_owned(),
+            "aGVsbG8tdGhpcy1pcy1hLWxhYi1rZXk=".to_owned(),
+        );
+        Daemon {
+            kind: DaemonKind::Knot,
+            settings,
+        }
     }
 
     #[test]

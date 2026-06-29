@@ -7,9 +7,7 @@
 //!   BW_DNS_SECRET=<base64> cargo test -p blackwall-dns --test interop -- --ignored
 
 use base64::Engine as _;
-use blackwall_dns::{
-    build_update, flux_pool, flux_window, send_update, TsigAlgorithm, TsigKey,
-};
+use blackwall_dns::{build_update, flux_pool, flux_window, send_update, TsigAlgorithm, TsigKey};
 use ipnet::IpNet;
 use std::net::SocketAddr;
 use std::time::Duration;
