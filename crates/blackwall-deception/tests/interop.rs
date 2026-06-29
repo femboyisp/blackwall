@@ -63,14 +63,24 @@ async fn serves_deception_banner() {
     // default Deception, no tenants -> every TCP port classifies as deception.
     let policy = Policy {
         interface: iface,
-        prefixes: vec![format!("{addr}/32").parse().expect("prefix")],
+        // Both families are declared as managed prefixes: the v4 prefix is the
+        // victim's own /32 (what the scanner hits); the v6 prefix exists only so
+        // the dummy v6 owned address below is "within a managed prefix" (apply
+        // validates that). No v6 traffic flows in this scenario.
+        prefixes: vec![
+            format!("{addr}/32").parse().expect("v4 prefix"),
+            "fd00::/64".parse().expect("v6 prefix"),
+        ],
         default_state: PortState::Deception,
-        // One benign declared service so the nft `real_v4` set is non-empty
-        // (an empty set makes `nft` reject the ruleset). Port 8080 is real;
-        // port 22 stays unmatched -> deception -> tproxy.
+        // One benign declared service per family so the nft `real_v4`/`real_v6`
+        // sets are non-empty (an empty set makes `nft` reject the ruleset). Port
+        // 8080 is real; port 22 stays unmatched -> deception -> tproxy.
         tenants: vec![Tenant {
             name: "lab".to_owned(),
-            owned: vec![IpAddr::V4(addr)],
+            owned: vec![
+                IpAddr::V4(addr),
+                IpAddr::V6("fd00::1".parse().expect("v6")),
+            ],
             allows: vec![AllowRule {
                 proto: L4Proto::Tcp,
                 port: 8080,
