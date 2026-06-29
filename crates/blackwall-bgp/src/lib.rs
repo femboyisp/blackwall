@@ -6,6 +6,8 @@ mod route;
 
 pub use error::BgpError;
 pub use message::{
-    decode_open, encode_header, encode_open, parse_header, MsgType, OpenMsg, HEADER_LEN, MARKER,
+    decode_message, decode_notification, decode_open, encode_header, encode_keepalive,
+    encode_notification, encode_open, parse_header, BgpMessage, MsgType, NotificationMsg, OpenMsg,
+    HEADER_LEN, MARKER,
 };
 pub use route::{Origin, Route};
