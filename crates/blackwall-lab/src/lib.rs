@@ -10,6 +10,7 @@ pub mod assert;
 pub mod error;
 pub mod plan;
 pub mod render;
+pub mod report;
 pub mod topology;
 
 pub use error::LabError;
