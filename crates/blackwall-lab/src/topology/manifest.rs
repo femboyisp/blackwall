@@ -13,12 +13,7 @@ use std::time::Duration;
 /// # Errors
 /// Returns [`LabError::Manifest`] for malformed KDL or unknown keywords.
 pub fn parse_manifest(input: &str) -> Result<Manifest, LabError> {
-    // KDL v2 requires a newline or `;` between nodes; a bare `}` followed by a
-    // space and the next node (as written in single-line manifests) is rejected.
-    // Normalize `} ` into `}\n` so single-line and multi-line manifests parse
-    // identically. The space is insignificant inside KDL syntax here.
-    let normalized = input.replace("} ", "}\n");
-    let doc: KdlDocument = normalized
+    let doc: KdlDocument = input
         .parse()
         .map_err(|e: kdl::KdlError| LabError::Manifest(e.to_string()))?;
 
@@ -369,8 +364,7 @@ scenario "announces-host-route" {
 
     #[test]
     fn parses_durations_in_ms() {
-        let src =
-            r#"topology "t" { node "a" } scenario "s" { step wait node="a" until="x" timeout="500ms" }"#;
+        let src = "topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step wait node=\"a\" until=\"x\" timeout=\"500ms\"\n}\n";
         let m = parse_manifest(src).unwrap();
         assert_eq!(
             m.scenarios[0].steps[0],
