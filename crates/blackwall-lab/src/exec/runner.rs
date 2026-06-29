@@ -93,9 +93,7 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
             } => {
                 let lookup = |key: &str| {
                     plan.ops.iter().find_map(|o| match o {
-                        Op::WriteConfig { key: k, contents } if k == key => {
-                            Some(contents.clone())
-                        }
+                        Op::WriteConfig { key: k, contents } if k == key => Some(contents.clone()),
                         _ => None,
                     })
                 };
