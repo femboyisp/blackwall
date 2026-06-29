@@ -6,7 +6,7 @@ use crate::error::LabError;
 use crate::exec::{netns, proc};
 use crate::plan::{compile, ExecutionPlan, Op};
 use crate::report::{to_junit, to_tap, RunReport, ScenarioResult, StepResult};
-use crate::topology::model::{Manifest, Step};
+use crate::topology::model::{DaemonKind, Manifest, Step};
 use crate::topology::{parse_manifest, validate};
 use std::process::Child;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -88,19 +88,29 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
                 netns: ns,
                 node,
                 config_key,
-                ..
+                kind,
             } => {
-                let contents = plan
-                    .ops
-                    .iter()
-                    .find_map(|o| match o {
-                        Op::WriteConfig { key, contents } if key == config_key => {
+                let lookup = |key: &str| {
+                    plan.ops.iter().find_map(|o| match o {
+                        Op::WriteConfig { key: k, contents } if k == key => {
                             Some(contents.clone())
                         }
                         _ => None,
                     })
+                };
+                let contents = lookup(config_key)
                     .ok_or_else(|| LabError::Exec(format!("missing config {config_key}")))?;
-                proc::spawn_bird(&plan.run_id, node, ns, &contents)?;
+                match kind {
+                    DaemonKind::Bird => proc::spawn_bird(&plan.run_id, node, ns, &contents)?,
+                    DaemonKind::Knot => {
+                        let zone = lookup(&format!("knot-zone:{node}"))
+                            .ok_or_else(|| LabError::Exec(format!("missing zone for {node}")))?;
+                        proc::spawn_knot(&plan.run_id, node, ns, &contents, &zone)?;
+                    }
+                    DaemonKind::WireGuard => {
+                        return Err(LabError::Exec(format!("daemon {kind:?} not realized")));
+                    }
+                }
             }
             Op::SpawnRun {
                 netns: ns,
