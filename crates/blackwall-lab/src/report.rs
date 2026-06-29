@@ -54,7 +54,7 @@ pub fn to_junit(report: &RunReport) -> String {
             .filter(|s| matches!(s.outcome, StepOutcome::Fail(_)))
             .count();
         out.push_str(&format!(
-            "<testsuite name=\"{}\" tests=\"{}\" failures=\"{}\">\n",
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\">\n",
             xml_escape(&sc.name),
             sc.steps.len(),
             failures,
@@ -62,16 +62,22 @@ pub fn to_junit(report: &RunReport) -> String {
         for step in &sc.steps {
             match &step.outcome {
                 StepOutcome::Pass => {
-                    out.push_str(&format!("<testcase name=\"{}\"/>\n", xml_escape(&step.name)));
+                    out.push_str(&format!(
+                        "    <testcase name=\"{}\"/>\n",
+                        xml_escape(&step.name)
+                    ));
                 }
                 StepOutcome::Fail(reason) => {
-                    out.push_str(&format!("<testcase name=\"{}\">\n", xml_escape(&step.name)));
-                    out.push_str(&format!("<failure>{}</failure>\n", xml_escape(reason)));
-                    out.push_str("</testcase>\n");
+                    out.push_str(&format!(
+                        "    <testcase name=\"{}\">\n",
+                        xml_escape(&step.name)
+                    ));
+                    out.push_str(&format!("      <failure>{}</failure>\n", xml_escape(reason)));
+                    out.push_str("    </testcase>\n");
                 }
             }
         }
-        out.push_str("</testsuite>\n");
+        out.push_str("  </testsuite>\n");
     }
     out.push_str("</testsuites>\n");
     out
@@ -126,15 +132,17 @@ mod tests {
 
     #[test]
     fn junit_is_byte_exact() {
-        let expected = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-<testsuites>\n\
-  <testsuite name=\"announces-host-route\" tests=\"2\" failures=\"1\">\n\
-    <testcase name=\"wait bgp-established\"/>\n\
-    <testcase name=\"assert route &lt;present&gt;\">\n\
-      <failure>stdout does not contain `x`</failure>\n\
-    </testcase>\n\
-  </testsuite>\n\
-</testsuites>\n";
+        let expected = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<testsuites>\n",
+            "  <testsuite name=\"announces-host-route\" tests=\"2\" failures=\"1\">\n",
+            "    <testcase name=\"wait bgp-established\"/>\n",
+            "    <testcase name=\"assert route &lt;present&gt;\">\n",
+            "      <failure>stdout does not contain `x`</failure>\n",
+            "    </testcase>\n",
+            "  </testsuite>\n",
+            "</testsuites>\n",
+        );
         assert_eq!(to_junit(&sample()), expected);
     }
 
