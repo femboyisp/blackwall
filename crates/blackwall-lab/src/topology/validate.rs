@@ -23,11 +23,13 @@ pub fn validate(topo: &Topology) -> Result<(), LabError> {
     }
 
     for (idx, link) in topo.links.iter().enumerate() {
-        if matches!(link.kind, LinkKind::Veth) && link.endpoints.len() != 2 {
-            return Err(LabError::Validation(format!("veth link {idx} needs exactly 2 endpoints")));
-        }
+        // Every link needs at least two endpoints (general rule, covers all
+        // kinds); a veth is strictly point-to-point (specific rule).
         if link.endpoints.len() < 2 {
             return Err(LabError::Validation(format!("link {idx} needs at least 2 endpoints")));
+        }
+        if matches!(link.kind, LinkKind::Veth) && link.endpoints.len() != 2 {
+            return Err(LabError::Validation(format!("veth link {idx} needs exactly 2 endpoints")));
         }
         if link.subnet_v4.is_none() && link.subnet_v6.is_none() {
             return Err(LabError::Validation(format!("link {idx} has no subnet")));
