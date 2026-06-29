@@ -37,3 +37,25 @@ jobs:
       # the single source of truth shared by CI and local runs so the two cannot drift.
       - name: Test with coverage gate
         run: bash scripts/coverage.sh
+
+  lab:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install BIRD2 + iproute2
+        run: sudo apt-get update && sudo apt-get install -y bird2 iproute2
+      - name: Build the lab + the interop test (warm the cache the in-ns run reuses)
+        run: cargo build -p blackwall-lab && cargo build -p blackwall-bgp --tests
+      - name: Run the lab gate
+        run: |
+          sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/bgp-bird.kdl lab-junit.xml
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-junit
+          path: lab-junit.xml
