@@ -1,0 +1,19 @@
+// BGP interop gate: the Rust speaker peers with BIRD2 and announces a /32,
+// which must appear in BIRD's RIB. Graduated from bgp-netns-lab.sh.
+topology "bgp-bird" {
+    node "peer" {
+        daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="cargo test --offline -p blackwall-bgp --test interop -- announces_a_host_route --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179 BW_BGP_ASN=214806"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "announces-host-route" {
+    step wait   node="peer" until="bgp-established" timeout="20s"
+    step assert node="peer" cmd="birdc show route 203.0.113.7/32" \
+         contains="203.0.113.7/32" timeout="15s"
+}
