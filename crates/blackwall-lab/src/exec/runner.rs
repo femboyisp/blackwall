@@ -1,6 +1,6 @@
 //! Orchestrate a lab run: realize plan -> run scenario -> report -> teardown.
 
-use crate::addr::{allocate, resolve_env};
+use crate::addr::{allocate, resolve_env, AddressMap};
 use crate::assert::{evaluate, StepOutcome};
 use crate::error::LabError;
 use crate::exec::{netns, proc};
@@ -57,8 +57,7 @@ impl Drop for Teardown {
 ///
 /// Returns handles to any background-spawned run processes so the caller's
 /// [`Teardown`] guard can kill them at teardown.
-fn realize(plan: &ExecutionPlan, manifest: &Manifest) -> Result<Vec<Child>, LabError> {
-    let map = allocate(&manifest.topology)?;
+fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabError> {
     let mut children = Vec::new();
 
     for op in &plan.ops {
@@ -90,7 +89,7 @@ fn realize(plan: &ExecutionPlan, manifest: &Manifest) -> Result<Vec<Child>, LabE
             Op::SpawnRun { netns: ns, cmd, env, .. } => {
                 let resolved: Vec<(String, String)> = env
                     .iter()
-                    .map(|(k, v)| Ok((k.clone(), resolve_env(v, &map)?)))
+                    .map(|(k, v)| Ok((k.clone(), resolve_env(v, map)?)))
                     .collect::<Result<_, LabError>>()?;
                 let child = proc::spawn_run(ns, cmd, &resolved)?;
                 children.push(child);
@@ -105,7 +104,8 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
     let manifest = parse_manifest(manifest_text)?;
     validate(&manifest.topology)?;
     let id = run_id();
-    let plan = compile(&manifest.topology, &allocate(&manifest.topology)?, &id)?;
+    let map = allocate(&manifest.topology)?;
+    let plan = compile(&manifest.topology, &map, &id)?;
 
     let mut guard = Teardown { netns: plan.netns.clone(), children: Vec::new() };
     {
@@ -119,7 +119,7 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
         });
     }
 
-    guard.children = realize(&plan, &manifest)?;
+    guard.children = realize(&plan, &map)?;
 
     let mut scenarios = Vec::new();
     let mut all_pass = true;
@@ -222,7 +222,7 @@ pub(crate) fn up(manifest_text: &str) -> Result<(), LabError> {
     let map = allocate(&manifest.topology)?;
     let plan = compile(&manifest.topology, &map, &id)?;
     // Children are intentionally leaked — the namespaces stay up.
-    let _ = realize(&plan, &manifest)?;
+    let _ = realize(&plan, &map)?;
     println!("lab up: {} ({} namespaces)", manifest.topology.name, plan.netns.len());
     for ns in &plan.netns {
         println!("  {ns}");
