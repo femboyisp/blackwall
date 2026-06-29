@@ -162,11 +162,6 @@ pub fn build_announce(route: &Route) -> Vec<u8> {
 
         // IPv6 MP-BGP announce: next-hop rides inside MP_REACH_NLRI (RFC 4760).
         (IpNet::V6(_), IpAddr::V6(nh)) => {
-            debug_assert!(
-                matches!(route.prefix, IpNet::V6(_)),
-                "build_announce: next_hop family must match prefix family"
-            );
-
             // ── build MP_REACH_NLRI value ─────────────────────────────────────
             // value = AFI(2) + SAFI(1) + nhlen(1) + nexthop(16) + reserved(1) + NLRI
             let nlri = encode_nlri(&route.prefix);

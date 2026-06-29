@@ -184,13 +184,14 @@ pub fn encode_open(o: &OpenMsg) -> Vec<u8> {
     }
 
     // Optional Parameter type 2 (Capabilities): [2, param_len, <caps>]
-    let param_len = u8::try_from(caps.len()).unwrap_or(u8::MAX);
+    let param_len = u8::try_from(caps.len()).expect("BGP OPEN capabilities exceed u8 length");
     let mut opt_params: Vec<u8> = Vec::new();
     opt_params.push(2); // type: Capabilities
     opt_params.push(param_len);
     opt_params.extend_from_slice(&caps);
 
-    let opt_param_len = u8::try_from(opt_params.len()).unwrap_or(u8::MAX);
+    let opt_param_len =
+        u8::try_from(opt_params.len()).expect("BGP OPEN capabilities exceed u8 length");
 
     // Legacy MY_AS: AS_TRANS if asn > 65535, else the real asn.
     let my_as: u16 = u16::try_from(o.asn).unwrap_or(AS_TRANS);
@@ -326,7 +327,11 @@ pub fn encode_header(msg_type: u8, body: &[u8]) -> Vec<u8> {
     let total = HEADER_LEN + body.len();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&MARKER);
-    out.extend_from_slice(&u16::try_from(total).unwrap_or(u16::MAX).to_be_bytes());
+    out.extend_from_slice(
+        &u16::try_from(total)
+            .expect("BGP message exceeds u16 length")
+            .to_be_bytes(),
+    );
     out.push(msg_type);
     out.extend_from_slice(body);
     out
