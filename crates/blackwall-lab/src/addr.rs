@@ -226,4 +226,111 @@ mod tests {
             Err(LabError::Plan(_))
         ));
     }
+
+    #[test]
+    fn allocates_errors_on_subnet_exhaustion() {
+        let topo = Topology {
+            name: "t".to_owned(),
+            nodes: vec![
+                Node {
+                    name: "a".to_owned(),
+                    netns: None,
+                    loopback: None,
+                    daemons: vec![],
+                    runs: vec![],
+                },
+                Node {
+                    name: "b".to_owned(),
+                    netns: None,
+                    loopback: None,
+                    daemons: vec![],
+                    runs: vec![],
+                },
+                Node {
+                    name: "c".to_owned(),
+                    netns: None,
+                    loopback: None,
+                    daemons: vec![],
+                    runs: vec![],
+                },
+            ],
+            links: vec![Link {
+                kind: LinkKind::Veth,
+                endpoints: vec![
+                    Endpoint {
+                        node: "a".to_owned(),
+                        addr_override: None,
+                    },
+                    Endpoint {
+                        node: "b".to_owned(),
+                        addr_override: None,
+                    },
+                    Endpoint {
+                        node: "c".to_owned(),
+                        addr_override: None,
+                    },
+                ],
+                subnet_v4: Some("10.0.0.0/30".parse().unwrap()),
+                subnet_v6: None,
+            }],
+        };
+        assert!(matches!(allocate(&topo), Err(LabError::Plan(_))));
+    }
+
+    #[test]
+    fn resolve_env_errors_on_unterminated_brace() {
+        let map = allocate(&proof_topo()).unwrap();
+        assert!(matches!(
+            resolve_env("BW_PEER={peer.addr", &map),
+            Err(LabError::Plan(_))
+        ));
+    }
+
+    #[test]
+    fn resolves_addr6_and_errors_on_wrong_family() {
+        let topo = Topology {
+            name: "t".to_owned(),
+            nodes: vec![
+                Node {
+                    name: "peer".to_owned(),
+                    netns: None,
+                    loopback: None,
+                    daemons: vec![],
+                    runs: vec![],
+                },
+                Node {
+                    name: "speaker".to_owned(),
+                    netns: None,
+                    loopback: None,
+                    daemons: vec![],
+                    runs: vec![],
+                },
+            ],
+            links: vec![Link {
+                kind: LinkKind::Veth,
+                endpoints: vec![
+                    Endpoint {
+                        node: "peer".to_owned(),
+                        addr_override: None,
+                    },
+                    Endpoint {
+                        node: "speaker".to_owned(),
+                        addr_override: None,
+                    },
+                ],
+                subnet_v4: None,
+                subnet_v6: Some("fd00::/64".parse().unwrap()),
+            }],
+        };
+        let map = allocate(&topo).unwrap();
+        // `ipnet`'s host iterator for a /64 starts at the all-zeros host,
+        // so the peer's first allocated v6 address is `fd00::`, not `fd00::1`.
+        let peer_v6 = map.node_primary("peer").unwrap();
+        assert_eq!(peer_v6, "fd00::".parse::<IpAddr>().unwrap());
+        assert_eq!(resolve_env("{peer.addr6}", &map).unwrap(), peer_v6.to_string());
+        assert!(matches!(
+            resolve_env("{peer.addr}", &map),
+            Err(LabError::Plan(_))
+        ));
+    }
 }
