@@ -12,9 +12,13 @@ fn get<'a>(daemon: &'a Daemon, key: &str) -> Result<&'a str, LabError> {
 }
 
 /// Render `knot.conf` for a `knot` daemon from its settings (`zone`,
-/// `tsig-name`, `tsig-algo`, `tsig-secret`). Uses fixed relative paths
-/// (`storage: "."`, `file: zone.db`) so the executor's per-node cwd resolves
-/// them; listens on `0.0.0.0@53`; grants TSIG-keyed `update` ACL.
+/// `tsig-name`, `tsig-algo`, `tsig-secret`). Uses fixed relative paths so the
+/// executor's per-node cwd resolves them: `database storage: "."` puts the
+/// journal/timer/kasp LMDB databases in the run dir (NOT knot's compiled
+/// default `/var/lib/knot`, which the lab's knotd cannot write — that yields
+/// `journal update failed (operation not permitted)` and DDNS SERVFAIL);
+/// `template storage: "."` + `file: zone.db` place the zone there. Listens on
+/// `0.0.0.0@53`; grants TSIG-keyed `update` ACL.
 ///
 /// # Errors
 /// Returns [`LabError::Plan`] if a required setting is absent.
@@ -24,7 +28,7 @@ pub fn render_knot_conf(daemon: &Daemon) -> Result<String, LabError> {
     let algo = get(daemon, "tsig-algo")?;
     let secret = get(daemon, "tsig-secret")?;
     Ok(format!(
-        "server:\n    rundir: \".\"\n    listen: 0.0.0.0@53\n\nkey:\n  - id: {name}\n    algorithm: {algo}\n    secret: {secret}\n\nacl:\n  - id: {name}-acl\n    key: {name}\n    action: update\n\ntemplate:\n  - id: default\n    storage: \".\"\n    zonefile-sync: -1\n    zonefile-load: difference\n    journal-content: changes\n\nzone:\n  - domain: {zone}\n    file: zone.db\n    acl: {name}-acl\n"
+        "server:\n    rundir: \".\"\n    listen: 0.0.0.0@53\n\ndatabase:\n    storage: \".\"\n\nkey:\n  - id: {name}\n    algorithm: {algo}\n    secret: {secret}\n\nacl:\n  - id: {name}-acl\n    key: {name}\n    action: update\n\ntemplate:\n  - id: default\n    storage: \".\"\n    zonefile-sync: -1\n    zonefile-load: difference\n    journal-content: changes\n\nzone:\n  - domain: {zone}\n    file: zone.db\n    acl: {name}-acl\n"
     ))
 }
 
@@ -72,6 +76,9 @@ mod tests {
             "server:\n",
             "    rundir: \".\"\n",
             "    listen: 0.0.0.0@53\n",
+            "\n",
+            "database:\n",
+            "    storage: \".\"\n",
             "\n",
             "key:\n",
             "  - id: lab-key\n",

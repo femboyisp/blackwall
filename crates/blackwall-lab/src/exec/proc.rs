@@ -3,7 +3,7 @@
 use crate::assert::Captured;
 use crate::error::LabError;
 use crate::exec::netns;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Path to a node's BIRD control socket for this run.
@@ -105,40 +105,40 @@ pub(crate) fn spawn_bird(
     Ok(())
 }
 
-/// Base dir for a knot node's working tree (config + zone + LMDB databases).
-///
-/// Deliberately on real disk (`/var/lib`), NOT the tmpfs `/run` base the rest
-/// of the lab uses: knot keeps its journal/timer/kasp state in LMDB, and LMDB's
-/// lock-file robust mutex fails with EPERM on tmpfs (`journal update failed
-/// (operation not permitted)`). Bird is unaffected (no LMDB) so it stays on
-/// `/run`. The teardown paths in `runner.rs` clean this base too.
-pub(crate) fn knot_base(run_id: &str, node: &str) -> String {
-    format!("/var/lib/blackwall-lab/{run_id}/{node}")
-}
-
 /// Launch `knotd` for a node in its namespace. Writes the rendered config and
-/// zone into a per-node disk-backed subdir ([`knot_base`]) and runs knotd with
-/// that dir as cwd, so the config's relative `storage`/`rundir`/`file: zone.db`
-/// resolve there. Backgrounded; reaped when the namespace is deleted at teardown.
+/// zone into a per-node run subdir and runs knotd with that dir as cwd, so the
+/// config's relative `database storage`/`storage`/`rundir`/`file: zone.db`
+/// resolve there (the rendered config sets `database storage: "."` so knot's
+/// LMDB databases land here, not its unwritable compiled default). Backgrounded;
+/// reaped when the namespace is deleted at teardown.
 pub(crate) fn spawn_knot(
     run_id: &str,
     node: &str,
     ns: &str,
     conf: &str,
     zone: &str,
-) -> Result<(), LabError> {
-    let dir = knot_base(run_id, node);
+) -> Result<Child, LabError> {
+    let dir = format!("/run/blackwall-lab/{run_id}/{node}");
     std::fs::create_dir_all(&dir).map_err(|e| LabError::Exec(format!("mkdir {dir}: {e}")))?;
     std::fs::write(format!("{dir}/knot.conf"), conf)
         .map_err(|e| LabError::Exec(format!("write knot.conf: {e}")))?;
     std::fs::write(format!("{dir}/zone.db"), zone)
         .map_err(|e| LabError::Exec(format!("write zone.db: {e}")))?;
-    let mut cmd = std::process::Command::new("ip");
-    cmd.args(["netns", "exec", ns, "knotd", "-c", "knot.conf"])
-        .current_dir(&dir);
-    cmd.spawn()
+    // knotd runs in the foreground; redirect its (verbose) output to a log file
+    // so it does not inherit and hold the lab's stdout pipe open after the run.
+    let log = std::fs::File::create(format!("{dir}/knotd.log"))
+        .map_err(|e| LabError::Exec(format!("create knotd.log: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| LabError::Exec(format!("clone knotd.log handle: {e}")))?;
+    let child = Command::new("ip")
+        .args(["netns", "exec", ns, "knotd", "-c", "knot.conf"])
+        .current_dir(&dir)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
         .map_err(|e| LabError::Exec(format!("spawn knotd: {e}")))?;
-    Ok(())
+    Ok(child)
 }
 
 /// Launch a process inside `ns` with resolved environment, returning a child
