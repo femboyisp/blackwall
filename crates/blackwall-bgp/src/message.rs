@@ -2,6 +2,98 @@
 
 use crate::error::BgpError;
 
+// ── New types added in Task 3 ────────────────────────────────────────────────
+
+/// A BGP NOTIFICATION message body (RFC 4271 §4.5).
+///
+/// Carries an error `code`, an error `subcode`, and optional diagnostic `data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationMsg {
+    /// Error code (see RFC 4271 §4.5 for defined values).
+    pub code: u8,
+    /// Error sub-code qualifying the error code.
+    pub subcode: u8,
+    /// Optional diagnostic data (may be empty).
+    pub data: Vec<u8>,
+}
+
+/// A decoded BGP message ready for dispatch.
+///
+/// `Update` is a *unit* variant: Blackwall is injection-only and does not
+/// parse inbound NLRI, so the body is validated by framing only.
+#[derive(Debug)]
+pub enum BgpMessage {
+    /// A BGP OPEN message.
+    Open(OpenMsg),
+    /// A BGP KEEPALIVE message (header only).
+    Keepalive,
+    /// A BGP UPDATE message (body treated as opaque).
+    Update,
+    /// A BGP NOTIFICATION message.
+    Notification(NotificationMsg),
+}
+
+/// Encode a BGP KEEPALIVE message (header only, type 4, total length 19).
+pub fn encode_keepalive() -> Vec<u8> {
+    encode_header(MsgType::Keepalive.code(), &[])
+}
+
+/// Encode a BGP NOTIFICATION message (header + `[code, subcode, data…]`).
+pub fn encode_notification(n: &NotificationMsg) -> Vec<u8> {
+    let mut body = Vec::with_capacity(2 + n.data.len());
+    body.push(n.code);
+    body.push(n.subcode);
+    body.extend_from_slice(&n.data);
+    encode_header(MsgType::Notification.code(), &body)
+}
+
+/// Decode a BGP NOTIFICATION body (bytes *after* the 19-byte header).
+///
+/// Returns [`BgpError::Decode`] if fewer than 2 bytes are present.
+pub fn decode_notification(body: &[u8]) -> Result<NotificationMsg, BgpError> {
+    if body.len() < 2 {
+        return Err(BgpError::Decode(format!(
+            "NOTIFICATION body too short: {} bytes",
+            body.len()
+        )));
+    }
+    Ok(NotificationMsg {
+        code: body[0],
+        subcode: body[1],
+        data: body[2..].to_vec(),
+    })
+}
+
+/// Parse a complete BGP message from a byte buffer.
+///
+/// Validates the header, ensures `bytes.len() >= total_len` (returns
+/// [`BgpError::Decode`] otherwise), dispatches by type, and returns
+/// `(message, total_len)` so a stream reader can advance by exactly
+/// `total_len` bytes.
+pub fn decode_message(bytes: &[u8]) -> Result<(BgpMessage, usize), BgpError> {
+    let (msg_type, total_len) = parse_header(bytes)?;
+    if bytes.len() < total_len {
+        return Err(BgpError::Decode(format!(
+            "buffer too short: need {} bytes, have {}",
+            total_len,
+            bytes.len()
+        )));
+    }
+    let body = &bytes[HEADER_LEN..total_len];
+    let msg = match msg_type {
+        1 => BgpMessage::Open(decode_open(body)?),
+        3 => BgpMessage::Notification(decode_notification(body)?),
+        4 => BgpMessage::Keepalive,
+        2 => BgpMessage::Update,
+        other => {
+            return Err(BgpError::Decode(format!(
+                "unknown BGP message type {other}"
+            )))
+        }
+    };
+    Ok((msg, total_len))
+}
+
 /// The 16-byte all-ones BGP marker.
 pub const MARKER: [u8; 16] = [0xFF; 16];
 /// The fixed BGP message header length.
@@ -346,5 +438,45 @@ mod tests {
     #[test]
     fn decode_open_rejects_truncation() {
         assert!(decode_open(&[4, 0x00]).is_err());
+    }
+
+    #[test]
+    fn keepalive_encodes_and_dispatches() {
+        let bytes = encode_keepalive();
+        let (msg, consumed) = decode_message(&bytes).unwrap();
+        assert_eq!(consumed, 19);
+        assert!(matches!(msg, BgpMessage::Keepalive));
+    }
+
+    #[test]
+    fn notification_round_trips() {
+        let n = NotificationMsg {
+            code: 4,
+            subcode: 0,
+            data: vec![],
+        }; // hold timer expired
+        let bytes = encode_notification(&n);
+        let (msg, _) = decode_message(&bytes).unwrap();
+        match msg {
+            BgpMessage::Notification(got) => assert_eq!(got, n),
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_body_is_opaque_but_framed() {
+        // a minimal UPDATE: withdrawn_len 0, total_path_attr_len 0, no NLRI
+        let body = [0u8, 0, 0, 0];
+        let bytes = encode_header(2, &body);
+        let (msg, consumed) = decode_message(&bytes).unwrap();
+        assert!(matches!(msg, BgpMessage::Update));
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn decode_message_rejects_length_past_buffer() {
+        let mut bytes = encode_keepalive();
+        bytes[17] = 0xFF; // claim length 0xFF.. past the 19-byte buffer
+        assert!(decode_message(&bytes).is_err());
     }
 }
