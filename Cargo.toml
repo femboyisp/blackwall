@@ -29,6 +29,8 @@ reqwest = { version = "0.12.28", default-features = false, features = ["rustls-t
 futures-util = "0.3.32"
 base64 = "0.22.1"
 domain = { version = "0.12.1", features = ["net", "tsig"] }
+kdl = "6.7.1"
+ctrlc = "3.5.2"
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
