@@ -8,8 +8,11 @@ repository.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 ipnet = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
