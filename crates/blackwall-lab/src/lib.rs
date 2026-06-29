@@ -7,6 +7,7 @@
 
 pub mod addr;
 pub mod error;
+pub mod render;
 pub mod topology;
 
 pub use error::LabError;
