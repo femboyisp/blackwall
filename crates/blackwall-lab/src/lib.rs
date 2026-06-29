@@ -5,6 +5,7 @@
 //! [`cli`], and the `lab` binary is pure and unit-tested; `exec`/`cli` shell
 //! out to the kernel and are coverage-excluded.
 
+pub mod addr;
 pub mod error;
 pub mod topology;
 
