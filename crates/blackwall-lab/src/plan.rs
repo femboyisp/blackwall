@@ -106,7 +106,9 @@ pub fn iface_name(run_id: &str, link_idx: usize, side: char) -> String {
 
 /// Resolve the namespace for a node (explicit override or per-run default).
 fn node_netns(run_id: &str, node: &Node) -> String {
-    node.netns.clone().unwrap_or_else(|| netns_name(run_id, &node.name))
+    node.netns
+        .clone()
+        .unwrap_or_else(|| netns_name(run_id, &node.name))
 }
 
 /// Compile `topo` into an [`ExecutionPlan`].
@@ -129,11 +131,16 @@ pub fn compile(topo: &Topology, map: &AddressMap, run_id: &str) -> Result<Execut
     // Phase 2: links (veth only in L1).
     for (idx, link) in topo.links.iter().enumerate() {
         if !matches!(link.kind, LinkKind::Veth) {
-            return Err(LabError::Plan(format!("link {idx} kind not realized in L1")));
+            return Err(LabError::Plan(format!(
+                "link {idx} kind not realized in L1"
+            )));
         }
         let a = iface_name(run_id, idx, 'a');
         let b = iface_name(run_id, idx, 'b');
-        ops.push(Op::CreateVethPair { a: a.clone(), b: b.clone() });
+        ops.push(Op::CreateVethPair {
+            a: a.clone(),
+            b: b.clone(),
+        });
 
         let ends = [(&link.endpoints[0], &a), (&link.endpoints[1], &b)];
         for (ep, iface) in ends {
@@ -143,12 +150,23 @@ pub fn compile(topo: &Topology, map: &AddressMap, run_id: &str) -> Result<Execut
                 .find(|n| n.name == ep.node)
                 .ok_or_else(|| LabError::Plan(format!("link {idx} unknown node `{}`", ep.node)))?;
             let ns = node_netns(run_id, node);
-            ops.push(Op::MoveIface { iface: iface.clone(), netns: ns.clone() });
-            ops.push(Op::SetIfaceUp { netns: ns.clone(), iface: iface.clone() });
-            let (addr, prefix) = map
-                .link_addr(idx, &ep.node)
-                .ok_or_else(|| LabError::Plan(format!("no address for `{}` on link {idx}", ep.node)))?;
-            ops.push(Op::AddAddr { netns: ns, iface: iface.clone(), addr, prefix });
+            ops.push(Op::MoveIface {
+                iface: iface.clone(),
+                netns: ns.clone(),
+            });
+            ops.push(Op::SetIfaceUp {
+                netns: ns.clone(),
+                iface: iface.clone(),
+            });
+            let (addr, prefix) = map.link_addr(idx, &ep.node).ok_or_else(|| {
+                LabError::Plan(format!("no address for `{}` on link {idx}", ep.node))
+            })?;
+            ops.push(Op::AddAddr {
+                netns: ns,
+                iface: iface.clone(),
+                addr,
+                prefix,
+            });
         }
     }
 
@@ -160,21 +178,41 @@ pub fn compile(topo: &Topology, map: &AddressMap, run_id: &str) -> Result<Execut
                 DaemonKind::Bird => {
                     let contents = render_bird(node, topo, map)?;
                     let key = format!("bird:{}", node.name);
-                    ops.push(Op::WriteConfig { key: key.clone(), contents });
+                    ops.push(Op::WriteConfig {
+                        key: key.clone(),
+                        contents,
+                    });
                     key
                 }
                 DaemonKind::Knot | DaemonKind::WireGuard => {
-                    return Err(LabError::Plan(format!("daemon {:?} not realized in L1", daemon.kind)));
+                    return Err(LabError::Plan(format!(
+                        "daemon {:?} not realized in L1",
+                        daemon.kind
+                    )));
                 }
             };
-            ops.push(Op::SpawnDaemon { netns: ns.clone(), kind: daemon.kind, config_key, node: node.name.clone() });
+            ops.push(Op::SpawnDaemon {
+                netns: ns.clone(),
+                kind: daemon.kind,
+                config_key,
+                node: node.name.clone(),
+            });
         }
         for run in &node.runs {
-            ops.push(Op::SpawnRun { netns: ns.clone(), name: run.name.clone(), cmd: run.cmd.clone(), env: run.env.clone() });
+            ops.push(Op::SpawnRun {
+                netns: ns.clone(),
+                name: run.name.clone(),
+                cmd: run.cmd.clone(),
+                env: run.env.clone(),
+            });
         }
     }
 
-    Ok(ExecutionPlan { run_id: run_id.to_owned(), netns, ops })
+    Ok(ExecutionPlan {
+        run_id: run_id.to_owned(),
+        netns,
+        ops,
+    })
 }
 
 #[cfg(test)]
@@ -187,26 +225,52 @@ mod tests {
 
     fn proof_topo() -> Topology {
         let mut settings = BTreeMap::new();
-        for (k, v) in [("local-as", "214806"), ("neighbor-node", "speaker"), ("neighbor-as", "214806"), ("import", "all"), ("passive", "yes")] {
+        for (k, v) in [
+            ("local-as", "214806"),
+            ("neighbor-node", "speaker"),
+            ("neighbor-as", "214806"),
+            ("import", "all"),
+            ("passive", "yes"),
+        ] {
             settings.insert(k.to_owned(), v.to_owned());
         }
         Topology {
             name: "t".to_owned(),
             nodes: vec![
-                Node { name: "peer".to_owned(), netns: None, loopback: None, daemons: vec![Daemon { kind: DaemonKind::Bird, settings }], runs: vec![] },
+                Node {
+                    name: "peer".to_owned(),
+                    netns: None,
+                    loopback: None,
+                    daemons: vec![Daemon {
+                        kind: DaemonKind::Bird,
+                        settings,
+                    }],
+                    runs: vec![],
+                },
                 Node {
                     name: "speaker".to_owned(),
                     netns: None,
                     loopback: None,
                     daemons: vec![],
-                    runs: vec![RunSpec { name: "speaker".to_owned(), cmd: "run-interop".to_owned(), env: vec![], readiness: None }],
+                    runs: vec![RunSpec {
+                        name: "speaker".to_owned(),
+                        cmd: "run-interop".to_owned(),
+                        env: vec![],
+                        readiness: None,
+                    }],
                 },
             ],
             links: vec![Link {
                 kind: LinkKind::Veth,
                 endpoints: vec![
-                    Endpoint { node: "peer".to_owned(), addr_override: None },
-                    Endpoint { node: "speaker".to_owned(), addr_override: None },
+                    Endpoint {
+                        node: "peer".to_owned(),
+                        addr_override: None,
+                    },
+                    Endpoint {
+                        node: "speaker".to_owned(),
+                        addr_override: None,
+                    },
                 ],
                 subnet_v4: Some("10.0.0.0/30".parse().unwrap()),
                 subnet_v6: None,
@@ -229,10 +293,17 @@ mod tests {
         let plan = compile(&topo, &map, "abc123").unwrap();
 
         assert_eq!(plan.run_id, "abc123");
-        assert_eq!(plan.netns, vec!["bw-abc123-peer".to_owned(), "bw-abc123-speaker".to_owned()]);
+        assert_eq!(
+            plan.netns,
+            vec!["bw-abc123-peer".to_owned(), "bw-abc123-speaker".to_owned()]
+        );
 
         // veth pair created once.
-        let veths: Vec<_> = plan.ops.iter().filter(|o| matches!(o, Op::CreateVethPair { .. })).collect();
+        let veths: Vec<_> = plan
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::CreateVethPair { .. }))
+            .collect();
         assert_eq!(veths.len(), 1);
 
         // both addresses assigned in the right namespaces.
@@ -247,13 +318,29 @@ mod tests {
         assert!(plan.ops.iter().any(|o| matches!(o, Op::SpawnRun { netns, cmd, .. } if netns == "bw-abc123-speaker" && cmd == "run-interop")));
 
         // ordering: every CreateNetns precedes the first CreateVethPair.
-        let first_veth = plan.ops.iter().position(|o| matches!(o, Op::CreateVethPair { .. })).unwrap();
-        let last_netns = plan.ops.iter().rposition(|o| matches!(o, Op::CreateNetns(_))).unwrap();
+        let first_veth = plan
+            .ops
+            .iter()
+            .position(|o| matches!(o, Op::CreateVethPair { .. }))
+            .unwrap();
+        let last_netns = plan
+            .ops
+            .iter()
+            .rposition(|o| matches!(o, Op::CreateNetns(_)))
+            .unwrap();
         assert!(last_netns < first_veth);
 
         // ordering: every link op (addr assignment) precedes the first daemon/run.
-        let last_link_op = plan.ops.iter().rposition(|o| matches!(o, Op::MoveIface { .. } | Op::AddAddr { .. })).unwrap();
-        let first_spawn = plan.ops.iter().position(|o| matches!(o, Op::SpawnDaemon { .. } | Op::SpawnRun { .. })).unwrap();
+        let last_link_op = plan
+            .ops
+            .iter()
+            .rposition(|o| matches!(o, Op::MoveIface { .. } | Op::AddAddr { .. }))
+            .unwrap();
+        let first_spawn = plan
+            .ops
+            .iter()
+            .position(|o| matches!(o, Op::SpawnDaemon { .. } | Op::SpawnRun { .. }))
+            .unwrap();
         assert!(last_link_op < first_spawn);
     }
 
@@ -262,6 +349,9 @@ mod tests {
         let mut topo = proof_topo();
         topo.links[0].kind = LinkKind::WireGuard;
         let map = allocate(&topo).unwrap();
-        assert!(matches!(compile(&topo, &map, "abc123"), Err(LabError::Plan(_))));
+        assert!(matches!(
+            compile(&topo, &map, "abc123"),
+            Err(LabError::Plan(_))
+        ));
     }
 }

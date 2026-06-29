@@ -18,7 +18,10 @@ pub fn validate(topo: &Topology) -> Result<(), LabError> {
     let mut seen = BTreeSet::new();
     for node in &topo.nodes {
         if !seen.insert(node.name.as_str()) {
-            return Err(LabError::Validation(format!("duplicate node name `{}`", node.name)));
+            return Err(LabError::Validation(format!(
+                "duplicate node name `{}`",
+                node.name
+            )));
         }
     }
 
@@ -26,10 +29,14 @@ pub fn validate(topo: &Topology) -> Result<(), LabError> {
         // Every link needs at least two endpoints (general rule, covers all
         // kinds); a veth is strictly point-to-point (specific rule).
         if link.endpoints.len() < 2 {
-            return Err(LabError::Validation(format!("link {idx} needs at least 2 endpoints")));
+            return Err(LabError::Validation(format!(
+                "link {idx} needs at least 2 endpoints"
+            )));
         }
         if matches!(link.kind, LinkKind::Veth) && link.endpoints.len() != 2 {
-            return Err(LabError::Validation(format!("veth link {idx} needs exactly 2 endpoints")));
+            return Err(LabError::Validation(format!(
+                "veth link {idx} needs exactly 2 endpoints"
+            )));
         }
         if link.subnet_v4.is_none() && link.subnet_v6.is_none() {
             return Err(LabError::Validation(format!("link {idx} has no subnet")));
@@ -53,14 +60,26 @@ mod tests {
     use crate::topology::model::*;
 
     fn node(name: &str) -> Node {
-        Node { name: name.to_owned(), netns: None, loopback: None, daemons: vec![], runs: vec![] }
+        Node {
+            name: name.to_owned(),
+            netns: None,
+            loopback: None,
+            daemons: vec![],
+            runs: vec![],
+        }
     }
     fn veth(a: &str, b: &str, subnet: Option<&str>) -> Link {
         Link {
             kind: LinkKind::Veth,
             endpoints: vec![
-                Endpoint { node: a.to_owned(), addr_override: None },
-                Endpoint { node: b.to_owned(), addr_override: None },
+                Endpoint {
+                    node: a.to_owned(),
+                    addr_override: None,
+                },
+                Endpoint {
+                    node: b.to_owned(),
+                    addr_override: None,
+                },
             ],
             subnet_v4: subnet.map(|s| s.parse().unwrap()),
             subnet_v6: None,
@@ -79,14 +98,21 @@ mod tests {
 
     #[test]
     fn rejects_empty_topology() {
-        let topo = Topology { name: "t".to_owned(), nodes: vec![], links: vec![] };
+        let topo = Topology {
+            name: "t".to_owned(),
+            nodes: vec![],
+            links: vec![],
+        };
         assert!(matches!(validate(&topo), Err(LabError::Validation(_))));
     }
 
     #[test]
     fn rejects_duplicate_node_names() {
-        let topo =
-            Topology { name: "t".to_owned(), nodes: vec![node("a"), node("a")], links: vec![] };
+        let topo = Topology {
+            name: "t".to_owned(),
+            nodes: vec![node("a"), node("a")],
+            links: vec![],
+        };
         assert!(matches!(validate(&topo), Err(LabError::Validation(_))));
     }
 

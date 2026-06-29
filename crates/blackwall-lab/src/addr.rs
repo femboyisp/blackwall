@@ -109,7 +109,9 @@ fn resolve_token(token: &str, map: &AddressMap) -> Result<String, LabError> {
         .ok_or_else(|| LabError::Plan(format!("bad placeholder `{token}`")))?;
     let want_v6 = field == "addr6";
     if field != "addr" && field != "addr6" {
-        return Err(LabError::Plan(format!("unknown placeholder field `{field}`")));
+        return Err(LabError::Plan(format!(
+            "unknown placeholder field `{field}`"
+        )));
     }
     let primary = map
         .node_primary(node)
@@ -327,7 +329,10 @@ mod tests {
         // so the peer's first allocated v6 address is `fd00::`, not `fd00::1`.
         let peer_v6 = map.node_primary("peer").unwrap();
         assert_eq!(peer_v6, "fd00::".parse::<IpAddr>().unwrap());
-        assert_eq!(resolve_env("{peer.addr6}", &map).unwrap(), peer_v6.to_string());
+        assert_eq!(
+            resolve_env("{peer.addr6}", &map).unwrap(),
+            peer_v6.to_string()
+        );
         assert!(matches!(
             resolve_env("{peer.addr}", &map),
             Err(LabError::Plan(_))

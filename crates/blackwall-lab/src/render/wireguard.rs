@@ -63,7 +63,11 @@ Endpoint = 198.51.100.2:55555\n";
 
     #[test]
     fn omits_listenport_and_endpoint_when_absent() {
-        let peers = vec![WgPeer { public_key: "PK".to_owned(), allowed_ips: "10.0.0.2/32".to_owned(), endpoint: None }];
+        let peers = vec![WgPeer {
+            public_key: "PK".to_owned(),
+            allowed_ips: "10.0.0.2/32".to_owned(),
+            endpoint: None,
+        }];
         let out = render_wireguard("PRIV", "10.0.0.1/30", None, &peers);
         let expected = "[Interface]\n\
 PrivateKey = PRIV\n\

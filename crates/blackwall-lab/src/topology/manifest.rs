@@ -30,13 +30,18 @@ pub fn parse_manifest(input: &str) -> Result<Manifest, LabError> {
             }
             "scenario" => scenarios.push(parse_scenario(node)?),
             other => {
-                return Err(LabError::Manifest(format!("unexpected top-level node `{other}`")));
+                return Err(LabError::Manifest(format!(
+                    "unexpected top-level node `{other}`"
+                )));
             }
         }
     }
 
     let topology = topology.ok_or_else(|| LabError::Manifest("no `topology` block".to_owned()))?;
-    Ok(Manifest { topology, scenarios })
+    Ok(Manifest {
+        topology,
+        scenarios,
+    })
 }
 
 /// First positional argument as a string, or an error labelled `what`.
@@ -86,7 +91,9 @@ fn parse_topology(node: &KdlNode) -> Result<Topology, LabError> {
                 "node" => nodes.push(parse_node(child)?),
                 "link" => links.push(parse_link(child)?),
                 other => {
-                    return Err(LabError::Manifest(format!("unexpected topology child `{other}`")));
+                    return Err(LabError::Manifest(format!(
+                        "unexpected topology child `{other}`"
+                    )));
                 }
             }
         }
@@ -112,12 +119,20 @@ fn parse_node(node: &KdlNode) -> Result<Node, LabError> {
                 "daemon" => daemons.push(parse_daemon(child)?),
                 "run" => runs.push(parse_run(child)?),
                 other => {
-                    return Err(LabError::Manifest(format!("unexpected node child `{other}`")));
+                    return Err(LabError::Manifest(format!(
+                        "unexpected node child `{other}`"
+                    )));
                 }
             }
         }
     }
-    Ok(Node { name, netns, loopback, daemons, runs })
+    Ok(Node {
+        name,
+        netns,
+        loopback,
+        daemons,
+        runs,
+    })
 }
 
 fn parse_daemon(node: &KdlNode) -> Result<Daemon, LabError> {
@@ -147,20 +162,31 @@ fn parse_run(node: &KdlNode) -> Result<RunSpec, LabError> {
         None => Vec::new(),
     };
     let readiness = prop(node, "readiness");
-    Ok(RunSpec { name, cmd, env, readiness })
+    Ok(RunSpec {
+        name,
+        cmd,
+        env,
+        readiness,
+    })
 }
 
 /// Split `K1=V1 K2=V2` into ordered pairs (split each on the first `=`).
 fn parse_env(s: &str) -> Vec<(String, String)> {
     s.split_whitespace()
-        .filter_map(|pair| pair.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .filter_map(|pair| {
+            pair.split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        })
         .collect()
 }
 
 fn parse_link(node: &KdlNode) -> Result<Link, LabError> {
     let endpoints: Vec<Endpoint> = args(node)
         .into_iter()
-        .map(|node_name| Endpoint { node: node_name, addr_override: None })
+        .map(|node_name| Endpoint {
+            node: node_name,
+            addr_override: None,
+        })
         .collect();
     let kind = match prop(node, "kind").as_deref() {
         None | Some("veth") => LinkKind::Veth,
@@ -176,7 +202,12 @@ fn parse_link(node: &KdlNode) -> Result<Link, LabError> {
     if let Some(s) = prop(node, "subnet6") {
         assign_subnet(&s, &mut subnet_v4, &mut subnet_v6)?;
     }
-    Ok(Link { kind, endpoints, subnet_v4, subnet_v6 })
+    Ok(Link {
+        kind,
+        endpoints,
+        subnet_v4,
+        subnet_v6,
+    })
 }
 
 fn assign_subnet(
@@ -224,7 +255,11 @@ fn parse_step(node: &KdlNode) -> Result<Step, LabError> {
                 &prop(node, "timeout")
                     .ok_or_else(|| LabError::Manifest("wait missing timeout".to_owned()))?,
             )?;
-            Ok(Step::Wait { node: node_name, until, timeout })
+            Ok(Step::Wait {
+                node: node_name,
+                until,
+                timeout,
+            })
         }
         "exec" => Ok(Step::Exec {
             node: node_name,
@@ -252,7 +287,12 @@ fn parse_step(node: &KdlNode) -> Result<Step, LabError> {
                     "assert needs contains|equals|exit".to_owned(),
                 ));
             };
-            Ok(Step::Assert { node: node_name, cmd, matcher, timeout })
+            Ok(Step::Assert {
+                node: node_name,
+                cmd,
+                matcher,
+                timeout,
+            })
         }
         other => Err(LabError::Manifest(format!("unknown step kind `{other}`"))),
     }
@@ -269,7 +309,9 @@ fn parse_duration(s: &str) -> Result<Duration, LabError> {
             .map(Duration::from_secs)
             .map_err(|e| LabError::Manifest(format!("bad duration `{s}`: {e}")))
     } else {
-        Err(LabError::Manifest(format!("duration `{s}` needs unit s or ms")))
+        Err(LabError::Manifest(format!(
+            "duration `{s}` needs unit s or ms"
+        )))
     }
 }
 
@@ -305,9 +347,15 @@ scenario "announces-host-route" {
         assert_eq!(peer.name, "peer");
         assert_eq!(peer.daemons.len(), 1);
         assert_eq!(peer.daemons[0].kind, DaemonKind::Bird);
-        assert_eq!(peer.daemons[0].settings.get("local-as").map(String::as_str), Some("214806"));
         assert_eq!(
-            peer.daemons[0].settings.get("neighbor-node").map(String::as_str),
+            peer.daemons[0].settings.get("local-as").map(String::as_str),
+            Some("214806")
+        );
+        assert_eq!(
+            peer.daemons[0]
+                .settings
+                .get("neighbor-node")
+                .map(String::as_str),
             Some("speaker")
         );
 
@@ -326,10 +374,16 @@ scenario "announces-host-route" {
         let link = &m.topology.links[0];
         assert_eq!(link.kind, LinkKind::Veth);
         assert_eq!(
-            link.endpoints.iter().map(|e| e.node.as_str()).collect::<Vec<_>>(),
+            link.endpoints
+                .iter()
+                .map(|e| e.node.as_str())
+                .collect::<Vec<_>>(),
             vec!["peer", "speaker"]
         );
-        assert_eq!(link.subnet_v4, Some("10.0.0.0/30".parse::<Ipv4Net>().unwrap()));
+        assert_eq!(
+            link.subnet_v4,
+            Some("10.0.0.0/30".parse::<Ipv4Net>().unwrap())
+        );
         assert_eq!(link.subnet_v6, None);
 
         assert_eq!(m.scenarios.len(), 1);
@@ -427,7 +481,9 @@ scenario "announces-host-route" {
         // A `step` missing its `node`.
         rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step wait until=\"x\" timeout=\"5s\"\n}\n");
         // Unknown step kind.
-        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step frob node=\"a\"\n}\n");
+        rejected(
+            "topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step frob node=\"a\"\n}\n",
+        );
     }
 
     #[test]

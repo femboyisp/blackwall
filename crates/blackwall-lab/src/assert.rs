@@ -56,24 +56,46 @@ mod tests {
     use crate::topology::model::Matcher;
 
     fn cap(stdout: &str, exit: i32) -> Captured {
-        Captured { stdout: stdout.to_owned(), stderr: String::new(), exit }
+        Captured {
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            exit,
+        }
     }
 
     #[test]
     fn contains_passes_and_fails() {
-        assert_eq!(evaluate(&Matcher::Contains("203.0.113.7/32".to_owned()), &cap("... 203.0.113.7/32 ...", 0)), StepOutcome::Pass);
-        assert!(matches!(evaluate(&Matcher::Contains("x".to_owned()), &cap("y", 0)), StepOutcome::Fail(_)));
+        assert_eq!(
+            evaluate(
+                &Matcher::Contains("203.0.113.7/32".to_owned()),
+                &cap("... 203.0.113.7/32 ...", 0)
+            ),
+            StepOutcome::Pass
+        );
+        assert!(matches!(
+            evaluate(&Matcher::Contains("x".to_owned()), &cap("y", 0)),
+            StepOutcome::Fail(_)
+        ));
     }
 
     #[test]
     fn equals_trims_stdout() {
-        assert_eq!(evaluate(&Matcher::Equals("ok".to_owned()), &cap("  ok\n", 0)), StepOutcome::Pass);
-        assert!(matches!(evaluate(&Matcher::Equals("ok".to_owned()), &cap("nope", 0)), StepOutcome::Fail(_)));
+        assert_eq!(
+            evaluate(&Matcher::Equals("ok".to_owned()), &cap("  ok\n", 0)),
+            StepOutcome::Pass
+        );
+        assert!(matches!(
+            evaluate(&Matcher::Equals("ok".to_owned()), &cap("nope", 0)),
+            StepOutcome::Fail(_)
+        ));
     }
 
     #[test]
     fn exit_matches_code() {
         assert_eq!(evaluate(&Matcher::Exit(0), &cap("", 0)), StepOutcome::Pass);
-        assert!(matches!(evaluate(&Matcher::Exit(0), &cap("", 1)), StepOutcome::Fail(_)));
+        assert!(matches!(
+            evaluate(&Matcher::Exit(0), &cap("", 1)),
+            StepOutcome::Fail(_)
+        ));
     }
 }

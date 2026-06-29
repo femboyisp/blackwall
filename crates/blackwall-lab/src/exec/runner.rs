@@ -19,7 +19,10 @@ fn run_id() -> String {
     let pid = std::process::id();
     let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
     // 6 lowercase hex chars from pid+seq; not cryptographic.
-    format!("{:06x}", (pid.wrapping_mul(31).wrapping_add(seq)) & 0x00ff_ffff)
+    format!(
+        "{:06x}",
+        (pid.wrapping_mul(31).wrapping_add(seq)) & 0x00ff_ffff
+    )
 }
 
 /// Deterministic run id derived from a topology name, so interactive
@@ -70,13 +73,23 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
             Op::CreateVethPair { a, b } => netns::veth_add(a, b)?,
             Op::MoveIface { iface, netns: ns } => netns::iface_to_ns(iface, ns)?,
             Op::SetIfaceUp { netns: ns, iface } => netns::iface_up(ns, iface)?,
-            Op::AddAddr { netns: ns, iface, addr, prefix } => {
+            Op::AddAddr {
+                netns: ns,
+                iface,
+                addr,
+                prefix,
+            } => {
                 netns::addr_add(ns, iface, *addr, *prefix)?;
             }
             Op::WriteConfig { .. } => {
                 // Contents are rendered; written by spawn_bird.
             }
-            Op::SpawnDaemon { netns: ns, node, config_key, .. } => {
+            Op::SpawnDaemon {
+                netns: ns,
+                node,
+                config_key,
+                ..
+            } => {
                 let contents = plan
                     .ops
                     .iter()
@@ -89,7 +102,12 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
                     .ok_or_else(|| LabError::Exec(format!("missing config {config_key}")))?;
                 proc::spawn_bird(&plan.run_id, node, ns, &contents)?;
             }
-            Op::SpawnRun { netns: ns, cmd, env, .. } => {
+            Op::SpawnRun {
+                netns: ns,
+                cmd,
+                env,
+                ..
+            } => {
                 let resolved: Vec<(String, String)> = env
                     .iter()
                     .map(|(k, v)| Ok((k.clone(), resolve_env(v, map)?)))
@@ -110,7 +128,11 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
     let map = allocate(&manifest.topology)?;
     let plan = compile(&manifest.topology, &map, &id)?;
 
-    let mut guard = Teardown { run_id: id.clone(), netns: plan.netns.clone(), children: Vec::new() };
+    let mut guard = Teardown {
+        run_id: id.clone(),
+        netns: plan.netns.clone(),
+        children: Vec::new(),
+    };
     {
         let cleanup = plan.netns.clone();
         // Best-effort SIGINT cleanup; Drop covers normal/panic/error exits.
@@ -137,7 +159,10 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
             }
             steps.push(StepResult { name, outcome });
         }
-        scenarios.push(ScenarioResult { name: sc.name.clone(), steps });
+        scenarios.push(ScenarioResult {
+            name: sc.name.clone(),
+            steps,
+        });
     }
 
     let report = RunReport { scenarios };
@@ -163,7 +188,11 @@ fn ns_for(manifest: &Manifest, id: &str, node: &str) -> String {
 /// Execute one scenario step, returning (label, outcome).
 fn run_step(id: &str, manifest: &Manifest, step: &Step) -> (String, StepOutcome) {
     match step {
-        Step::Wait { node, until, timeout } => {
+        Step::Wait {
+            node,
+            until,
+            timeout,
+        } => {
             let ns = ns_for(manifest, id, node);
             let label = format!("wait {until}");
             match proc::wait_until(id, node, &ns, until, *timeout) {
@@ -180,7 +209,12 @@ fn run_step(id: &str, manifest: &Manifest, step: &Step) -> (String, StepOutcome)
                 Err(e) => (label, StepOutcome::Fail(e.to_string())),
             }
         }
-        Step::Assert { node, cmd, matcher, timeout } => {
+        Step::Assert {
+            node,
+            cmd,
+            matcher,
+            timeout,
+        } => {
             let ns = ns_for(manifest, id, node);
             let label = format!("assert {cmd}");
             let deadline = std::time::Instant::now() + *timeout;
@@ -230,7 +264,11 @@ pub(crate) fn up(manifest_text: &str) -> Result<(), LabError> {
     let plan = compile(&manifest.topology, &map, &id)?;
     // Children are intentionally leaked — the namespaces stay up.
     let _ = realize(&plan, &map)?;
-    println!("lab up: {} ({} namespaces)", manifest.topology.name, plan.netns.len());
+    println!(
+        "lab up: {} ({} namespaces)",
+        manifest.topology.name,
+        plan.netns.len()
+    );
     for ns in &plan.netns {
         println!("  {ns}");
     }
