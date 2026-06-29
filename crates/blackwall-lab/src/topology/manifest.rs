@@ -375,4 +375,82 @@ scenario "announces-host-route" {
             }
         );
     }
+
+    /// Assert that `src` is rejected with a [`LabError::Manifest`].
+    fn rejected(src: &str) {
+        assert!(
+            matches!(parse_manifest(src), Err(LabError::Manifest(_))),
+            "expected Manifest error for: {src}"
+        );
+    }
+
+    #[test]
+    fn rejects_top_level_structure_errors() {
+        // Two `topology` blocks.
+        rejected("topology \"a\" {\n}\ntopology \"b\" {\n}\n");
+        // No `topology` block at all.
+        rejected("scenario \"s\" {\n}\n");
+        // An unexpected top-level node.
+        rejected("foo \"x\"\n");
+    }
+
+    #[test]
+    fn rejects_topology_errors() {
+        // Topology missing its name argument.
+        rejected("topology {\n    node \"a\"\n}\n");
+        // Unexpected child of `topology` (neither node nor link).
+        rejected("topology \"t\" {\n    widget \"w\"\n}\n");
+    }
+
+    #[test]
+    fn rejects_node_errors() {
+        // `run` missing its `cmd`.
+        rejected("topology \"t\" {\n    node \"a\" {\n        run \"r\"\n    }\n}\n");
+        // Unexpected child of a `node` (neither daemon nor run).
+        rejected("topology \"t\" {\n    node \"a\" {\n        widget \"w\"\n    }\n}\n");
+        // Bad loopback address.
+        rejected("topology \"t\" {\n    node \"a\" loopback=\"not-an-ip\"\n}\n");
+    }
+
+    #[test]
+    fn rejects_link_errors() {
+        // Unknown link kind.
+        rejected("topology \"t\" {\n    node \"a\"\n    node \"b\"\n    link \"a\" \"b\" kind=\"frob\"\n}\n");
+        // Bad subnet CIDR.
+        rejected("topology \"t\" {\n    node \"a\"\n    node \"b\"\n    link \"a\" \"b\" subnet=\"not-a-cidr\"\n}\n");
+    }
+
+    #[test]
+    fn rejects_scenario_structure_errors() {
+        // Unexpected child of a scenario (not `step`).
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    widget \"w\"\n}\n");
+        // A `step` missing its `node`.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step wait until=\"x\" timeout=\"5s\"\n}\n");
+        // Unknown step kind.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step frob node=\"a\"\n}\n");
+    }
+
+    #[test]
+    fn rejects_wait_step_errors() {
+        // Wait missing `until`.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step wait node=\"a\" timeout=\"5s\"\n}\n");
+        // Wait missing `timeout`.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step wait node=\"a\" until=\"x\"\n}\n");
+        // Timeout with no unit.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step wait node=\"a\" until=\"x\" timeout=\"5\"\n}\n");
+        // Timeout with a bad unit.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step wait node=\"a\" until=\"x\" timeout=\"5h\"\n}\n");
+    }
+
+    #[test]
+    fn rejects_assert_step_errors() {
+        // Assert missing `cmd`.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step assert node=\"a\" contains=\"x\" timeout=\"5s\"\n}\n");
+        // Assert missing `timeout`.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step assert node=\"a\" cmd=\"c\" contains=\"x\"\n}\n");
+        // Assert with no matcher (no contains/equals/exit).
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step assert node=\"a\" cmd=\"c\" timeout=\"5s\"\n}\n");
+        // Assert with a bad exit code.
+        rejected("topology \"t\" {\n    node \"a\"\n}\nscenario \"s\" {\n    step assert node=\"a\" cmd=\"c\" exit=\"notanumber\" timeout=\"5s\"\n}\n");
+    }
 }
