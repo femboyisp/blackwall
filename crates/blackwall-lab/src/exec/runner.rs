@@ -38,6 +38,7 @@ fn run_id_stable(topology: &str) -> String {
 
 /// Guard that tears down a run's namespaces and kills tracked children on drop.
 struct Teardown {
+    run_id: String,
     netns: Vec<String>,
     children: Vec<Child>,
 }
@@ -50,6 +51,8 @@ impl Drop for Teardown {
         for ns in &self.netns {
             let _ = netns::netns_del(ns);
         }
+        // Remove this run's scratch dir (bird config/pid/ctl socket).
+        let _ = std::fs::remove_dir_all(format!("/run/blackwall-lab/{}", self.run_id));
     }
 }
 
@@ -107,10 +110,12 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
     let map = allocate(&manifest.topology)?;
     let plan = compile(&manifest.topology, &map, &id)?;
 
-    let mut guard = Teardown { netns: plan.netns.clone(), children: Vec::new() };
+    let mut guard = Teardown { run_id: id.clone(), netns: plan.netns.clone(), children: Vec::new() };
     {
         let cleanup = plan.netns.clone();
         // Best-effort SIGINT cleanup; Drop covers normal/panic/error exits.
+        // Captures only this run's namespaces, so it assumes one `run_test` per
+        // process — a second `set_handler` returns Err and is ignored here.
         let _ = ctrlc::set_handler(move || {
             for ns in &cleanup {
                 let _ = netns::netns_del(ns);
@@ -211,6 +216,8 @@ pub(crate) fn down_all() -> Result<(), LabError> {
             }
         }
     }
+    // Remove every run's scratch dir along with the namespace sweep.
+    let _ = std::fs::remove_dir_all("/run/blackwall-lab");
     Ok(())
 }
 
@@ -242,6 +249,8 @@ pub(crate) fn down_scenario(manifest_text: &str) -> Result<(), LabError> {
             .unwrap_or_else(|| crate::plan::netns_name(&id, &node.name));
         netns::netns_del(&ns)?;
     }
+    // Remove this scenario's run scratch dir (stable id).
+    let _ = std::fs::remove_dir_all(format!("/run/blackwall-lab/{id}"));
     Ok(())
 }
 
