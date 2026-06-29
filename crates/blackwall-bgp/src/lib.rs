@@ -3,6 +3,7 @@
 mod error;
 mod message;
 mod route;
+mod update;
 
 pub use error::BgpError;
 pub use message::{
@@ -11,3 +12,4 @@ pub use message::{
     HEADER_LEN, MARKER,
 };
 pub use route::{Origin, Route};
+pub use update::{build_announce, build_withdraw};
