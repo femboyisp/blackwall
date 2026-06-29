@@ -72,7 +72,10 @@ pub fn to_junit(report: &RunReport) -> String {
                         "    <testcase name=\"{}\">\n",
                         xml_escape(&step.name)
                     ));
-                    out.push_str(&format!("      <failure>{}</failure>\n", xml_escape(reason)));
+                    out.push_str(&format!(
+                        "      <failure>{}</failure>\n",
+                        xml_escape(reason)
+                    ));
                     out.push_str("    </testcase>\n");
                 }
             }
@@ -121,9 +124,7 @@ mod tests {
                     },
                     StepResult {
                         name: "assert route <present>".to_owned(),
-                        outcome: StepOutcome::Fail(
-                            "stdout does not contain `x`".to_owned(),
-                        ),
+                        outcome: StepOutcome::Fail("stdout does not contain `x`".to_owned()),
                     },
                 ],
             }],

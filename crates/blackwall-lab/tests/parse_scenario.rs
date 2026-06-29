@@ -14,7 +14,10 @@ fn proof_slice_is_well_formed() {
 
     let map = allocate(&manifest.topology).expect("allocate");
     let plan = compile(&manifest.topology, &map, "test00").expect("compile");
-    assert_eq!(plan.netns, vec!["bw-test00-peer".to_owned(), "bw-test00-speaker".to_owned()]);
+    assert_eq!(
+        plan.netns,
+        vec!["bw-test00-peer".to_owned(), "bw-test00-speaker".to_owned()]
+    );
 
     let peer = &manifest.topology.nodes[0];
     let bird = render_bird(peer, &manifest.topology, &map).expect("render");

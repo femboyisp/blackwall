@@ -7,7 +7,9 @@ use std::process::Command;
 
 /// Run a command, returning captured stdout/stderr/exit.
 pub(crate) fn run(cmd: &mut Command) -> Result<Captured, LabError> {
-    let out = cmd.output().map_err(|e| LabError::Exec(format!("spawn failed: {e}")))?;
+    let out = cmd
+        .output()
+        .map_err(|e| LabError::Exec(format!("spawn failed: {e}")))?;
     Ok(Captured {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -62,7 +64,10 @@ pub(crate) fn veth_add(a: &str, b: &str) -> Result<(), LabError> {
 pub(crate) fn iface_to_ns(iface: &str, ns: &str) -> Result<(), LabError> {
     let c = run(Command::new("ip").args(["link", "set", iface, "netns", ns]))?;
     if c.exit != 0 {
-        return Err(LabError::Exec(format!("move {iface} -> {ns}: {}", c.stderr)));
+        return Err(LabError::Exec(format!(
+            "move {iface} -> {ns}: {}",
+            c.stderr
+        )));
     }
     Ok(())
 }
@@ -71,7 +76,10 @@ pub(crate) fn iface_to_ns(iface: &str, ns: &str) -> Result<(), LabError> {
 pub(crate) fn iface_up(ns: &str, iface: &str) -> Result<(), LabError> {
     let c = run(Command::new("ip").args(["-n", ns, "link", "set", iface, "up"]))?;
     if c.exit != 0 {
-        return Err(LabError::Exec(format!("iface up {iface} in {ns}: {}", c.stderr)));
+        return Err(LabError::Exec(format!(
+            "iface up {iface} in {ns}: {}",
+            c.stderr
+        )));
     }
     Ok(())
 }
@@ -81,7 +89,10 @@ pub(crate) fn addr_add(ns: &str, iface: &str, addr: IpAddr, prefix: u8) -> Resul
     let cidr = format!("{addr}/{prefix}");
     let c = run(Command::new("ip").args(["-n", ns, "addr", "add", &cidr, "dev", iface]))?;
     if c.exit != 0 && !c.stderr.contains("File exists") {
-        return Err(LabError::Exec(format!("addr add {cidr} on {iface} in {ns}: {}", c.stderr)));
+        return Err(LabError::Exec(format!(
+            "addr add {cidr} on {iface} in {ns}: {}",
+            c.stderr
+        )));
     }
     Ok(())
 }

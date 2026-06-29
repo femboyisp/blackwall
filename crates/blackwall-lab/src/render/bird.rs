@@ -87,16 +87,31 @@ mod tests {
                     name: "peer".to_owned(),
                     netns: None,
                     loopback: None,
-                    daemons: vec![Daemon { kind: DaemonKind::Bird, settings }],
+                    daemons: vec![Daemon {
+                        kind: DaemonKind::Bird,
+                        settings,
+                    }],
                     runs: vec![],
                 },
-                Node { name: "speaker".to_owned(), netns: None, loopback: None, daemons: vec![], runs: vec![] },
+                Node {
+                    name: "speaker".to_owned(),
+                    netns: None,
+                    loopback: None,
+                    daemons: vec![],
+                    runs: vec![],
+                },
             ],
             links: vec![Link {
                 kind: LinkKind::Veth,
                 endpoints: vec![
-                    Endpoint { node: "peer".to_owned(), addr_override: None },
-                    Endpoint { node: "speaker".to_owned(), addr_override: None },
+                    Endpoint {
+                        node: "peer".to_owned(),
+                        addr_override: None,
+                    },
+                    Endpoint {
+                        node: "speaker".to_owned(),
+                        addr_override: None,
+                    },
                 ],
                 subnet_v4: Some("10.0.0.0/30".parse().unwrap()),
                 subnet_v6: None,
@@ -138,6 +153,9 @@ protocol bgp peer_speaker {\n\
     fn errors_when_node_has_no_bird_daemon() {
         let topo = proof_topo();
         let map = allocate(&topo).unwrap();
-        assert!(matches!(render_bird(&topo.nodes[1], &topo, &map), Err(LabError::Plan(_))));
+        assert!(matches!(
+            render_bird(&topo.nodes[1], &topo, &map),
+            Err(LabError::Plan(_))
+        ));
     }
 }

@@ -27,7 +27,9 @@ pub(crate) fn wait_until(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(LabError::Exec(format!("probe `{probe}` timed out after {timeout:?}")));
+            return Err(LabError::Exec(format!(
+                "probe `{probe}` timed out after {timeout:?}"
+            )));
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -50,7 +52,12 @@ fn probe_passes(run_id: &str, node: &str, ns: &str, probe: &str) -> Result<bool,
 
 /// Run an assert command in `ns`. If the command starts with `birdc `, inject
 /// `-s <ctl>` so it talks to this run's BIRD socket.
-pub(crate) fn assert_cmd(run_id: &str, node: &str, ns: &str, cmd: &str) -> Result<Captured, LabError> {
+pub(crate) fn assert_cmd(
+    run_id: &str,
+    node: &str,
+    ns: &str,
+    cmd: &str,
+) -> Result<Captured, LabError> {
     let rewritten = if let Some(rest) = cmd.strip_prefix("birdc ") {
         format!("birdc -s {} {rest}", bird_ctl(run_id, node))
     } else {
@@ -64,7 +71,12 @@ pub(crate) fn assert_cmd(run_id: &str, node: &str, ns: &str, cmd: &str) -> Resul
 /// Creates `/run/blackwall-lab/<run_id>/` if absent, writes `<node>.conf`,
 /// and starts `bird` in the background. The process is detached (no handle
 /// retained); BIRD exits on namespace teardown.
-pub(crate) fn spawn_bird(run_id: &str, node: &str, ns: &str, config_contents: &str) -> Result<(), LabError> {
+pub(crate) fn spawn_bird(
+    run_id: &str,
+    node: &str,
+    ns: &str,
+    config_contents: &str,
+) -> Result<(), LabError> {
     let dir = format!("/run/blackwall-lab/{run_id}");
     std::fs::create_dir_all(&dir)
         .map_err(|e| LabError::Exec(format!("create run dir {dir}: {e}")))?;
@@ -78,7 +90,9 @@ pub(crate) fn spawn_bird(run_id: &str, node: &str, ns: &str, config_contents: &s
 
     // Launch BIRD in the background; it daemonizes itself.
     let status = Command::new("ip")
-        .args(["netns", "exec", ns, "bird", "-c", &conf_path, "-s", &ctl, "-P", &pid_path])
+        .args([
+            "netns", "exec", ns, "bird", "-c", &conf_path, "-s", &ctl, "-P", &pid_path,
+        ])
         .status()
         .map_err(|e| LabError::Exec(format!("spawn bird in {ns}: {e}")))?;
 
@@ -100,7 +114,12 @@ pub(crate) fn spawn_run(
     cmd: &str,
     env_resolved: &[(String, String)],
 ) -> Result<Child, LabError> {
-    let mut args: Vec<String> = vec!["netns".to_owned(), "exec".to_owned(), ns.to_owned(), "env".to_owned()];
+    let mut args: Vec<String> = vec![
+        "netns".to_owned(),
+        "exec".to_owned(),
+        ns.to_owned(),
+        "env".to_owned(),
+    ];
     for (k, v) in env_resolved {
         args.push(format!("{k}={v}"));
     }
