@@ -17,7 +17,9 @@ etherparse = { workspace = true }
 nfq = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+blackwall-nft = { path = "../blackwall-nft" }
+blackwall-core = { path = "../blackwall-core" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "rt", "io-util"] }
 
 [lints]
 workspace = true
