@@ -49,7 +49,18 @@ struct Teardown {
 impl Drop for Teardown {
     fn drop(&mut self) {
         for child in &mut self.children {
+            // Runs lead their own process group (see `proc::spawn_run`), so kill
+            // the whole `ip → sh → <cmd>` tree by its negative pgid — otherwise a
+            // long-lived grandchild (e.g. a `cargo test` serving forever) is
+            // orphaned and holds the lab's stdout pipe open, hanging the caller.
+            // Best-effort: daemons that are not group leaders (knotd's `ip`) have
+            // no such group and the signal is a harmless no-op; `child.kill()`
+            // below still reaps them as before.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &format!("-{}", child.id())])
+                .status();
             let _ = child.kill();
+            let _ = child.wait();
         }
         for ns in &self.netns {
             let _ = netns::netns_del(ns);
@@ -116,15 +127,15 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
             }
             Op::SpawnRun {
                 netns: ns,
+                name,
                 cmd,
                 env,
-                ..
             } => {
                 let resolved: Vec<(String, String)> = env
                     .iter()
                     .map(|(k, v)| Ok((k.clone(), resolve_env(v, map)?)))
                     .collect::<Result<_, LabError>>()?;
-                let child = proc::spawn_run(ns, cmd, &resolved)?;
+                let child = proc::spawn_run(&plan.run_id, name, ns, cmd, &resolved)?;
                 children.push(child);
             }
         }
