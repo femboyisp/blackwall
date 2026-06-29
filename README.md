@@ -92,7 +92,40 @@ cargo llvm-cov --workspace --fail-under-lines 90     # ≥90% line coverage is e
 ```
 
 The repo follows strict coding guidelines (deny-warnings lints, exact dependency pins, rustdoc on
-public items) and ships a pre-commit config (`pre-commit install`).
+public items) and ships a pre-commit config (`pre-commit install`) that runs fmt, clippy, and tests.
+
+### Integration lab (`blackwall-lab`)
+
+Beyond unit tests, Blackwall ships a **reproducible network-namespace lab** that exercises each
+component against the real peer software it talks to, with one command that runs identically
+locally and in CI. A scenario is a small [KDL](https://kdl.dev) file declaring a topology (nodes,
+veth links, daemons, processes) and assertions; the `lab` binary realizes it in per-run network
+namespaces (`bw-<id>-…`), runs the assertions with timeout-polling, emits JUnit + TAP, and
+self-cleans on any exit.
+
+```bash
+cargo build -p blackwall-lab
+sudo ./target/debug/lab test crates/blackwall-lab/scenarios/bgp-bird.kdl   # one scenario
+sudo ./target/debug/lab up   crates/blackwall-lab/scenarios/dns-knot.kdl   # leave it standing
+sudo ./target/debug/lab shell crates/blackwall-lab/scenarios/dns-knot.kdl ns   # poke at a node
+sudo ./target/debug/lab down                                              # tear everything down
+```
+
+Current scenarios (each a CI gate):
+
+| Scenario | What it proves |
+|----------|----------------|
+| `bgp-bird` | The native BGP speaker peers with real **BIRD2**; an announced `/32` lands in BIRD's RIB. |
+| `dns-knot` | The DNS fast-flux path pushes an RFC 2136 + TSIG update to real **Knot DNS**; `kdig` serves the rotated record. |
+| `shaper-cake` | The shaper installs **CAKE** on an interface; `tc qdisc show` reports it. |
+| `flow-sflow` | Real **sFlow v5** datagrams drive the collector + detector to fire a volumetric detection. |
+
+The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
+renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is
+the only coverage-excluded part, validated end-to-end by the scenarios above. The roadmap adds
+per-component scenarios for the remaining crates, then a multi-host POP simulation (home + POPs
+over a WireGuard mesh with OSPF/BFD + iBGP + anycast), and eventually DDoS attack-traffic
+generation to exercise the XDP/eBPF data plane.
 
 ### Workspace layout
 
@@ -102,7 +135,15 @@ public items) and ships a pre-commit config (`pre-commit install`).
 | `blackwall-config` | The configuration DSL: lexer + parser → policy model. |
 | `blackwall-state` | PostgreSQL persistence (migrations, tenants, services, audit log). |
 | `blackwall-nft` | Renders the policy to an nftables ruleset and applies it atomically. |
-| `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`). |
+| `blackwall-deception` | Two-tier deception engine: service emulators, banner store + fast-flux, TPROXY/NFQUEUE transports. |
+| `blackwall-discovery` | Host-socket + Incus instance discovery feeding effective policy. |
+| `blackwall-speedtest` | Multi-provider speedtest with source/interface binding. |
+| `blackwall-shaper` | CAKE traffic shaping (egress + IFB ingress) computed from measured bandwidth. |
+| `blackwall-dns` | RFC 2136 + TSIG DNS fast-flux against a Knot primary. |
+| `blackwall-flow` | sFlow v5 decode + sliding-window volumetric attack detection (sub-project D). |
+| `blackwall-bgp` | Byte-exact BGP codec + injection-only iBGP speaker (sub-project C). |
+| `blackwall-lab` | netns integration-test lab harness (`lab` CLI) — see below. |
+| `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`, `run`, `flow`, …). |
 
 ## Roadmap
 
