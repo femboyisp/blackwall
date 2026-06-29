@@ -105,10 +105,21 @@ pub(crate) fn spawn_bird(
     Ok(())
 }
 
+/// Base dir for a knot node's working tree (config + zone + LMDB databases).
+///
+/// Deliberately on real disk (`/var/lib`), NOT the tmpfs `/run` base the rest
+/// of the lab uses: knot keeps its journal/timer/kasp state in LMDB, and LMDB's
+/// lock-file robust mutex fails with EPERM on tmpfs (`journal update failed
+/// (operation not permitted)`). Bird is unaffected (no LMDB) so it stays on
+/// `/run`. The teardown paths in `runner.rs` clean this base too.
+pub(crate) fn knot_base(run_id: &str, node: &str) -> String {
+    format!("/var/lib/blackwall-lab/{run_id}/{node}")
+}
+
 /// Launch `knotd` for a node in its namespace. Writes the rendered config and
-/// zone into a per-node run subdir and runs knotd with that dir as cwd, so the
-/// config's relative `storage`/`rundir`/`file: zone.db` resolve there.
-/// Backgrounded; reaped when the namespace is deleted at teardown.
+/// zone into a per-node disk-backed subdir ([`knot_base`]) and runs knotd with
+/// that dir as cwd, so the config's relative `storage`/`rundir`/`file: zone.db`
+/// resolve there. Backgrounded; reaped when the namespace is deleted at teardown.
 pub(crate) fn spawn_knot(
     run_id: &str,
     node: &str,
@@ -116,7 +127,7 @@ pub(crate) fn spawn_knot(
     conf: &str,
     zone: &str,
 ) -> Result<(), LabError> {
-    let dir = format!("/run/blackwall-lab/{run_id}/{node}");
+    let dir = knot_base(run_id, node);
     std::fs::create_dir_all(&dir).map_err(|e| LabError::Exec(format!("mkdir {dir}: {e}")))?;
     std::fs::write(format!("{dir}/knot.conf"), conf)
         .map_err(|e| LabError::Exec(format!("write knot.conf: {e}")))?;

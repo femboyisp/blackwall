@@ -54,8 +54,10 @@ impl Drop for Teardown {
         for ns in &self.netns {
             let _ = netns::netns_del(ns);
         }
-        // Remove this run's scratch dir (bird config/pid/ctl socket).
+        // Remove this run's scratch dirs: the tmpfs base (bird config/pid/ctl
+        // socket) and the disk-backed knot base (knot's LMDB state).
         let _ = std::fs::remove_dir_all(format!("/run/blackwall-lab/{}", self.run_id));
+        let _ = std::fs::remove_dir_all(format!("/var/lib/blackwall-lab/{}", self.run_id));
     }
 }
 
@@ -259,8 +261,9 @@ pub(crate) fn down_all() -> Result<(), LabError> {
             }
         }
     }
-    // Remove every run's scratch dir along with the namespace sweep.
+    // Remove every run's scratch dirs (tmpfs + disk-backed knot base).
     let _ = std::fs::remove_dir_all("/run/blackwall-lab");
+    let _ = std::fs::remove_dir_all("/var/lib/blackwall-lab");
     Ok(())
 }
 
@@ -296,8 +299,9 @@ pub(crate) fn down_scenario(manifest_text: &str) -> Result<(), LabError> {
             .unwrap_or_else(|| crate::plan::netns_name(&id, &node.name));
         netns::netns_del(&ns)?;
     }
-    // Remove this scenario's run scratch dir (stable id).
+    // Remove this scenario's run scratch dirs (tmpfs + disk-backed knot base).
     let _ = std::fs::remove_dir_all(format!("/run/blackwall-lab/{id}"));
+    let _ = std::fs::remove_dir_all(format!("/var/lib/blackwall-lab/{id}"));
     Ok(())
 }
 
