@@ -7,7 +7,9 @@
 
 pub mod addr;
 pub mod assert;
+pub mod cli;
 pub mod error;
+pub mod exec;
 pub mod plan;
 pub mod render;
 pub mod report;
