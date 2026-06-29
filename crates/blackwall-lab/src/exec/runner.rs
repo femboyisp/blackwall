@@ -82,7 +82,8 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
                 netns::addr_add(ns, iface, *addr, *prefix)?;
             }
             Op::WriteConfig { .. } => {
-                // Contents are rendered; written by spawn_bird.
+                // Contents are rendered; the owning daemon (spawn_bird/spawn_knot)
+                // writes them to its run dir at spawn time.
             }
             Op::SpawnDaemon {
                 netns: ns,
