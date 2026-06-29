@@ -67,7 +67,6 @@ expression: json
           "type": "filter",
           "hook": "prerouting",
           "prio": -300,
-          "dev": "eth0",
           "policy": "accept"
         }
       }
@@ -79,6 +78,17 @@ expression: json
           "table": "blackwall",
           "chain": "prerouting",
           "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "eth0",
+                "op": "=="
+              }
+            },
             {
               "match": {
                 "left": {
@@ -136,6 +146,17 @@ expression: json
               "match": {
                 "left": {
                   "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "eth0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
                     "key": "nfproto"
                   }
                 },
@@ -189,6 +210,17 @@ expression: json
               "match": {
                 "left": {
                   "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "eth0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
                     "key": "l4proto"
                   }
                 },
@@ -231,6 +263,17 @@ expression: json
           "table": "blackwall",
           "chain": "prerouting",
           "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "eth0",
+                "op": "=="
+              }
+            },
             {
               "match": {
                 "left": {

@@ -5,8 +5,8 @@
 //!   tuples for every Open IPv4 service in the policy.
 //! * Named set `real_v6` — open `(ipv6_addr, inet_proto, inet_service)`
 //!   tuples for every Open IPv6 service in the policy.
-//! * Chain `prerouting` — base chain capturing the managed interface with
-//!   classifier rules:
+//! * Chain `prerouting` — base chain with classifier rules scoped to the
+//!   managed interface via an `iifname` match:
 //!   1. Real-service membership → accept (DNAT to backend deferred to M3).
 //!   2. Deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
 //!   3. Deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
@@ -25,6 +25,21 @@ use nftables::{
     stmt::{Match, Operator, Queue, Statement, TProxy},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
+
+/// Build an `iifname == <iface>` match statement.
+///
+/// Used to scope each classifier rule to the managed interface without binding
+/// the prerouting chain to a device (which nft rejects for non-ingress/egress
+/// chains).
+fn iifname_match(iface: &str) -> Statement<'static> {
+    Statement::Match(Match {
+        left: Expression::Named(NamedExpression::Meta(Meta {
+            key: MetaKey::Iifname,
+        })),
+        right: Expression::String(iface.to_owned().into()),
+        op: Operator::EQ,
+    })
+}
 
 /// The nftables family Blackwall uses (dual-stack).
 const FAMILY: NfFamily = NfFamily::INet;
@@ -52,9 +67,11 @@ const DECEPTION_QUEUE: u16 = 0;
 /// 3. `add set inet blackwall real_v4 { type ipv4_addr . inet_proto . inet_service; ... }`
 /// 4. `add set inet blackwall real_v6 { type ipv6_addr . inet_proto . inet_service; ... }`
 /// 5. `add chain inet blackwall prerouting { type filter hook prerouting priority -300; }`
-/// 6. Rule: real-service membership → accept (DNAT to backend deferred to M3)
-/// 7. Rule: deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT
-/// 8. Rule: deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE
+///    (no device binding — device binding is rejected by nft for prerouting chains;
+///    the managed interface is scoped per-rule via `iifname == policy.interface`)
+/// 6. Rule: `iifname` match + real-service membership → accept (DNAT deferred to M3)
+/// 7. Rule: `iifname` match + deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT
+/// 8. Rule: `iifname` match + deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE
 ///
 /// The idiomatic nft atomic full-replace pattern is: `add table` (creates if
 /// absent), `flush table` (empties existing content), then re-add sets and
@@ -147,7 +164,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             _type: Some(NfChainType::Filter),
             hook: Some(NfHook::Prerouting),
             prio: Some(-300),
-            dev: Some(policy.interface.clone().into()),
+            dev: None,
             policy: Some(chain_policy),
         },
     ))));
@@ -167,6 +184,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             table: TABLE.into(),
             chain: "prerouting".into(),
             expr: vec![
+                // iifname == managed interface — scope rule to policy interface
+                iifname_match(&policy.interface),
                 // meta nfproto == ipv4/ipv6
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
@@ -227,6 +246,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             table: TABLE.into(),
             chain: "prerouting".into(),
             expr: vec![
+                // iifname == managed interface — scope rule to policy interface
+                iifname_match(&policy.interface),
                 // meta l4proto tcp
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
@@ -282,6 +303,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             table: TABLE.into(),
             chain: "prerouting".into(),
             expr: vec![
+                // iifname == managed interface — scope rule to policy interface
+                iifname_match(&policy.interface),
                 // meta l4proto != tcp  (i.e. ICMP and UDP)
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {

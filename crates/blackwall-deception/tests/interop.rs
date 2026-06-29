@@ -46,11 +46,7 @@ fn first_ipv4_of(iface: &str) -> std::net::Ipv4Addr {
         .skip_while(|w| *w != "inet")
         .nth(1)
         .expect("no inet addr on iface");
-    cidr.split('/')
-        .next()
-        .unwrap()
-        .parse()
-        .expect("parse ipv4")
+    cidr.split('/').next().unwrap().parse().expect("parse ipv4")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -77,10 +73,7 @@ async fn serves_deception_banner() {
         // 8080 is real; port 22 stays unmatched -> deception -> tproxy.
         tenants: vec![Tenant {
             name: "lab".to_owned(),
-            owned: vec![
-                IpAddr::V4(addr),
-                IpAddr::V6("fd00::1".parse().expect("v6")),
-            ],
+            owned: vec![IpAddr::V4(addr), IpAddr::V6("fd00::1".parse().expect("v6"))],
             allows: vec![AllowRule {
                 proto: L4Proto::Tcp,
                 port: 8080,
