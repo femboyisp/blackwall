@@ -47,7 +47,7 @@ jobs:
       - name: Install BIRD2 + Knot + iproute2
         run: sudo apt-get update && sudo apt-get install -y bird2 knot knot-dnsutils iproute2
       - name: Build the lab + interop tests (warm the cache the in-ns runs reuse)
-        run: cargo build -p blackwall-lab && cargo build -p blackwall-bgp --tests && cargo build -p blackwall-dns --tests
+        run: cargo build -p blackwall-lab && cargo build -p blackwall-bgp --tests && cargo build -p blackwall-dns --tests && cargo build -p blackwall-shaper --tests
       - name: Run the lab gate
         run: |
           sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
@@ -58,6 +58,11 @@ jobs:
           sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/dns-knot.kdl lab-junit-dns.xml
+      - name: Run the lab gate (shaper)
+        run: |
+          sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/shaper-cake.kdl lab-junit-shaper.xml
       - name: Upload JUnit
         if: always()
         uses: actions/upload-artifact@v4
@@ -66,3 +71,4 @@ jobs:
           path: |
             lab-junit.xml
             lab-junit-dns.xml
+            lab-junit-shaper.xml
