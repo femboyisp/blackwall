@@ -5,9 +5,10 @@
 //!
 //!   cargo test -p blackwall-deception --test interop -- serves_deception_banner --ignored --nocapture
 
-use blackwall_core::{Policy, PortState};
+use blackwall_core::{AllowRule, L4Proto, Policy, PortState, ServiceTarget, Tenant};
 use blackwall_deception::transport::{serve, SessionRecord, TproxyListener};
 use blackwall_deception::{default_registry, BannerStore, EngineLimits};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -64,7 +65,18 @@ async fn serves_deception_banner() {
         interface: iface,
         prefixes: vec![format!("{addr}/32").parse().expect("prefix")],
         default_state: PortState::Deception,
-        tenants: Vec::new(),
+        // One benign declared service so the nft `real_v4` set is non-empty
+        // (an empty set makes `nft` reject the ruleset). Port 8080 is real;
+        // port 22 stays unmatched -> deception -> tproxy.
+        tenants: vec![Tenant {
+            name: "lab".to_owned(),
+            owned: vec![IpAddr::V4(addr)],
+            allows: vec![AllowRule {
+                proto: L4Proto::Tcp,
+                port: 8080,
+                target: ServiceTarget::Host,
+            }],
+        }],
         shaping: Vec::new(),
         banner_flux: None,
         dns_flux: None,
