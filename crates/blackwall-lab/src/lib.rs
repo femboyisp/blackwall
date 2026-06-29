@@ -6,6 +6,7 @@
 //! out to the kernel and are coverage-excluded.
 
 pub mod addr;
+pub mod assert;
 pub mod error;
 pub mod plan;
 pub mod render;
