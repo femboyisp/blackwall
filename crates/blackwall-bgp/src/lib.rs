@@ -3,6 +3,7 @@
 mod error;
 mod message;
 mod route;
+mod session_net;
 mod update;
 
 pub use error::BgpError;
@@ -12,4 +13,5 @@ pub use message::{
     HEADER_LEN, MARKER,
 };
 pub use route::{Origin, Route};
+pub use session_net::{spawn, BgpHandle, PeerConfig, SessionCommand};
 pub use update::{build_announce, build_withdraw};
