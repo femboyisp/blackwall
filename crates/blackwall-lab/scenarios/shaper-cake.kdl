@@ -1,0 +1,15 @@
+// CAKE apply gate: blackwall-shaper installs CAKE (egress + IFB ingress) on the
+// shaper node's veth; `tc qdisc show` must then report a cake qdisc.
+topology "shaper-cake" {
+    node "shaper" {
+        run "apply" \
+            cmd="cargo test --offline -p blackwall-shaper --test interop -- applies_cake --ignored --nocapture" \
+            env="BW_SHAPE_DOWN=100 BW_SHAPE_UP=50"
+    }
+    node "sink"
+    link "shaper" "sink" subnet="10.0.0.0/30"
+}
+
+scenario "cake-applied" {
+    step assert node="shaper" cmd="tc qdisc show" contains="cake" timeout="15s"
+}
