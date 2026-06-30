@@ -120,6 +120,7 @@ Current scenarios (each a CI gate):
 | `shaper-cake` | The shaper installs **CAKE** on an interface; `tc qdisc show` reports it. |
 | `flow-sflow` | Real **sFlow v5** datagrams drive the collector + detector to fire a volumetric detection. |
 | `deception-nft` | The real nftables ruleset classifies a scanner's TCP connection to a non-real port, **TPROXY**-redirects it to the deception engine, and the SSH emulator answers an `SSH-2.0` banner — the full data path end to end. |
+| `trafficgen-foundation` | A Rust generator floods the victim with the full DDoS pattern set (UDP/SYN/reflection/malformed + benign) over **AF_PACKET**; the victim's per-flow sink + `/proc/net/dev` counters classify delivery and gate fidelity, benign-survival, and measurement-consistency. |
 
 The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
 renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is

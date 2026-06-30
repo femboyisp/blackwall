@@ -276,6 +276,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-trafficgen"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "etherparse",
+ "ipnet",
+ "libc",
+ "serde",
+ "serde_json",
+ "socket2 0.5.10",
+ "thiserror",
+]
+
+[[package]]
 name = "blackwalld"
 version = "0.1.0"
 dependencies = [
