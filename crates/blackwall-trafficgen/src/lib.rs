@@ -8,5 +8,6 @@
 pub mod error;
 pub mod flow;
 pub mod pattern;
+pub mod rate;
 
 pub use error::{Result, TrafficGenError};
