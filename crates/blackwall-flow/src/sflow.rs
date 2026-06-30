@@ -1,7 +1,8 @@
 //! sFlow v5 datagram decoder.
 //!
 //! Decodes sFlow v5 UDP payloads into a flat list of [`FlowObservation`]s.
-//! Only flow samples (sample format 1) containing raw Ethernet headers
+//! Regular flow samples (sample format 1) and expanded flow samples (format 3,
+//! emitted by real agents such as hsflowd) containing raw Ethernet headers
 //! (record format 1, header protocol 1) that etherparse can parse to an IP
 //! packet produce observations.  Everything else is skipped silently.
 
@@ -88,12 +89,14 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
             .map_err(|_| FlowError::Decode("length overflow".into()))?;
         let sample_body = cur.take(sample_length)?;
 
-        // Only process flow samples (enterprise=0, format=1).
-        if sample_type & 0xFFF != 1 {
-            continue;
+        // Flow samples: regular (format 1) and expanded (format 3, used by
+        // real agents such as hsflowd). Other sample types (counters) are
+        // skipped.
+        match sample_type & 0xFFF {
+            1 => decode_flow_sample(sample_body, &mut observations)?,
+            3 => decode_expanded_flow_sample(sample_body, &mut observations)?,
+            _ => continue,
         }
-
-        decode_flow_sample(sample_body, &mut observations)?;
     }
 
     Ok(observations)
@@ -114,6 +117,48 @@ fn decode_flow_sample(body: &[u8], out: &mut Vec<FlowObservation>) -> Result<(),
     let _drops = cur.read_u32()?;
     let _input = cur.read_u32()?;
     let _output = cur.read_u32()?;
+    let num_records = cur.read_u32()?;
+
+    for _ in 0..num_records {
+        let record_type = cur.read_u32()?;
+        let record_length = usize::try_from(cur.read_u32()?)
+            .map_err(|_| FlowError::Decode("length overflow".into()))?;
+        let record_body = cur.take(record_length)?;
+
+        // Only raw packet header records (enterprise=0, format=1).
+        if record_type & 0xFFF != 1 {
+            continue;
+        }
+
+        if let Some(obs) = decode_raw_header_record(record_body, sampling_rate) {
+            out.push(obs);
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse an EXPANDED flow-sample body (sample type 3) and append observations.
+///
+/// The expanded layout splits the regular flow sample's `source_id` into
+/// `ds_class`/`ds_index` and its `input`/`output` into `format`/`value` pairs
+/// (three extra `u32`s); the inner flow records are identical, so they are
+/// decoded the same way as the regular path.
+fn decode_expanded_flow_sample(
+    body: &[u8],
+    out: &mut Vec<FlowObservation>,
+) -> Result<(), FlowError> {
+    let mut cur = Cursor::new(body);
+    let _sequence = cur.read_u32()?;
+    let _ds_class = cur.read_u32()?;
+    let _ds_index = cur.read_u32()?;
+    let sampling_rate = cur.read_u32()?;
+    let _sample_pool = cur.read_u32()?;
+    let _drops = cur.read_u32()?;
+    let _input_format = cur.read_u32()?;
+    let _input_value = cur.read_u32()?;
+    let _output_format = cur.read_u32()?;
+    let _output_value = cur.read_u32()?;
     let num_records = cur.read_u32()?;
 
     for _ in 0..num_records {
@@ -288,6 +333,55 @@ mod tests {
         d
     }
 
+    /// Assemble a one-flow-sample sFlow v5 datagram using the EXPANDED (type-3)
+    /// flow-sample format around `header`.  The expanded header replaces the
+    /// regular `source_id` with `ds_class`/`ds_index` and `input`/`output` with
+    /// `input_format`/`input_value`/`output_format`/`output_value` — three extra
+    /// `u32`s.  The raw-header record framing is otherwise identical.
+    fn sflow_datagram_expanded(header: &[u8], sampling_rate: u32) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&be(5)); // version
+        d.extend_from_slice(&be(1)); // agent type ipv4
+        d.extend_from_slice(&[10, 0, 0, 1]); // agent addr
+        d.extend_from_slice(&be(0)); // sub agent
+        d.extend_from_slice(&be(1)); // seq
+        d.extend_from_slice(&be(1000)); // uptime
+        d.extend_from_slice(&be(1)); // num_samples
+
+        // --- raw-header record (identical to regular path) ---
+        let header_len = header.len();
+        let pad = (4 - (header_len % 4)) % 4;
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&be(1)); // header_protocol = ethernet
+        rec.extend_from_slice(&be(1500)); // frame_length
+        rec.extend_from_slice(&be(0)); // stripped
+        rec.extend_from_slice(&be(u32::try_from(header_len).unwrap())); // header_length
+        rec.extend_from_slice(header);
+        rec.extend(std::iter::repeat_n(0u8, pad));
+
+        // --- expanded flow-sample body (10 header u32s, then 1 record) ---
+        let mut flow = Vec::new();
+        flow.extend_from_slice(&be(1)); // sequence
+        flow.extend_from_slice(&be(0)); // ds_class   (replaces source_id)
+        flow.extend_from_slice(&be(0)); // ds_index
+        flow.extend_from_slice(&be(sampling_rate)); // sampling_rate
+        flow.extend_from_slice(&be(0)); // sample_pool
+        flow.extend_from_slice(&be(0)); // drops
+        flow.extend_from_slice(&be(0)); // input_format  (replaces input)
+        flow.extend_from_slice(&be(0)); // input_value
+        flow.extend_from_slice(&be(0)); // output_format (replaces output)
+        flow.extend_from_slice(&be(0)); // output_value
+        flow.extend_from_slice(&be(1)); // num_records
+        flow.extend_from_slice(&be(1)); // record_type = raw header
+        flow.extend_from_slice(&be(u32::try_from(rec.len()).unwrap())); // record_length
+        flow.extend_from_slice(&rec);
+
+        d.extend_from_slice(&be(3)); // sample_type = expanded flow sample
+        d.extend_from_slice(&be(u32::try_from(flow.len()).unwrap())); // sample_length
+        d.extend_from_slice(&flow);
+        d
+    }
+
     #[test]
     fn decodes_flow_sample_ipv4_udp() {
         let header = sample_eth_ipv4_udp();
@@ -302,6 +396,29 @@ mod tests {
         assert_eq!(o.src_port, 12345);
         assert_eq!(o.frame_len, 1500);
         assert_eq!(o.sampling_rate, 1024);
+    }
+
+    #[test]
+    fn expanded_flow_sample_decodes_same_observation() {
+        let header = sample_eth_ipv4_udp();
+        // Expanded (type 3) — must produce one observation identical to type 1.
+        let dg_expanded = sflow_datagram_expanded(&header, 512);
+        let obs = decode_datagram(&dg_expanded).unwrap();
+        assert_eq!(obs.len(), 1, "expanded flow sample yields one observation");
+        let o = obs[0];
+        assert_eq!(o.dst, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+        assert_eq!(o.proto, 17); // UDP
+        assert_eq!(o.dst_port, 53);
+        assert_eq!(o.sampling_rate, 512);
+
+        // Regular (type 1) — regression: must still decode after the dispatch change.
+        let dg_regular = sflow_datagram(&header, 256);
+        let obs_reg = decode_datagram(&dg_regular).unwrap();
+        assert_eq!(
+            obs_reg.len(),
+            1,
+            "regular flow sample still decodes (regression)"
+        );
     }
 
     #[test]
