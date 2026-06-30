@@ -1,0 +1,10 @@
+//! Blackwall traffic generator: craft + send DDoS attack and benign traffic
+//! over `AF_PACKET` in a lab namespace, and measure per-flow delivery.
+//!
+//! Pure modules ([`pattern`], [`flow`], [`rate`], [`report`], [`spec`]) are
+//! byte-exact unit-tested; the thin `io` layer and the `trafficgen` binary do
+//! the actual sockets and are validated end-to-end by the lab scenario.
+
+pub mod error;
+
+pub use error::{Result, TrafficGenError};
