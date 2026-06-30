@@ -6,5 +6,6 @@
 //! the actual sockets and are validated end-to-end by the lab scenario.
 
 pub mod error;
+pub mod pattern;
 
 pub use error::{Result, TrafficGenError};
