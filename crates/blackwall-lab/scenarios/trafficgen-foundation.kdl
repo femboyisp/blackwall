@@ -1,0 +1,27 @@
+// DDoS traffic-gen foundation: the attacker floods the victim with the full
+// pattern set; the victim's AF_PACKET sink + /proc/net/dev counters measure
+// per-flow delivery, and `verify` gates the thresholds.
+topology "trafficgen-foundation" {
+    node "victim" {
+        run "sink" \
+            cmd="cargo run --offline -p blackwall-trafficgen -- recv --ready /run/blackwall-lab/trafficgen-recv.ready --report /run/blackwall-lab/trafficgen-recv.json --duration 8"
+    }
+    node "attacker"
+    link "victim" "attacker" subnet="10.0.0.0/30"
+}
+
+scenario "flood-and-measure" {
+    // Sink readiness: it writes the sentinel as soon as its AF_PACKET socket binds.
+    step wait   node="victim"   until="file-present:/run/blackwall-lab/trafficgen-recv.ready" timeout="30s"
+    // Flood: `cargo run` (warm cache) + a 5s flood; the binary self-asserts
+    // generator fidelity, so a non-zero exit means the flood under-ran.
+    step assert node="attacker" \
+         cmd="cargo run --offline -p blackwall-trafficgen -- send --dst 10.0.0.1 --spec full-set --duration 5" \
+         exit="0" timeout="40s"
+    // Verify: the sink writes its report only when its 8s capture ends, after the
+    // flood. The assert retries (every 250ms) until the report exists and the
+    // thresholds pass, so the timeout must span past the sink's capture window.
+    step assert node="victim" \
+         cmd="cargo run --offline -p blackwall-trafficgen -- verify --report /run/blackwall-lab/trafficgen-recv.json --spec full-set" \
+         exit="0" timeout="20s"
+}
