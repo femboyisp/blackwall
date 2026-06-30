@@ -84,8 +84,8 @@ fn proc_rx_packets(iface: &str) -> Result<u64> {
         let line = line.trim_start();
         if let Some(rest) = line.strip_prefix(iface) {
             if let Some(rest) = rest.strip_prefix(':') {
-                if let Some(first) = rest.split_whitespace().next() {
-                    return first
+                if let Some(rx_packets) = rest.split_whitespace().nth(1) {
+                    return rx_packets
                         .parse()
                         .map_err(|e| TrafficGenError::Io(format!("parse rx: {e}")));
                 }
