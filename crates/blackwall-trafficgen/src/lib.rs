@@ -10,5 +10,6 @@ pub mod flow;
 pub mod pattern;
 pub mod rate;
 pub mod report;
+pub mod spec;
 
 pub use error::{Result, TrafficGenError};
