@@ -130,4 +130,49 @@ mod tests {
         assert_eq!(back.total.packets, 100);
         assert_eq!(back.per_flow["benign"].bytes, 1600);
     }
+
+    #[test]
+    fn flow_key_for_pattern_matches_flow_key() {
+        use crate::pattern::{MalformedKind, Pattern, ReflProto};
+        // Every sendable pattern maps to the same key its received frames classify
+        // to (so the send and recv reports use a shared vocabulary).
+        assert_eq!(flow_key_for_pattern(&Pattern::UdpFlood), "udp-flood");
+        assert_eq!(
+            flow_key_for_pattern(&Pattern::SynFlood { spoof_src: true }),
+            "syn-flood"
+        );
+        assert_eq!(
+            flow_key_for_pattern(&Pattern::Reflection(ReflProto::Ntp)),
+            "reflection"
+        );
+        assert_eq!(
+            flow_key_for_pattern(&Pattern::Malformed(MalformedKind::TruncatedL4)),
+            "malformed"
+        );
+        assert_eq!(flow_key_for_pattern(&Pattern::Benign), "benign");
+    }
+
+    #[test]
+    fn send_report_serializes_to_json() {
+        let mut per_pattern = BTreeMap::new();
+        per_pattern.insert(
+            "udp-flood".to_owned(),
+            FlowCounts {
+                packets: 250,
+                bytes: 4000,
+            },
+        );
+        let r = SendReport {
+            target_pps: 77_000,
+            elapsed_ms: 5000,
+            sent: FlowCounts {
+                packets: 250,
+                bytes: 4000,
+            },
+            per_pattern,
+        };
+        let json = r.to_json().unwrap();
+        assert!(json.contains("\"target_pps\""));
+        assert!(json.contains("udp-flood"));
+    }
 }
