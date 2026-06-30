@@ -83,10 +83,25 @@ pub fn build_frame(pattern: &Pattern, params: &FrameParams, seq_index: u64) -> R
             build_udp(params, rotate_port(1024, seq_index, 60000), params.dst_port)
         }
         Pattern::Benign => build_udp(params, rotate_port(40000, seq_index, 1000), params.dst_port),
-        // Extended in Task 3.
-        _ => Err(TrafficGenError::Build(
-            "pattern not yet implemented".to_owned(),
-        )),
+        Pattern::SynFlood { spoof_src } => build_syn(params, seq_index, *spoof_src),
+        Pattern::Reflection(proto) => {
+            let src_port = match proto {
+                ReflProto::Dns => 53,
+                ReflProto::Ntp => 123,
+            };
+            // Amplified reply: large UDP FROM the reflector port TO the victim.
+            let mut big = params.clone();
+            big.payload_len = 1400;
+            build_udp(&big, src_port, rotate_port(20000, seq_index, 1000))
+        }
+        Pattern::Malformed(kind) => {
+            let mut buf = match kind {
+                MalformedKind::IllegalTcpFlags => build_syn_fin_rst(params)?,
+                _ => build_udp(params, rotate_port(1024, seq_index, 60000), params.dst_port)?,
+            };
+            corrupt(&mut buf, *kind);
+            Ok(buf)
+        }
     }
 }
 
@@ -105,6 +120,85 @@ fn build_udp(params: &FrameParams, src_port: u16, dst_port: u16) -> Result<Vec<u
         .write(&mut buf, &payload)
         .map_err(|e| TrafficGenError::Build(e.to_string()))?;
     Ok(buf)
+}
+
+/// Build an Ethernet+IPv4/6+TCP-SYN frame; optionally rotate the source IP.
+fn build_syn(params: &FrameParams, seq_index: u64, spoof_src: bool) -> Result<Vec<u8>> {
+    let src_ip = if spoof_src {
+        rotate_ip(params.src_ip, seq_index)
+    } else {
+        params.src_ip
+    };
+    let src_port = rotate_port(1024, seq_index, 60000);
+    let builder = PacketBuilder::ethernet2(params.src_mac, params.dst_mac);
+    let builder = match (src_ip, params.dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => builder.ipv4(s.octets(), d.octets(), 64),
+        (IpAddr::V6(s), IpAddr::V6(d)) => builder.ipv6(s.octets(), d.octets(), 64),
+        _ => return Err(TrafficGenError::Build("mismatched IP families".to_owned())),
+    };
+    let builder = builder.tcp(src_port, params.dst_port, 0, 65535).syn();
+    let mut buf = Vec::with_capacity(builder.size(0));
+    builder
+        .write(&mut buf, &[])
+        .map_err(|e| TrafficGenError::Build(e.to_string()))?;
+    Ok(buf)
+}
+
+/// Build a TCP frame with the impossible SYN+FIN+RST flag combination.
+fn build_syn_fin_rst(params: &FrameParams) -> Result<Vec<u8>> {
+    let builder = PacketBuilder::ethernet2(params.src_mac, params.dst_mac);
+    let builder = match (params.src_ip, params.dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => builder.ipv4(s.octets(), d.octets(), 64),
+        (IpAddr::V6(s), IpAddr::V6(d)) => builder.ipv6(s.octets(), d.octets(), 64),
+        _ => return Err(TrafficGenError::Build("mismatched IP families".to_owned())),
+    };
+    let builder = builder
+        .tcp(1024, params.dst_port, 0, 65535)
+        .syn()
+        .fin()
+        .rst();
+    let mut buf = Vec::with_capacity(builder.size(0));
+    builder
+        .write(&mut buf, &[])
+        .map_err(|e| TrafficGenError::Build(e.to_string()))?;
+    Ok(buf)
+}
+
+/// Rotate an IPv4 source address by `seq_index` (low octet); IPv6 unchanged for
+/// the lab (spoofing is exercised on IPv4 SYN floods).
+fn rotate_ip(ip: IpAddr, seq_index: u64) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mut o = v4.octets();
+            o[3] = o[3].wrapping_add(u8::try_from(seq_index % 250).unwrap_or(0));
+            IpAddr::V4(std::net::Ipv4Addr::from(o))
+        }
+        IpAddr::V6(_) => ip,
+    }
+}
+
+/// Corrupt a freshly-built valid frame in the way `kind` prescribes.
+fn corrupt(buf: &mut Vec<u8>, kind: MalformedKind) {
+    match kind {
+        MalformedKind::BadIpChecksum => {
+            // Flip the stored IPv4 checksum bytes (14 + 10 .. 14 + 12).
+            buf[24] ^= 0xff;
+            buf[25] ^= 0xff;
+        }
+        MalformedKind::TruncatedL4 => {
+            // Cut the frame inside the L4 header (keep eth + ip + 2 L4 bytes).
+            buf.truncate(36);
+        }
+        MalformedKind::BadIpTotalLen => {
+            // Overwrite IPv4 total-length (bytes 16..18) with a too-large value.
+            let bogus = u16::MAX.to_be_bytes();
+            buf[16] = bogus[0];
+            buf[17] = bogus[1];
+        }
+        MalformedKind::IllegalTcpFlags => {
+            // Already malformed by construction in build_syn_fin_rst.
+        }
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +266,109 @@ mod tests {
     fn rotate_port_wraps_within_span() {
         assert_eq!(rotate_port(1024, 0, 100), 1024);
         assert_eq!(rotate_port(1024, 250, 100), 1024 + 50);
+    }
+
+    #[test]
+    fn syn_flood_sets_syn_only() {
+        let p = v4_params();
+        let bytes = build_frame(&Pattern::SynFlood { spoof_src: false }, &p, 7).unwrap();
+        let sliced = SlicedPacket::from_ethernet(&bytes).unwrap();
+        match sliced.transport.as_ref().unwrap() {
+            TransportSlice::Tcp(tcp) => {
+                assert!(tcp.syn() && !tcp.fin() && !tcp.rst() && !tcp.ack());
+            }
+            _ => panic!("expected tcp"),
+        }
+    }
+
+    #[test]
+    fn syn_flood_spoof_rotates_source_ip() {
+        let p = v4_params();
+        let a = build_frame(&Pattern::SynFlood { spoof_src: true }, &p, 0).unwrap();
+        let b = build_frame(&Pattern::SynFlood { spoof_src: true }, &p, 1).unwrap();
+        let src = |f: &[u8]| match SlicedPacket::from_ethernet(f).unwrap().net.unwrap() {
+            NetSlice::Ipv4(ip) => ip.header().source_addr(),
+            _ => unreachable!(),
+        };
+        assert_ne!(src(&a), src(&b), "spoofed source IP must rotate");
+    }
+
+    #[test]
+    fn reflection_dns_sources_from_port_53() {
+        let p = v4_params();
+        let bytes = build_frame(&Pattern::Reflection(ReflProto::Dns), &p, 1).unwrap();
+        let sliced = SlicedPacket::from_ethernet(&bytes).unwrap();
+        match sliced.transport.as_ref().unwrap() {
+            TransportSlice::Udp(u) => assert_eq!(u.source_port(), 53),
+            _ => panic!("expected udp"),
+        }
+    }
+
+    #[test]
+    fn malformed_bad_checksum_differs_from_recomputed() {
+        let p = v4_params();
+        let bytes = build_frame(&Pattern::Malformed(MalformedKind::BadIpChecksum), &p, 0).unwrap();
+        // Stored checksum (bytes 24..26) must NOT equal the checksum recomputed
+        // over the IPv4 header — that's the malformation.
+        let stored = u16::from_be_bytes([bytes[24], bytes[25]]);
+        let recomputed = ipv4_header_checksum(&bytes[14..34]);
+        assert_ne!(stored, recomputed);
+    }
+
+    #[test]
+    fn malformed_truncated_l4_has_no_transport() {
+        let p = v4_params();
+        let bytes = build_frame(&Pattern::Malformed(MalformedKind::TruncatedL4), &p, 0).unwrap();
+        // etherparse must fail to produce a transport header (frame cut short).
+        let parsed = SlicedPacket::from_ethernet(&bytes);
+        let truncated = match parsed {
+            Err(_) => true,
+            Ok(s) => s.transport.is_none(),
+        };
+        assert!(
+            truncated,
+            "truncated frame must not yield a transport header"
+        );
+    }
+
+    #[test]
+    fn malformed_illegal_flags_sets_syn_fin_rst() {
+        let p = v4_params();
+        let bytes =
+            build_frame(&Pattern::Malformed(MalformedKind::IllegalTcpFlags), &p, 0).unwrap();
+        let sliced = SlicedPacket::from_ethernet(&bytes).unwrap();
+        match sliced.transport.as_ref().unwrap() {
+            TransportSlice::Tcp(tcp) => assert!(tcp.syn() && tcp.fin() && tcp.rst()),
+            _ => panic!("expected tcp"),
+        }
+    }
+
+    #[test]
+    fn malformed_bad_total_len_exceeds_frame() {
+        let p = v4_params();
+        let bytes = build_frame(&Pattern::Malformed(MalformedKind::BadIpTotalLen), &p, 0).unwrap();
+        let total_len = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
+        // total-length claims more than the actual IP packet (frame len - eth 14).
+        assert!(total_len > bytes.len() - 14);
+    }
+
+    // Test helper: standard one's-complement IPv4 header checksum.
+    fn ipv4_header_checksum(header: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < header.len() {
+            // skip the checksum field itself (bytes 10..12 of the IP header)
+            if i == 10 {
+                i += 2;
+                continue;
+            }
+            sum += u32::from(u16::from_be_bytes([header[i], header[i + 1]]));
+            i += 2;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let folded = u16::try_from(sum & 0xffff).unwrap_or(0);
+        !folded
     }
 }
