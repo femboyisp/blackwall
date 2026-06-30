@@ -44,8 +44,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install BIRD2 + Knot + nftables + iproute2
-        run: sudo apt-get update && sudo apt-get install -y bird2 knot knot-dnsutils nftables iproute2
+      - name: Install BIRD2 + Knot + nftables + iproute2 + build hsflowd
+        run: |
+          sudo apt-get update && sudo apt-get install -y bird2 knot knot-dnsutils nftables iproute2 libpcap-dev
+          # host-sflow ships no binary package; build hsflowd + mod_pcap from a pinned tag.
+          git clone --depth 1 --branch v2.1.26-1 https://github.com/sflow/host-sflow.git /tmp/host-sflow
+          make -C /tmp/host-sflow FEATURES="PCAP"
+          sudo mkdir -p /opt/host-sflow
+          sudo cp /tmp/host-sflow/src/Linux/hsflowd /tmp/host-sflow/src/Linux/mod_pcap.so /opt/host-sflow/
       - name: Build the lab + interop tests (warm the cache the in-ns runs reuse)
         run: cargo build -p blackwall-lab && cargo build -p blackwall-bgp --tests && cargo build -p blackwall-dns --tests && cargo build -p blackwall-shaper --tests && cargo build -p blackwall-flow --tests && cargo build -p blackwall-deception --tests && cargo build -p blackwall-trafficgen
       - name: Run the lab gate
@@ -78,6 +84,11 @@ jobs:
           sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/trafficgen-foundation.kdl lab-junit-trafficgen.xml
+      - name: Run the lab gate (flow-live)
+        run: |
+          sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/flow-sflow-live.kdl lab-junit-flow-live.xml
       - name: Upload JUnit
         if: always()
         uses: actions/upload-artifact@v4
@@ -90,3 +101,4 @@ jobs:
             lab-junit-flow.xml
             lab-junit-deception.xml
             lab-junit-trafficgen.xml
+            lab-junit-flow-live.xml
