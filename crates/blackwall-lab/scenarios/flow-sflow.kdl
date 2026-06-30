@@ -1,0 +1,11 @@
+// Detection gate: real sFlow v5 datagrams drive the blackwall-flow collector +
+// ThresholdDetector; the self-asserting interop test exits 0 iff a detection fires.
+topology "flow-sflow" {
+    node "flow"
+}
+
+scenario "detection-fires" {
+    step assert node="flow" \
+         cmd="cargo test --offline -p blackwall-flow --test interop -- detects_volumetric_attack --ignored --nocapture" \
+         exit="0" timeout="40s"
+}
