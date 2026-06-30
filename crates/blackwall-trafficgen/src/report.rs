@@ -2,6 +2,7 @@
 
 use crate::error::{Result, TrafficGenError};
 use crate::flow::FlowClass;
+use crate::pattern::Pattern;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -38,6 +39,18 @@ pub struct RecvReport {
     pub kernel_rx_packets: u64,
     /// Per-flow breakdown, keyed by [`flow_key`].
     pub per_flow: BTreeMap<String, FlowCounts>,
+}
+
+/// Map a [`Pattern`] to the same stable key its received frames classify to.
+#[must_use]
+pub fn flow_key_for_pattern(p: &Pattern) -> &'static str {
+    match p {
+        Pattern::UdpFlood => "udp-flood",
+        Pattern::SynFlood { .. } => "syn-flood",
+        Pattern::Reflection(_) => "reflection",
+        Pattern::Malformed(_) => "malformed",
+        Pattern::Benign => "benign",
+    }
 }
 
 /// Stable string key for a flow class (used in both reports' maps).
