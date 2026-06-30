@@ -108,16 +108,26 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
                         _ => None,
                     })
                 };
-                let contents = lookup(config_key)
-                    .ok_or_else(|| LabError::Exec(format!("missing config {config_key}")))?;
                 match kind {
-                    DaemonKind::Bird => proc::spawn_bird(&plan.run_id, node, ns, &contents)?,
+                    DaemonKind::Bird => {
+                        let contents = lookup(config_key).ok_or_else(|| {
+                            LabError::Exec(format!("missing config {config_key}"))
+                        })?;
+                        proc::spawn_bird(&plan.run_id, node, ns, &contents)?;
+                    }
                     DaemonKind::Knot => {
+                        let contents = lookup(config_key).ok_or_else(|| {
+                            LabError::Exec(format!("missing config {config_key}"))
+                        })?;
                         let zone = lookup(&format!("knot-zone:{node}"))
                             .ok_or_else(|| LabError::Exec(format!("missing zone for {node}")))?;
                         // knotd runs in the foreground; track it so teardown
                         // kills it (unlike bird, which daemonizes itself).
                         let child = proc::spawn_knot(&plan.run_id, node, ns, &contents, &zone)?;
+                        children.push(child);
+                    }
+                    DaemonKind::Hsflowd => {
+                        let child = proc::spawn_hsflowd(&plan.run_id, node, ns)?;
                         children.push(child);
                     }
                     DaemonKind::WireGuard => {
