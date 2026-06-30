@@ -7,6 +7,7 @@
 
 pub mod error;
 pub mod flow;
+pub mod io;
 pub mod pattern;
 pub mod rate;
 pub mod report;
