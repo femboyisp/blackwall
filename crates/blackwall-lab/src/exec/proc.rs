@@ -142,6 +142,73 @@ pub(crate) fn spawn_knot(
     Ok(child)
 }
 
+/// Module dir + binary for the from-source hsflowd build (see the lab CI/install).
+const HSFLOWD_BIN: &str = "/opt/host-sflow/hsflowd";
+const HSFLOWD_MODDIR: &str = "/opt/host-sflow";
+/// sFlow collector port (standard) the in-namespace driver binds.
+const SFLOW_COLLECTOR_PORT: u16 = 6343;
+/// 1-in-N packet sampling (pinned; see the live-gate validation).
+const HSFLOWD_SAMPLING: u32 = 4;
+
+/// Launch hsflowd in `ns`, sampling the node's veth via mod_pcap and exporting
+/// sFlow v5 to 127.0.0.1:6343. Foreground (`-d`), root (`-P`, needed for pcap);
+/// output redirected so it cannot hold the lab's stdout pipe. Killed at teardown.
+pub(crate) fn spawn_hsflowd(run_id: &str, node: &str, ns: &str) -> Result<Child, LabError> {
+    // Discover the node's veth inside its namespace (first non-lo/ifb iface).
+    let out = Command::new("ip")
+        .args(["netns", "exec", ns, "ip", "-o", "link", "show"])
+        .output()
+        .map_err(|e| LabError::Exec(format!("ip link in {ns}: {e}")))?;
+    let iface = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            l.split(':')
+                .nth(1)
+                .map(str::trim)
+                .and_then(|n| n.split('@').next())
+                .map(str::trim)
+        })
+        .find(|n| !n.is_empty() && *n != "lo" && !n.starts_with("ifb"))
+        .ok_or_else(|| LabError::Exec(format!("no veth in {ns}")))?
+        .to_owned();
+
+    let dir = format!("/run/blackwall-lab/{run_id}/{node}");
+    std::fs::create_dir_all(&dir).map_err(|e| LabError::Exec(format!("mkdir {dir}: {e}")))?;
+    let conf = crate::render::render_hsflowd_conf(
+        &iface,
+        "127.0.0.1",
+        SFLOW_COLLECTOR_PORT,
+        HSFLOWD_SAMPLING,
+    );
+    let conf_path = format!("{dir}/hsflowd.conf");
+    std::fs::write(&conf_path, conf)
+        .map_err(|e| LabError::Exec(format!("write hsflowd.conf: {e}")))?;
+
+    let log = std::fs::File::create(format!("{dir}/hsflowd.log"))
+        .map_err(|e| LabError::Exec(format!("create hsflowd.log: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| LabError::Exec(format!("clone log handle: {e}")))?;
+    let child = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            ns,
+            HSFLOWD_BIN,
+            "-d",
+            "-P",
+            "-f",
+            &conf_path,
+            "-l",
+            HSFLOWD_MODDIR,
+        ])
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .map_err(|e| LabError::Exec(format!("spawn hsflowd: {e}")))?;
+    Ok(child)
+}
+
 /// Launch a process inside `ns` with resolved environment, returning a child
 /// handle the runner kills at teardown.
 ///

@@ -199,6 +199,7 @@ pub fn compile(topo: &Topology, map: &AddressMap, run_id: &str) -> Result<Execut
                     });
                     conf_key
                 }
+                DaemonKind::Hsflowd => String::new(),
                 DaemonKind::WireGuard => {
                     return Err(LabError::Plan(format!(
                         "daemon {:?} not realized yet",
