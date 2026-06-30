@@ -1,0 +1,21 @@
+// Live flow gate: the attacker floods the victim; real hsflowd (mod_pcap) samples
+// the veth into real sFlow v5; the production collector + detector must fire.
+// hsflowd (daemon) and the collector (run) both start at realize, before the
+// steps — so the collector is bound before the flood produces samples.
+topology "flow-sflow-live" {
+    node "victim" {
+        daemon "hsflowd"
+        run "collector" \
+            cmd="cargo test --offline -p blackwall-flow --test interop -- detects_live_sflow_attack --ignored --nocapture"
+    }
+    node "attacker"
+    link "victim" "attacker" subnet="10.0.0.0/30"
+}
+
+scenario "live-sflow-detection" {
+    step assert node="attacker" \
+         cmd="cargo run --offline -p blackwall-trafficgen -- send --dst 10.0.0.1 --spec full-set --duration 8" \
+         exit="0" timeout="60s"
+    step wait   node="victim" \
+         until="file-present:/run/blackwall-lab/flow-live-detected" timeout="40s"
+}
