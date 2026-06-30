@@ -79,8 +79,11 @@ pub fn rotate_port(base: u16, seq_index: u64, span: u16) -> u16 {
 /// Returns [`TrafficGenError::Build`] if `etherparse` serialization fails.
 pub fn build_frame(pattern: &Pattern, params: &FrameParams, seq_index: u64) -> Result<Vec<u8>> {
     match pattern {
+        // Source-port span 1024..31023 is deliberately disjoint from the benign
+        // flow's 40000..40999 window so the receiver never misclassifies a flood
+        // frame as benign (both share dst_port 80). See `flow::classify`.
         Pattern::UdpFlood => {
-            build_udp(params, rotate_port(1024, seq_index, 60000), params.dst_port)
+            build_udp(params, rotate_port(1024, seq_index, 30000), params.dst_port)
         }
         Pattern::Benign => build_udp(params, rotate_port(40000, seq_index, 1000), params.dst_port),
         Pattern::SynFlood { spoof_src } => build_syn(params, seq_index, *spoof_src),

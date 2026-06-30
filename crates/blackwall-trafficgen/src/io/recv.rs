@@ -25,8 +25,10 @@ pub fn run_recv(
     report_path: &str,
     duration: Duration,
 ) -> Result<RecvReport> {
-    // Remove any stale sentinel so the lab's file-present probe is fresh.
+    // Remove any stale sentinel + report from a previous run so the lab's
+    // file-present probe is fresh and `verify` can only read this run's report.
     let _ = std::fs::remove_file(ready_path);
+    let _ = std::fs::remove_file(report_path);
 
     let rx_before = proc_rx_packets(iface)?;
     // AF_PACKET wants the protocol in network byte order (htons(ETH_P_ALL)) so
