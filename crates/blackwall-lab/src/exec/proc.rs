@@ -3,6 +3,7 @@
 use crate::assert::Captured;
 use crate::error::LabError;
 use crate::exec::netns;
+use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -145,11 +146,29 @@ pub(crate) fn spawn_knot(
 /// handle the runner kills at teardown.
 ///
 /// Runs: `ip netns exec <ns> env <KEY=VAL...> sh -c "<cmd>"`
+///
+/// The child leads its own process group (`process_group(0)`) so teardown can
+/// signal the entire `ip → sh → <cmd>` tree, not just the `ip` parent — a
+/// long-lived `run` (e.g. a `cargo test` that serves forever) spawns a
+/// grandchild test binary that would otherwise survive `child.kill()` as an
+/// orphan. Its output is redirected to `<rundir>/<name>/run.log` so that even a
+/// momentarily-surviving descendant cannot hold the lab's stdout pipe open
+/// (the same hazard handled for `knotd` in [`spawn_knot`]).
 pub(crate) fn spawn_run(
+    run_id: &str,
+    name: &str,
     ns: &str,
     cmd: &str,
     env_resolved: &[(String, String)],
 ) -> Result<Child, LabError> {
+    let dir = format!("/run/blackwall-lab/{run_id}/{name}");
+    std::fs::create_dir_all(&dir).map_err(|e| LabError::Exec(format!("mkdir {dir}: {e}")))?;
+    let log = std::fs::File::create(format!("{dir}/run.log"))
+        .map_err(|e| LabError::Exec(format!("create run.log: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| LabError::Exec(format!("clone run.log handle: {e}")))?;
+
     let mut args: Vec<String> = vec![
         "netns".to_owned(),
         "exec".to_owned(),
@@ -163,6 +182,9 @@ pub(crate) fn spawn_run(
 
     let child = Command::new("ip")
         .args(&args)
+        .process_group(0)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|e| LabError::Exec(format!("spawn run in {ns}: {e}")))?;
     Ok(child)

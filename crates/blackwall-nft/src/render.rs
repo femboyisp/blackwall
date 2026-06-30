@@ -5,12 +5,14 @@
 //!   tuples for every Open IPv4 service in the policy.
 //! * Named set `real_v6` — open `(ipv6_addr, inet_proto, inet_service)`
 //!   tuples for every Open IPv6 service in the policy.
-//! * Chain `prerouting` — base chain capturing the managed interface with
-//!   classifier rules:
+//! * Chain `prerouting` — base chain with classifier rules scoped to the
+//!   managed interface via an `iifname` match:
 //!   1. Real-service membership → accept (DNAT to backend deferred to M3).
 //!   2. Deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
 //!   3. Deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
-//!   4. If default_state == Closed → drop (chain policy).
+//!   4. If default_state == Closed → an interface-scoped terminal `drop` rule
+//!      (the chain runs for every interface, so the closed posture must be
+//!      enforced by a rule matched on `iifname`, not a chain-wide drop policy).
 //!
 //! This module is pure: it builds the schema only. Applying it is handled by
 //! the `apply` function in the crate root.
@@ -25,6 +27,21 @@ use nftables::{
     stmt::{Match, Operator, Queue, Statement, TProxy},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
+
+/// Build an `iifname == <iface>` match statement.
+///
+/// Used to scope each classifier rule to the managed interface without binding
+/// the prerouting chain to a device (which nft rejects for non-ingress/egress
+/// chains).
+fn iifname_match(iface: &str) -> Statement<'static> {
+    Statement::Match(Match {
+        left: Expression::Named(NamedExpression::Meta(Meta {
+            key: MetaKey::Iifname,
+        })),
+        right: Expression::String(iface.to_owned().into()),
+        op: Operator::EQ,
+    })
+}
 
 /// The nftables family Blackwall uses (dual-stack).
 const FAMILY: NfFamily = NfFamily::INet;
@@ -52,9 +69,11 @@ const DECEPTION_QUEUE: u16 = 0;
 /// 3. `add set inet blackwall real_v4 { type ipv4_addr . inet_proto . inet_service; ... }`
 /// 4. `add set inet blackwall real_v6 { type ipv6_addr . inet_proto . inet_service; ... }`
 /// 5. `add chain inet blackwall prerouting { type filter hook prerouting priority -300; }`
-/// 6. Rule: real-service membership → accept (DNAT to backend deferred to M3)
-/// 7. Rule: deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT
-/// 8. Rule: deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE
+///    (no device binding — device binding is rejected by nft for prerouting chains;
+///    the managed interface is scoped per-rule via `iifname == policy.interface`)
+/// 6. Rule: `iifname` match + real-service membership → accept (DNAT deferred to M3)
+/// 7. Rule: `iifname` match + deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT
+/// 8. Rule: `iifname` match + deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE
 ///
 /// The idiomatic nft atomic full-replace pattern is: `add table` (creates if
 /// absent), `flush table` (empties existing content), then re-add sets and
@@ -131,12 +150,13 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
 
     // 5. Prerouting base chain.
     //
-    // Chain policy: Closed → Drop (enforce closed posture); otherwise Accept
-    // (the explicit classifier rules above handle deception/real traffic).
-    let chain_policy = match policy.default_state {
-        PortState::Closed => NfChainPolicy::Drop,
-        PortState::Deception | PortState::Open => NfChainPolicy::Accept,
-    };
+    // The chain is NOT bound to a device (nft rejects a device-bound filter
+    // prerouting chain), so it runs for packets ingressing on *every* interface.
+    // Its policy is therefore always Accept: a chain-wide `drop` policy would
+    // black-hole unrelated host traffic (loopback, other NICs). The Closed
+    // posture is instead enforced by an explicit interface-scoped drop rule
+    // appended below (rule 9), preserving the original "drop only on the managed
+    // interface" semantics the device binding used to provide.
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(
         Chain {
             family: FAMILY,
@@ -147,8 +167,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             _type: Some(NfChainType::Filter),
             hook: Some(NfHook::Prerouting),
             prio: Some(-300),
-            dev: Some(policy.interface.clone().into()),
-            policy: Some(chain_policy),
+            dev: None,
+            policy: Some(NfChainPolicy::Accept),
         },
     ))));
 
@@ -167,6 +187,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             table: TABLE.into(),
             chain: "prerouting".into(),
             expr: vec![
+                // iifname == managed interface — scope rule to policy interface
+                iifname_match(&policy.interface),
                 // meta nfproto == ipv4/ipv6
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
@@ -227,6 +249,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             table: TABLE.into(),
             chain: "prerouting".into(),
             expr: vec![
+                // iifname == managed interface — scope rule to policy interface
+                iifname_match(&policy.interface),
                 // meta l4proto tcp
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
@@ -282,6 +306,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             table: TABLE.into(),
             chain: "prerouting".into(),
             expr: vec![
+                // iifname == managed interface — scope rule to policy interface
+                iifname_match(&policy.interface),
                 // meta l4proto != tcp  (i.e. ICMP and UDP)
                 Statement::Match(Match {
                     left: Expression::Named(NamedExpression::Meta(Meta {
@@ -317,6 +343,29 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         };
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
             queue_rule,
+        ))));
+    }
+
+    // 9. Closed posture: drop unmatched traffic on the managed interface.
+    //
+    //    The chain is unbound (rule 5) and its policy is Accept, so the Closed
+    //    default_state is enforced with this interface-scoped terminal drop
+    //    rather than a chain-wide drop policy. Only managed-interface traffic
+    //    that fell through the classifier rules above is dropped — never
+    //    loopback or other-interface host traffic, which the old device-bound
+    //    chain's drop policy also never touched.
+    if policy.default_state == PortState::Closed {
+        let drop_rule = Rule {
+            family: FAMILY,
+            table: TABLE.into(),
+            chain: "prerouting".into(),
+            expr: vec![iifname_match(&policy.interface), Statement::Drop(None)].into(),
+            handle: None,
+            index: None,
+            comment: Some("closed posture: drop unmatched traffic on the managed interface".into()),
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+            drop_rule,
         ))));
     }
 
@@ -520,15 +569,63 @@ mod tests {
     }
 
     #[test]
-    fn drop_default_state_sets_chain_policy_to_drop() {
+    fn closed_default_state_emits_interface_scoped_drop_rule() {
         let mut policy = sample();
         policy.default_state = PortState::Closed;
         let ruleset = render(&policy).expect("render");
+
+        // The chain policy stays Accept: the chain is unbound and runs for every
+        // interface, so a drop *policy* would black-hole unrelated host traffic.
         let chain = match &ruleset.objects[4] {
             NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(c))) => c,
             other => panic!("expected chain, got {other:?}"),
         };
-        assert_eq!(chain.policy, Some(NfChainPolicy::Drop));
+        assert_eq!(chain.policy, Some(NfChainPolicy::Accept));
+
+        // The Closed posture is enforced by a terminal drop rule appended after
+        // the classifier rules, scoped to the managed interface by `iifname`.
+        let drop_rule = match ruleset.objects.last().expect("a terminal rule") {
+            NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) => r,
+            other => panic!("expected terminal drop rule, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                drop_rule.expr.first(),
+                Some(Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::Iifname
+                    })),
+                    ..
+                }))
+            ),
+            "the closed-posture drop must be scoped to the managed interface"
+        );
+        assert!(
+            drop_rule
+                .expr
+                .iter()
+                .any(|s| matches!(s, Statement::Drop(None))),
+            "the closed-posture rule must drop"
+        );
+    }
+
+    #[test]
+    fn non_closed_default_state_emits_no_drop_rule() {
+        // Deception/Open postures must NOT append a terminal drop rule (the
+        // chain policy carries the accept fall-through).
+        for state in [PortState::Deception, PortState::Open] {
+            let mut policy = sample();
+            policy.default_state = state;
+            let ruleset = render(&policy).expect("render");
+            let has_drop = ruleset.objects.iter().any(|o| {
+                matches!(
+                    o,
+                    NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r)))
+                        if r.expr.iter().any(|s| matches!(s, Statement::Drop(None)))
+                )
+            });
+            assert!(!has_drop, "{state:?} must not emit a drop rule");
+        }
     }
 
     #[test]

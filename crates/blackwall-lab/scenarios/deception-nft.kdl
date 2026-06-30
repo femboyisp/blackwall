@@ -1,0 +1,18 @@
+// Deception data-plane gate: a scanner's TCP connection to a non-real port on
+// the victim's managed prefix is nft-classified -> TPROXY -> the engine, which
+// answers with a honeypot banner.
+topology "deception-nft" {
+    node "victim" {
+        run "engine" \
+            cmd="cargo test --offline -p blackwall-deception --test interop -- serves_deception_banner --ignored --nocapture"
+    }
+    node "scanner"
+    link "victim" "scanner" subnet="10.0.0.0/30"
+}
+
+scenario "ssh-banner-served" {
+    step wait   node="victim"  until="port-open:61000" timeout="20s"
+    step assert node="scanner" \
+         cmd="timeout 3 bash -c 'exec 3<>/dev/tcp/10.0.0.1/22; head -c 40 <&3'" \
+         contains="SSH-2.0" timeout="15s"
+}

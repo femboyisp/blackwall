@@ -119,6 +119,7 @@ Current scenarios (each a CI gate):
 | `dns-knot` | The DNS fast-flux path pushes an RFC 2136 + TSIG update to real **Knot DNS**; `kdig` serves the rotated record. |
 | `shaper-cake` | The shaper installs **CAKE** on an interface; `tc qdisc show` reports it. |
 | `flow-sflow` | Real **sFlow v5** datagrams drive the collector + detector to fire a volumetric detection. |
+| `deception-nft` | The real nftables ruleset classifies a scanner's TCP connection to a non-real port, **TPROXY**-redirects it to the deception engine, and the SSH emulator answers an `SSH-2.0` banner — the full data path end to end. |
 
 The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
 renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is
