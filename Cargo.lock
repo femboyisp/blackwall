@@ -133,6 +133,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-bgp"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "blackwall-config"
 version = "0.1.0"
 dependencies = [
