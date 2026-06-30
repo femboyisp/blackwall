@@ -3,7 +3,7 @@
 use crate::assert::Captured;
 use crate::error::LabError;
 use crate::exec::netns;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Path to a node's BIRD control socket for this run.
@@ -103,6 +103,42 @@ pub(crate) fn spawn_bird(
         )));
     }
     Ok(())
+}
+
+/// Launch `knotd` for a node in its namespace. Writes the rendered config and
+/// zone into a per-node run subdir and runs knotd with that dir as cwd, so the
+/// config's relative `database storage`/`storage`/`rundir`/`file: zone.db`
+/// resolve there (the rendered config sets `database storage: "."` so knot's
+/// LMDB databases land here, not its unwritable compiled default). Backgrounded;
+/// reaped when the namespace is deleted at teardown.
+pub(crate) fn spawn_knot(
+    run_id: &str,
+    node: &str,
+    ns: &str,
+    conf: &str,
+    zone: &str,
+) -> Result<Child, LabError> {
+    let dir = format!("/run/blackwall-lab/{run_id}/{node}");
+    std::fs::create_dir_all(&dir).map_err(|e| LabError::Exec(format!("mkdir {dir}: {e}")))?;
+    std::fs::write(format!("{dir}/knot.conf"), conf)
+        .map_err(|e| LabError::Exec(format!("write knot.conf: {e}")))?;
+    std::fs::write(format!("{dir}/zone.db"), zone)
+        .map_err(|e| LabError::Exec(format!("write zone.db: {e}")))?;
+    // knotd runs in the foreground; redirect its (verbose) output to a log file
+    // so it does not inherit and hold the lab's stdout pipe open after the run.
+    let log = std::fs::File::create(format!("{dir}/knotd.log"))
+        .map_err(|e| LabError::Exec(format!("create knotd.log: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| LabError::Exec(format!("clone knotd.log handle: {e}")))?;
+    let child = Command::new("ip")
+        .args(["netns", "exec", ns, "knotd", "-c", "knot.conf"])
+        .current_dir(&dir)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .map_err(|e| LabError::Exec(format!("spawn knotd: {e}")))?;
+    Ok(child)
 }
 
 /// Launch a process inside `ns` with resolved environment, returning a child

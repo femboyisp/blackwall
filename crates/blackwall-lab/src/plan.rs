@@ -184,9 +184,24 @@ pub fn compile(topo: &Topology, map: &AddressMap, run_id: &str) -> Result<Execut
                     });
                     key
                 }
-                DaemonKind::Knot | DaemonKind::WireGuard => {
+                DaemonKind::Knot => {
+                    let conf = crate::render::render_knot_conf(daemon)?;
+                    let zone = crate::render::render_zone(daemon)?;
+                    let conf_key = format!("knot-conf:{}", node.name);
+                    let zone_key = format!("knot-zone:{}", node.name);
+                    ops.push(Op::WriteConfig {
+                        key: conf_key.clone(),
+                        contents: conf,
+                    });
+                    ops.push(Op::WriteConfig {
+                        key: zone_key,
+                        contents: zone,
+                    });
+                    conf_key
+                }
+                DaemonKind::WireGuard => {
                     return Err(LabError::Plan(format!(
-                        "daemon {:?} not realized in L1",
+                        "daemon {:?} not realized yet",
                         daemon.kind
                     )));
                 }
@@ -342,6 +357,51 @@ mod tests {
             .position(|o| matches!(o, Op::SpawnDaemon { .. } | Op::SpawnRun { .. }))
             .unwrap();
         assert!(last_link_op < first_spawn);
+    }
+
+    #[test]
+    fn compiles_knot_daemon() {
+        use std::collections::BTreeMap;
+        let mut settings = BTreeMap::new();
+        for (k, v) in [
+            ("zone", "lab.test"),
+            ("tsig-name", "lab-key"),
+            ("tsig-algo", "hmac-sha256"),
+            ("tsig-secret", "aGVsbG8="),
+        ] {
+            settings.insert(k.to_owned(), v.to_owned());
+        }
+        let topo = Topology {
+            name: "t".to_owned(),
+            nodes: vec![Node {
+                name: "ns".to_owned(),
+                netns: None,
+                loopback: None,
+                daemons: vec![Daemon {
+                    kind: DaemonKind::Knot,
+                    settings,
+                }],
+                runs: vec![],
+            }],
+            links: vec![],
+        };
+        let map = allocate(&topo).unwrap();
+        let plan = compile(&topo, &map, "run000").unwrap();
+
+        assert!(plan
+            .ops
+            .iter()
+            .any(|o| matches!(o, Op::WriteConfig { key, contents }
+            if key == "knot-conf:ns" && contents.contains("listen: 0.0.0.0@53"))));
+        assert!(plan
+            .ops
+            .iter()
+            .any(|o| matches!(o, Op::WriteConfig { key, contents }
+            if key == "knot-zone:ns" && contents.contains("$ORIGIN lab.test."))));
+        assert!(plan.ops.iter().any(
+            |o| matches!(o, Op::SpawnDaemon { kind, config_key, node, .. }
+            if *kind == DaemonKind::Knot && config_key == "knot-conf:ns" && node == "ns")
+        ));
     }
 
     #[test]

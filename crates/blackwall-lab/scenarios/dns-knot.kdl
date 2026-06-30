@@ -1,0 +1,20 @@
+// DNS interop gate: blackwall-dns pushes a flux window to a live Knot primary
+// over TSIG (RFC 2136); kdig must then resolve the rotated A within 10.9.9.0/24.
+topology "dns-knot" {
+    node "ns" {
+        daemon "knot" zone="lab.test" tsig-name="lab-key" \
+            tsig-algo="hmac-sha256" tsig-secret="aGVsbG8tdGhpcy1pcy1hLWxhYi1rZXk="
+    }
+    node "updater" {
+        run "push" \
+            cmd="cargo test --offline -p blackwall-dns --test interop -- pushes_a_flux_window --ignored --nocapture" \
+            env="BW_DNS_SERVER={ns.addr}:53 BW_DNS_ZONE=lab.test BW_DNS_NAME=host.lab.test BW_DNS_PREFIX=10.9.9.0/24 BW_DNS_KEYNAME=lab-key BW_DNS_ALGO=hmac-sha256 BW_DNS_SECRET=aGVsbG8tdGhpcy1pcy1hLWxhYi1rZXk="
+    }
+    link "ns" "updater" subnet="10.0.0.0/30"
+}
+
+scenario "flux-window-served" {
+    step wait   node="ns" until="port-open:53" timeout="20s"
+    step assert node="ns" cmd="kdig +short @127.0.0.1 host.lab.test A" \
+         contains="10.9.9." timeout="15s"
+}

@@ -6,7 +6,7 @@ use crate::error::LabError;
 use crate::exec::{netns, proc};
 use crate::plan::{compile, ExecutionPlan, Op};
 use crate::report::{to_junit, to_tap, RunReport, ScenarioResult, StepResult};
-use crate::topology::model::{Manifest, Step};
+use crate::topology::model::{DaemonKind, Manifest, Step};
 use crate::topology::{parse_manifest, validate};
 use std::process::Child;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -54,7 +54,7 @@ impl Drop for Teardown {
         for ns in &self.netns {
             let _ = netns::netns_del(ns);
         }
-        // Remove this run's scratch dir (bird config/pid/ctl socket).
+        // Remove this run's scratch dir (bird + knot config/state/sockets).
         let _ = std::fs::remove_dir_all(format!("/run/blackwall-lab/{}", self.run_id));
     }
 }
@@ -82,25 +82,37 @@ fn realize(plan: &ExecutionPlan, map: &AddressMap) -> Result<Vec<Child>, LabErro
                 netns::addr_add(ns, iface, *addr, *prefix)?;
             }
             Op::WriteConfig { .. } => {
-                // Contents are rendered; written by spawn_bird.
+                // Contents are rendered; the owning daemon (spawn_bird/spawn_knot)
+                // writes them to its run dir at spawn time.
             }
             Op::SpawnDaemon {
                 netns: ns,
                 node,
                 config_key,
-                ..
+                kind,
             } => {
-                let contents = plan
-                    .ops
-                    .iter()
-                    .find_map(|o| match o {
-                        Op::WriteConfig { key, contents } if key == config_key => {
-                            Some(contents.clone())
-                        }
+                let lookup = |key: &str| {
+                    plan.ops.iter().find_map(|o| match o {
+                        Op::WriteConfig { key: k, contents } if k == key => Some(contents.clone()),
                         _ => None,
                     })
+                };
+                let contents = lookup(config_key)
                     .ok_or_else(|| LabError::Exec(format!("missing config {config_key}")))?;
-                proc::spawn_bird(&plan.run_id, node, ns, &contents)?;
+                match kind {
+                    DaemonKind::Bird => proc::spawn_bird(&plan.run_id, node, ns, &contents)?,
+                    DaemonKind::Knot => {
+                        let zone = lookup(&format!("knot-zone:{node}"))
+                            .ok_or_else(|| LabError::Exec(format!("missing zone for {node}")))?;
+                        // knotd runs in the foreground; track it so teardown
+                        // kills it (unlike bird, which daemonizes itself).
+                        let child = proc::spawn_knot(&plan.run_id, node, ns, &contents, &zone)?;
+                        children.push(child);
+                    }
+                    DaemonKind::WireGuard => {
+                        return Err(LabError::Exec(format!("daemon {kind:?} not realized")));
+                    }
+                }
             }
             Op::SpawnRun {
                 netns: ns,
