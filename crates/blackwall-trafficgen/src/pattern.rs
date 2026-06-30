@@ -100,7 +100,10 @@ pub fn build_frame(pattern: &Pattern, params: &FrameParams, seq_index: u64) -> R
         Pattern::Malformed(kind) => {
             let mut buf = match kind {
                 MalformedKind::IllegalTcpFlags => build_syn_fin_rst(params)?,
-                _ => build_udp(params, rotate_port(1024, seq_index, 60000), params.dst_port)?,
+                // Same disjoint-from-benign source-port window as the flood, so a
+                // malformed UDP frame can never alias the benign flow even if a
+                // future malformed kind escapes the checksum/length pre-checks.
+                _ => build_udp(params, rotate_port(1024, seq_index, 30000), params.dst_port)?,
             };
             corrupt(&mut buf, *kind);
             Ok(buf)

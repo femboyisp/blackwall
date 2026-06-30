@@ -1,6 +1,6 @@
 //! `trafficgen` CLI: send floods, receive + measure, or verify a recv report.
 
-use blackwall_trafficgen::io::{first_non_loopback_iface, ipv4_of, recv::run_recv, send::run_send};
+use blackwall_trafficgen::io::{first_non_loopback_iface, recv::run_recv, send::run_send};
 use blackwall_trafficgen::rate::Bound;
 use blackwall_trafficgen::report::RecvReport;
 use blackwall_trafficgen::spec::{parse_spec, verify};
@@ -71,7 +71,6 @@ fn run(cli: Cli) -> Result<(), String> {
             duration,
         } => {
             let iface = first_non_loopback_iface().map_err(|e| e.to_string())?;
-            let _ = ipv4_of(&iface); // ensure addressed
             let gen = parse_spec(&spec).map_err(|e| e.to_string())?;
             let report = run_send(
                 &iface,
@@ -82,9 +81,12 @@ fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
             println!("{}", report.to_json().map_err(|e| e.to_string())?);
             // Generator fidelity self-assert (spec §5.3): achieved pps must reach
-            // a floor fraction of target. The floor is 50% at lab scale; tighten
-            // toward the spec's ±10% once a sustainable rate is pinned in Task
-            // 10's local validation.
+            // at least 50% of target. This is a deliberately conservative floor
+            // for increment 1 — the sustainable userspace AF_PACKET rate is
+            // environment-dependent (CI vs bare metal), so the gate proves the
+            // generator is not grossly under-delivering rather than asserting a
+            // tight band. Tightening once the rate is measured on CI is a
+            // tracked follow-up.
             let elapsed_ms = report.elapsed_ms.max(1);
             let achieved_pps = report.sent.packets.saturating_mul(1000) / elapsed_ms;
             if achieved_pps.saturating_mul(100) < report.target_pps.saturating_mul(50) {
