@@ -243,7 +243,6 @@ dependencies = [
  "blackwall-bgp",
  "blackwall-flow",
  "ipnet",
- "thiserror",
  "tokio",
  "tracing",
 ]
