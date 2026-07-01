@@ -56,6 +56,8 @@ pub enum DaemonKind {
     Bird,
     /// Knot authoritative DNS (modelled; realized in L2).
     Knot,
+    /// hsflowd mod_pcap sFlow agent (realized in the flow-live increment).
+    Hsflowd,
     /// WireGuard (modelled; realized in L3).
     WireGuard,
 }
