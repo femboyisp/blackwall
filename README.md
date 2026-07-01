@@ -118,7 +118,8 @@ Current scenarios (each a CI gate):
 | `bgp-bird` | The native BGP speaker peers with real **BIRD2**; an announced `/32` lands in BIRD's RIB. |
 | `dns-knot` | The DNS fast-flux path pushes an RFC 2136 + TSIG update to real **Knot DNS**; `kdig` serves the rotated record. |
 | `shaper-cake` | The shaper installs **CAKE** on an interface; `tc qdisc show` reports it. |
-| `flow-sflow` | Real **sFlow v5** datagrams drive the collector + detector to fire a volumetric detection. |
+| `flow-sflow` | Crafted **sFlow v5** datagrams drive the collector + detector to fire a volumetric detection (fast, dependency-free decoder test). |
+| `flow-sflow-live` | A trafficgen flood is sampled by **real hsflowd** (`mod_pcap`) into real sFlow v5; the production collector + detector must fire — proving the decoder handles real-agent (expanded) flow samples, which the crafted gate cannot. |
 | `deception-nft` | The real nftables ruleset classifies a scanner's TCP connection to a non-real port, **TPROXY**-redirects it to the deception engine, and the SSH emulator answers an `SSH-2.0` banner — the full data path end to end. |
 | `trafficgen-foundation` | A Rust generator floods the victim with the full DDoS pattern set (UDP/SYN/reflection/malformed + benign) over **AF_PACKET**; the victim's per-flow sink + `/proc/net/dev` counters classify delivery and gate fidelity, benign-survival, and measurement-consistency. |
 

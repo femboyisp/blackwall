@@ -139,6 +139,7 @@ fn parse_daemon(node: &KdlNode) -> Result<Daemon, LabError> {
     let kind = match first_arg(node, "kind")?.as_str() {
         "bird" => DaemonKind::Bird,
         "knot" => DaemonKind::Knot,
+        "hsflowd" => DaemonKind::Hsflowd,
         "wireguard" => DaemonKind::WireGuard,
         other => return Err(LabError::Manifest(format!("unknown daemon kind `{other}`"))),
     };
@@ -407,6 +408,13 @@ scenario "announces-host-route" {
                 timeout: Duration::from_secs(15),
             }
         );
+    }
+
+    #[test]
+    fn parses_hsflowd_daemon_kind() {
+        let src = r#"topology "t" { node "a" { daemon "hsflowd" } }"#;
+        let m = parse_manifest(src).expect("parse");
+        assert_eq!(m.topology.nodes[0].daemons[0].kind, DaemonKind::Hsflowd);
     }
 
     #[test]
