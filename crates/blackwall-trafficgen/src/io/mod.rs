@@ -1,5 +1,6 @@
 //! Thin `AF_PACKET` send/receive I/O. Coverage-excluded; validated by the lab.
 
+pub mod connect;
 pub mod recv;
 pub mod send;
 
