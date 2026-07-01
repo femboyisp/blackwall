@@ -3,5 +3,7 @@
 //! (added next) executes via the BGP speaker.
 
 pub mod controller;
+pub mod sink;
 
 pub use controller::{RtbhAction, RtbhConfig, RtbhController};
+pub use sink::RtbhSink;
