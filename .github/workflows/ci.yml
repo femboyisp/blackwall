@@ -41,6 +41,8 @@ jobs:
   lab:
     runs-on: ubuntu-latest
     needs: check
+    # Cap the whole job so a hung gate fails in minutes, not after hours.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,6 +98,12 @@ jobs:
           sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flow-sflow-live.kdl lab-junit-flow-live.xml
+      - name: Run the lab gate (deception-resilience)
+        timeout-minutes: 6
+        run: |
+          sudo env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/deception-resilience.kdl lab-junit-deception-resilience.xml
       - name: Upload JUnit
         if: always()
         uses: actions/upload-artifact@v4
@@ -109,3 +117,4 @@ jobs:
             lab-junit-deception.xml
             lab-junit-trafficgen.xml
             lab-junit-flow-live.xml
+            lab-junit-deception-resilience.xml

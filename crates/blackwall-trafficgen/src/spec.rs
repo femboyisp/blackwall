@@ -2,7 +2,7 @@
 
 use crate::error::{Result, TrafficGenError};
 use crate::pattern::{MalformedKind, Pattern, ReflProto};
-use crate::report::RecvReport;
+use crate::report::{ConnectReport, RecvReport};
 
 /// One pattern at one rate.
 #[derive(Debug, Clone)]
@@ -61,6 +61,16 @@ pub struct VerifyOutcome {
     pub passed: bool,
     /// One line per failed (or noted) threshold.
     pub reasons: Vec<String>,
+}
+
+/// The `connect-flood` gate predicate: the engine is **alive** (served > 0) AND
+/// the flood was **bounded** (some excess rejected — dropped at the cap, or failed
+/// at the backlog). Requiring only `dropped > 0` would be flaky since under heavy
+/// load the excess can shift to backlog-`failed`; the robust property is
+/// "alive AND bounded".
+#[must_use]
+pub fn connect_flood_ok(r: &ConnectReport) -> bool {
+    r.served > 0 && (r.dropped + r.failed) > 0
 }
 
 /// Apply the increment-1 gate thresholds (spec §5.3) to a receive report.
@@ -230,5 +240,38 @@ mod tests {
             "reasons: {:?}",
             verify(&r, &spec).reasons
         );
+    }
+
+    #[test]
+    fn connect_flood_ok_needs_served_and_bounded() {
+        use crate::report::ConnectReport;
+        // alive AND bounded (some dropped) -> ok
+        assert!(connect_flood_ok(&ConnectReport {
+            attempted: 900,
+            served: 256,
+            dropped: 600,
+            failed: 0,
+        }));
+        // alive AND bounded (some failed at the backlog) -> ok
+        assert!(connect_flood_ok(&ConnectReport {
+            attempted: 900,
+            served: 256,
+            dropped: 0,
+            failed: 600,
+        }));
+        // everything served, nothing bounded -> not ok (cap never engaged)
+        assert!(!connect_flood_ok(&ConnectReport {
+            attempted: 256,
+            served: 256,
+            dropped: 0,
+            failed: 0,
+        }));
+        // engine dead (nothing served) -> not ok
+        assert!(!connect_flood_ok(&ConnectReport {
+            attempted: 900,
+            served: 0,
+            dropped: 900,
+            failed: 0,
+        }));
     }
 }
