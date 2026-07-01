@@ -130,3 +130,32 @@ async fn detects_volumetric_attack() {
     collector.abort();
     panic!("no detection fired within ~10s");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs hsflowd + a netns; run by the lab's flow-sflow-live scenario"]
+async fn detects_live_sflow_attack() {
+    let sentinel = "/run/blackwall-lab/flow-live-detected";
+    let _ = std::fs::remove_file(sentinel); // fresh for the scenario's file-present probe
+
+    // Monitor the victim's prefix; threshold below the lab flood's estimated pps.
+    let detector = Box::new(ThresholdDetector::new(
+        vec!["10.0.0.0/30".parse().expect("prefix")],
+        20_000.0,      // pps; pinned in Task 5 validation
+        f64::INFINITY, // bps not gated here
+        1000,          // window_ms
+        2000,          // hold_down_ms
+    ));
+    let sink = Arc::new(CountingSink::default());
+    let listen: SocketAddr = "127.0.0.1:6343".parse().expect("addr");
+    tokio::spawn(run_collector(listen, detector, sink.clone(), 250));
+
+    // Poll for hsflowd's real samples to drive an Opened event.
+    for _ in 0..120 {
+        if sink.opened() {
+            std::fs::write(sentinel, b"ok").expect("write sentinel");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("no live volumetric detection fired");
+}
