@@ -41,6 +41,21 @@ pub struct RecvReport {
     pub per_flow: BTreeMap<String, FlowCounts>,
 }
 
+/// What a `connect-flood` run observed. `served` = a banner was read; `dropped`
+/// = the TCP connect succeeded but the engine closed with no banner (drop-at-cap);
+/// `failed` = the TCP connect itself errored (refused/reset/backlog).
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct ConnectReport {
+    /// Total connection attempts started.
+    pub attempted: u64,
+    /// Connections that received a banner (the engine served them).
+    pub served: u64,
+    /// Connections accepted then closed without a banner (the engine's drop-at-cap).
+    pub dropped: u64,
+    /// Connection attempts that errored before any data (refused/reset/backlog).
+    pub failed: u64,
+}
+
 /// Map a [`Pattern`] to the same stable key its received frames classify to.
 #[must_use]
 pub fn flow_key_for_pattern(p: &Pattern) -> &'static str {
@@ -91,6 +106,16 @@ impl RecvReport {
     /// [`TrafficGenError::Report`] on parse failure.
     pub fn from_json(s: &str) -> Result<Self> {
         serde_json::from_str(s).map_err(|e| TrafficGenError::Report(e.to_string()))
+    }
+}
+
+impl ConnectReport {
+    /// Serialize to pretty JSON.
+    ///
+    /// # Errors
+    /// [`TrafficGenError::Report`] on serialization failure.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).map_err(|e| TrafficGenError::Report(e.to_string()))
     }
 }
 
@@ -174,5 +199,18 @@ mod tests {
         let json = r.to_json().unwrap();
         assert!(json.contains("\"target_pps\""));
         assert!(json.contains("udp-flood"));
+    }
+
+    #[test]
+    fn connect_report_serializes_to_json() {
+        let r = ConnectReport {
+            attempted: 900,
+            served: 256,
+            dropped: 600,
+            failed: 44,
+        };
+        let json = r.to_json().unwrap();
+        assert!(json.contains("\"served\""));
+        assert!(json.contains("256"));
     }
 }
