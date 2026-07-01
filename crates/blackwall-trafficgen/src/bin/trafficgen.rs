@@ -50,6 +50,22 @@ enum Command {
         #[arg(long)]
         spec: String,
     },
+    /// Flood a port with concurrent completed TCP connections; self-asserts the
+    /// engine's drop-at-cap (served > 0 AND some dropped/failed).
+    ConnectFlood {
+        /// Destination IPv4 (the victim).
+        #[arg(long)]
+        dst: std::net::Ipv4Addr,
+        /// Destination port (a deception port, e.g. 22).
+        #[arg(long)]
+        port: u16,
+        /// Number of concurrent connections.
+        #[arg(long)]
+        concurrency: usize,
+        /// Duration in seconds.
+        #[arg(long, default_value_t = 8)]
+        duration: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -118,6 +134,33 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(())
             } else {
                 Err(format!("verify failed: {:?}", out.reasons))
+            }
+        }
+        Command::ConnectFlood {
+            dst,
+            port,
+            concurrency,
+            duration,
+        } => {
+            use blackwall_trafficgen::io::connect::run_connect_flood;
+            use blackwall_trafficgen::spec::connect_flood_ok;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let report = rt.block_on(run_connect_flood(
+                dst,
+                port,
+                concurrency,
+                Duration::from_secs(duration),
+            ));
+            println!("{}", report.to_json().map_err(|e| e.to_string())?);
+            if connect_flood_ok(&report) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "connect-flood: not (alive AND bounded): {report:?}"
+                ))
             }
         }
     }
