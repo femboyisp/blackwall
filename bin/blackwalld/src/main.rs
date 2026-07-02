@@ -1,6 +1,7 @@
 //! The Blackwall daemon/CLI entry point.
 
 use clap::{Parser, Subcommand};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -114,6 +115,47 @@ enum Command {
         /// against your own LibreSpeed deployment.
         #[arg(long, default_value = "https://lon.speedtest.clouvider.net")]
         librespeed_server: String,
+    },
+    /// Queue RTBH operator intent, or inspect the announced mirror / intent queue.
+    ///
+    /// The CLI never talks to BGP directly: it only appends to (or reads) the
+    /// `rtbh_requests`/`rtbh_blackholes` tables. A running `blackwalld flow`
+    /// daemon (with an `rtbh` config block) is the sole applier of intent.
+    Rtbh {
+        /// Which RTBH action to perform.
+        #[command(subcommand)]
+        action: RtbhCmd,
+    },
+}
+
+/// Operator actions for the `rtbh` subcommand.
+#[derive(Subcommand)]
+enum RtbhCmd {
+    /// Queue a blackhole-add request for `ip`.
+    ///
+    /// Rejected up front (before any database connection) if `ip` falls
+    /// outside the config's `ipv4`/`ipv6` prefixes, or if the config's `rtbh`
+    /// block has no next-hop configured for `ip`'s address family.
+    Add {
+        /// The target address to blackhole.
+        ip: IpAddr,
+        /// Path to the Blackwall config file (must contain an `rtbh` block).
+        #[arg(long)]
+        config: PathBuf,
+        /// Attribution for the request; defaults to `$USER@<hostname>`.
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Queue a blackhole-remove request for `ip`.
+    Remove {
+        /// The target address to un-blackhole.
+        ip: IpAddr,
+    },
+    /// List the announced blackhole mirror (and, optionally, the intent queue).
+    List {
+        /// Also print the `rtbh_requests` operator intent queue.
+        #[arg(long)]
+        requests: bool,
     },
 }
 
@@ -323,6 +365,199 @@ async fn apply_shaping(
     }
 }
 
+/// Process-start [`Instant`](std::time::Instant) base, captured once on first
+/// use, so [`mono_now`] returns a stable monotonic clock for the process's
+/// lifetime (the RTBH controller's injected `mono_now` clock).
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Monotonic milliseconds since the process started.
+fn mono_now() -> u64 {
+    let start = *PROCESS_START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Wall-clock milliseconds since the Unix epoch (the RTBH journal's `at_ms`).
+fn wall_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Default RTBH request attribution: `$USER@<hostname>`, falling back to
+/// `"unknown"`/`"unknown-host"` when either is unavailable.
+fn default_operator() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_owned())
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_owned());
+    format!("{user}@{host}")
+}
+
+/// Build an [`blackwall_rtbh::RtbhConfig`] from the policy's prefixes and the
+/// config's `rtbh` block. Shared by the CLI's eligibility pre-check and the
+/// `flow` daemon's manager wiring, so both agree on what is eligible.
+fn rtbh_config_from(
+    policy: &blackwall_core::Policy,
+    rtbh: &blackwall_core::RtbhPolicy,
+) -> blackwall_rtbh::RtbhConfig {
+    blackwall_rtbh::RtbhConfig {
+        eligible_prefixes: policy.prefixes.clone(),
+        blackhole_communities: rtbh.blackhole_communities.clone(),
+        next_hop_v4: rtbh.next_hop_v4,
+        next_hop_v6: rtbh.next_hop_v6,
+        max_blackholes: rtbh.max_blackholes,
+        hold_down: rtbh.hold_down,
+        max_ttl: rtbh.max_ttl,
+    }
+}
+
+/// Single-owner RTBH reconcile loop: applies auto detection events as they
+/// arrive on `rx`, and on a 1 s tick, calls [`blackwall_rtbh::RtbhManager::tick`]
+/// (completing deferred clears/TTL expiries — mandatory, see the module docs)
+/// and then drains `rtbh_requests` by an id watermark, applying each as
+/// `manual_add`/`manual_remove` and recording the outcome back onto the
+/// request row. Cap-deferred adds are retried from a small FIFO on every
+/// tick, ahead of newly drained requests, and their request row is left
+/// `pending` until they apply.
+///
+/// Runs until `rx` is closed (i.e. for the process's lifetime, since the
+/// paired `ChannelSink`'s sender is held by the running collector).
+async fn rtbh_manager_task(
+    mut manager: blackwall_rtbh::RtbhManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+    mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
+    request_store: std::sync::Arc<blackwall_state::Store>,
+) {
+    let mut watermark: i64 = 0;
+    let mut deferred: Vec<(i64, IpAddr)> = Vec::new();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            maybe_ev = rx.recv() => {
+                match maybe_ev {
+                    Some(ev) => manager.apply_event(&ev, mono_now(), wall_now()).await,
+                    None => {
+                        tracing::warn!("RTBH: detection-event channel closed; manager task exiting");
+                        return;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                // Mandatory: without this, a `Cleared` arriving before hold-down
+                // elapses is deferred and never completed.
+                manager.tick(mono_now(), wall_now()).await;
+
+                deferred = retry_deferred(&mut manager, &request_store, deferred).await;
+
+                match request_store.drain_requests(watermark).await {
+                    Ok(reqs) => {
+                        for req in reqs {
+                            watermark = req.id;
+                            apply_request(&mut manager, &request_store, &mut deferred, req).await;
+                        }
+                    }
+                    Err(err) => tracing::warn!(%err, "RTBH: failed to drain rtbh_requests"),
+                }
+            }
+        }
+    }
+}
+
+/// Retry cap-deferred adds (from a prior tick) before draining new requests.
+/// Returns the still-deferred subset (order preserved, FIFO).
+async fn retry_deferred(
+    manager: &mut blackwall_rtbh::RtbhManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+    request_store: &blackwall_state::Store,
+    deferred: Vec<(i64, IpAddr)>,
+) -> Vec<(i64, IpAddr)> {
+    let mut still_deferred = Vec::new();
+    for (id, target) in deferred {
+        match manager.apply_add(target, mono_now(), wall_now()).await {
+            blackwall_rtbh::ApplyOutcome::Applied => {
+                if let Err(err) = request_store.set_request_status(id, "applied", None).await {
+                    tracing::warn!(%err, id, "RTBH: failed to mark deferred request applied");
+                }
+            }
+            blackwall_rtbh::ApplyOutcome::Deferred => still_deferred.push((id, target)),
+            blackwall_rtbh::ApplyOutcome::Rejected(reason) => {
+                if let Err(err) = request_store
+                    .set_request_status(id, "rejected", Some(&reason))
+                    .await
+                {
+                    tracing::warn!(%err, id, "RTBH: failed to mark deferred request rejected");
+                }
+            }
+        }
+    }
+    still_deferred
+}
+
+/// Apply one drained `rtbh_requests` row and record its outcome. A rejected
+/// or applied outcome updates the row's status immediately; a capacity-deferred
+/// add is pushed onto `deferred` and left `pending` for a later tick.
+async fn apply_request(
+    manager: &mut blackwall_rtbh::RtbhManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+    request_store: &blackwall_state::Store,
+    deferred: &mut Vec<(i64, IpAddr)>,
+    req: blackwall_state::RtbhRequestRow,
+) {
+    match req.action.as_str() {
+        "add" => match manager.apply_add(req.target, mono_now(), wall_now()).await {
+            blackwall_rtbh::ApplyOutcome::Applied => {
+                if let Err(err) = request_store
+                    .set_request_status(req.id, "applied", None)
+                    .await
+                {
+                    tracing::warn!(%err, id = req.id, "RTBH: failed to set request status");
+                }
+            }
+            blackwall_rtbh::ApplyOutcome::Deferred => deferred.push((req.id, req.target)),
+            blackwall_rtbh::ApplyOutcome::Rejected(reason) => {
+                if let Err(err) = request_store
+                    .set_request_status(req.id, "rejected", Some(&reason))
+                    .await
+                {
+                    tracing::warn!(%err, id = req.id, "RTBH: failed to set request status");
+                }
+            }
+        },
+        "remove" => {
+            // Supersede any cap-deferred add of the same target: the operator's
+            // remove is the newer intent, so a pending add must not later announce
+            // this target once capacity frees.
+            let superseded: Vec<i64> = deferred
+                .iter()
+                .filter(|(_, t)| *t == req.target)
+                .map(|(id, _)| *id)
+                .collect();
+            deferred.retain(|(_, t)| *t != req.target);
+            for id in superseded {
+                if let Err(err) = request_store
+                    .set_request_status(id, "applied", Some("superseded by remove"))
+                    .await
+                {
+                    tracing::warn!(%err, id, "RTBH: failed to mark superseded add");
+                }
+            }
+            manager.apply_remove(req.target, wall_now()).await;
+            if let Err(err) = request_store
+                .set_request_status(req.id, "applied", None)
+                .await
+            {
+                tracing::warn!(%err, id = req.id, "RTBH: failed to set request status");
+            }
+        }
+        other => {
+            tracing::warn!(action = other, id = req.id, "RTBH: unknown request action; ignoring");
+        }
+    }
+}
+
 /// Core dispatch logic; returns `Err` on any failure.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -392,7 +627,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 window_secs * 1000,
                 hold_down_secs * 1000,
             );
-            let sink = std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store));
+
+            let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone() {
+                None => std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store)),
+                Some(rtbh) => {
+                    let pg_sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
+                        std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store.clone()));
+
+                    let peer = blackwall_bgp::PeerConfig {
+                        local_asn: rtbh.local_asn,
+                        peer_asn: rtbh.peer_asn,
+                        peer_addr: rtbh.peer_addr,
+                        router_id: rtbh.router_id,
+                        hold_time: 90,
+                    };
+                    let (bgp, _bgp_join) = blackwall_bgp::spawn(peer)?;
+                    let controller =
+                        blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
+                    let journal: blackwall_state::Store = (*store).clone();
+                    let mut manager = blackwall_rtbh::RtbhManager::new(controller, bgp, journal);
+
+                    // Rehydrate the controller from the announced mirror before
+                    // this session starts accepting new detections/requests.
+                    let mirror = store.list_active_blackholes().await?;
+                    let rehydrate_rows: Vec<(IpAddr, u64, blackwall_rtbh::BlackholeOrigin)> =
+                        mirror
+                            .into_iter()
+                            .map(|row| {
+                                let origin = match row.origin.as_str() {
+                                    "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
+                                    _ => blackwall_rtbh::BlackholeOrigin::Auto,
+                                };
+                                (row.target, row.announced_at_ms, origin)
+                            })
+                            .collect();
+                    manager.rehydrate(rehydrate_rows, mono_now()).await;
+
+                    let channel_cap = rtbh.max_blackholes.max(1024);
+                    let (tx, rx) = mpsc::channel::<blackwall_flow::DetectionEvent>(channel_cap);
+                    let request_store = store.clone();
+                    tokio::spawn(rtbh_manager_task(manager, rx, request_store));
+
+                    let channel_sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
+                        std::sync::Arc::new(blackwall_flow::ChannelSink::new(tx));
+                    std::sync::Arc::new(blackwall_flow::FanoutSink(vec![pg_sink, channel_sink]))
+                }
+            };
+
             tracing::info!(%listen, "sflow collector starting");
             blackwall_flow::run_collector(listen, Box::new(detector), sink, 1000).await?;
             Ok(())
@@ -416,6 +697,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+        Command::Rtbh { action } => run_rtbh(action).await,
         Command::Run {
             config,
             database_url,
@@ -695,4 +977,96 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err("deception engine transport exited".into())
         }
     }
+}
+
+/// Dispatch one `rtbh` subcommand.
+async fn run_rtbh(action: RtbhCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        RtbhCmd::Add {
+            ip,
+            config,
+            operator,
+        } => rtbh_add(ip, &config, operator).await,
+        RtbhCmd::Remove { ip } => rtbh_remove(ip).await,
+        RtbhCmd::List { requests } => rtbh_list(requests).await,
+    }
+}
+
+/// `rtbh add`: reject `ip` up front (no database connection made yet) if it
+/// falls outside the config's eligible prefixes or has no next-hop for its
+/// address family; otherwise queue an `"add"` intent row.
+async fn rtbh_add(
+    ip: IpAddr,
+    config: &std::path::Path,
+    operator: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = blackwall_config::parse_file(config)?;
+    let Some(rtbh) = policy.rtbh.clone() else {
+        return Err("config has no `rtbh` block; RTBH is not enabled".into());
+    };
+    let controller = blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
+    if !controller.is_eligible(ip) {
+        return Err(format!("{ip} is outside the configured RTBH-eligible prefixes").into());
+    }
+    if !controller.has_next_hop(ip) {
+        return Err(format!("no RTBH next-hop is configured for {ip}'s address family").into());
+    }
+
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue an rtbh request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let created_by = operator.unwrap_or_else(default_operator);
+    let id = store.enqueue_request(ip, "add", &created_by).await?;
+    println!("queued (request {id}); the running daemon will announce it.");
+    Ok(())
+}
+
+/// `rtbh remove`: queue a `"remove"` intent row.
+async fn rtbh_remove(ip: IpAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue an rtbh request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let id = store
+        .enqueue_request(ip, "remove", &default_operator())
+        .await?;
+    println!("queued (request {id}); the running daemon will withdraw it.");
+    Ok(())
+}
+
+/// `rtbh list`: print the announced-blackhole mirror, and (with `--requests`)
+/// the operator intent queue.
+async fn rtbh_list(requests: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to list rtbh state")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+
+    let active = store.list_active_blackholes().await?;
+    let now = wall_now();
+    println!("{:<40} {:<8} AGE", "TARGET", "ORIGIN");
+    for row in &active {
+        let age_secs = now.saturating_sub(row.announced_at_ms) / 1000;
+        println!("{:<40} {:<8} {age_secs}s", row.target, row.origin);
+    }
+
+    if requests {
+        println!();
+        println!(
+            "{:<6} {:<40} {:<8} {:<10} NOTE",
+            "ID", "TARGET", "ACTION", "STATUS"
+        );
+        for row in store.list_requests(None).await? {
+            println!(
+                "{:<6} {:<40} {:<8} {:<10} {}",
+                row.id,
+                row.target,
+                row.action,
+                row.status,
+                row.note.as_deref().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
 }
