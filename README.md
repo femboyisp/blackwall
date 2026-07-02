@@ -123,6 +123,7 @@ Current scenarios (each a CI gate):
 | `deception-nft` | The real nftables ruleset classifies a scanner's TCP connection to a non-real port, **TPROXY**-redirects it to the deception engine, and the SSH emulator answers an `SSH-2.0` banner — the full data path end to end. |
 | `trafficgen-foundation` | A Rust generator floods the victim with the full DDoS pattern set (UDP/SYN/reflection/malformed + benign) over **AF_PACKET**; the victim's per-flow sink + `/proc/net/dev` counters classify delivery and gate fidelity, benign-survival, and measurement-consistency. |
 | `deception-resilience` | A connection flood past the deception engine's `max_concurrent` cap proves its DDoS-defense is correct — drop-at-cap is enforced, legit deception still gets `SSH-2.0`, and the engine survives. A **resilience/correctness** gate, not a throughput benchmark (realistic-scale stress needs kernel-bypass, tracked separately). |
+| `rtbh-bird` | A synthetic attack detection drives the RTBH sink to announce a `/32` blackhole (community `65535:666`, RFC 7999) via the native BGP speaker; real **BIRD2** must show the route carrying that community — the detection→mitigation (D→C) loop end to end. |
 
 The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
 renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is
@@ -146,6 +147,7 @@ generation to exercise the XDP/eBPF data plane.
 | `blackwall-dns` | RFC 2136 + TSIG DNS fast-flux against a Knot primary. |
 | `blackwall-flow` | sFlow v5 decode + sliding-window volumetric attack detection (sub-project D). |
 | `blackwall-bgp` | Byte-exact BGP codec + injection-only iBGP speaker (sub-project C). |
+| `blackwall-rtbh` | RTBH controller + `MitigationSink` — detected attacks → BGP blackhole announcements (sub-project C). |
 | `blackwall-lab` | netns integration-test lab harness (`lab` CLI) — see below. |
 | `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`, `run`, `flow`, …). |
 
