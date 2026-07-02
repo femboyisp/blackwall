@@ -553,7 +553,11 @@ async fn apply_request(
             }
         }
         other => {
-            tracing::warn!(action = other, id = req.id, "RTBH: unknown request action; ignoring");
+            tracing::warn!(
+                action = other,
+                id = req.id,
+                "RTBH: unknown request action; ignoring"
+            );
         }
     }
 }
@@ -628,7 +632,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 hold_down_secs * 1000,
             );
 
-            let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone() {
+            let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
+            {
                 None => std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store)),
                 Some(rtbh) => {
                     let pg_sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
@@ -1038,8 +1043,8 @@ async fn rtbh_remove(ip: IpAddr) -> Result<(), Box<dyn std::error::Error>> {
 /// `rtbh list`: print the announced-blackhole mirror, and (with `--requests`)
 /// the operator intent queue.
 async fn rtbh_list(requests: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = std::env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL must be set to list rtbh state")?;
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set to list rtbh state")?;
     let store = blackwall_state::Store::connect(&database_url).await?;
     store.migrate().await?;
 

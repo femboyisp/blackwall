@@ -47,11 +47,7 @@ fn tempfile_config() -> (std::path::PathBuf, std::fs::File) {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut path = std::env::temp_dir();
-    path.push(format!(
-        "blackwall-cli-{}-{}.conf",
-        std::process::id(),
-        n
-    ));
+    path.push(format!("blackwall-cli-{}-{}.conf", std::process::id(), n));
     let file = std::fs::File::create(&path).expect("create temp config");
     (path, file)
 }

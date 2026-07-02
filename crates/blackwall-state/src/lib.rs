@@ -329,19 +329,15 @@ impl Store {
 
     /// List all currently-active (not withdrawn) blackholes.
     pub async fn list_active_blackholes(&self) -> Result<Vec<RtbhBlackholeRow>, StateError> {
-        let rows: Vec<(
-            sqlx::types::ipnetwork::IpNetwork,
-            String,
-            i64,
-            Option<i64>,
-        )> = sqlx::query_as(
-            "SELECT target, origin, \
+        let rows: Vec<(sqlx::types::ipnetwork::IpNetwork, String, i64, Option<i64>)> =
+            sqlx::query_as(
+                "SELECT target, origin, \
                     (EXTRACT(EPOCH FROM announced_at) * 1000)::bigint, \
                     (EXTRACT(EPOCH FROM withdrawn_at) * 1000)::bigint \
              FROM rtbh_blackholes WHERE withdrawn_at IS NULL ORDER BY target",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for (target, origin, announced_at_ms, withdrawn_at_ms) in rows {
@@ -744,10 +740,7 @@ mod tests {
             .unwrap();
         let drained = store.drain_requests(id - 1).await.unwrap();
         assert!(drained.iter().any(|r| r.id == id && r.action == "add"));
-        store
-            .set_request_status(id, "applied", None)
-            .await
-            .unwrap();
+        store.set_request_status(id, "applied", None).await.unwrap();
         assert_eq!(
             store
                 .list_requests(Some("applied"))
@@ -770,11 +763,7 @@ mod tests {
         let store = Store::connect(&url).await.unwrap();
         store.migrate().await.unwrap();
         let id = store
-            .enqueue_request(
-                "203.0.113.9".parse().unwrap(),
-                "remove",
-                "op2@host",
-            )
+            .enqueue_request("203.0.113.9".parse().unwrap(), "remove", "op2@host")
             .await
             .unwrap();
         store
