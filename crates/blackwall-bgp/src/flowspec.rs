@@ -3,16 +3,13 @@
 //! Injection-only: we encode announce/withdraw UPDATEs; we never decode
 //! FlowSpec NLRI. Minimal DDoS-drop match set (destination-prefix, IP-protocol,
 //! destination-port) with a traffic-rate action.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "encode_flowspec_nlri and its helpers are wired into the \
-        announce/withdraw UPDATE builders in Task 2; only the NLRI tests call \
-        them here"
-    )
-)]
 
+use crate::message::encode_header;
+use crate::route::Origin;
+use crate::update::{
+    push_attr, ATTR_AS_PATH, ATTR_EXTENDED_COMMUNITIES, ATTR_MP_REACH_NLRI, ATTR_MP_UNREACH_NLRI,
+    ATTR_ORIGIN, FLAG_OPT_NON_TRANS, FLAG_OPT_TRANS, FLAG_WELL_KNOWN,
+};
 use ipnet::IpNet;
 use std::net::IpAddr;
 
@@ -113,6 +110,79 @@ fn push_two_byte_len(out: &mut Vec<u8>, len: usize) {
     out.extend_from_slice(&(0xF000 | l).to_be_bytes());
 }
 
+/// SAFI for FlowSpec (RFC 8955 §3 / RFC 8956).
+const SAFI_FLOWSPEC: u8 = 133;
+
+/// Encode the traffic-rate extended community (RFC 8955 §7.1): `80 06 <AS=0>
+/// <IEEE-754 f32 rate bytes/sec>`. `0.0` = discard.
+fn traffic_rate_community(rate: f32) -> [u8; 8] {
+    let mut c = [0u8; 8];
+    c[0] = 0x80;
+    c[1] = 0x06;
+    // c[2..4] = AS (0, informational)
+    c[4..8].copy_from_slice(&rate.to_be_bytes());
+    c
+}
+
+fn afi_of(rule: &FlowSpecRule) -> u16 {
+    match rule.dst {
+        IpNet::V4(_) => 1,
+        IpNet::V6(_) => 2,
+    }
+}
+
+/// Build a FlowSpec announce UPDATE for `rule`.
+#[must_use]
+pub fn build_flowspec_announce(rule: &FlowSpecRule) -> Vec<u8> {
+    let nlri = encode_flowspec_nlri(rule);
+    let FlowAction::TrafficRate(rate) = rule.action;
+
+    let mut mp_reach: Vec<u8> = Vec::new();
+    mp_reach.extend_from_slice(&afi_of(rule).to_be_bytes());
+    mp_reach.push(SAFI_FLOWSPEC);
+    mp_reach.push(0); // next-hop length: FlowSpec has none
+    mp_reach.push(0); // reserved
+    mp_reach.extend_from_slice(&nlri);
+
+    let mut attrs: Vec<u8> = Vec::new();
+    push_attr(&mut attrs, FLAG_WELL_KNOWN, ATTR_ORIGIN, &[Origin::Igp.wire()]);
+    push_attr(&mut attrs, FLAG_WELL_KNOWN, ATTR_AS_PATH, &[]);
+    push_attr(
+        &mut attrs,
+        FLAG_OPT_TRANS,
+        ATTR_EXTENDED_COMMUNITIES,
+        &traffic_rate_community(rate),
+    );
+    push_attr(&mut attrs, FLAG_OPT_NON_TRANS, ATTR_MP_REACH_NLRI, &mp_reach);
+
+    let total_attr_len = u16::try_from(attrs.len()).expect("path attributes exceed 65535 bytes");
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&0u16.to_be_bytes()); // withdrawn_routes_len = 0
+    body.extend_from_slice(&total_attr_len.to_be_bytes());
+    body.extend_from_slice(&attrs);
+    encode_header(2, &body)
+}
+
+/// Build a FlowSpec withdraw UPDATE for `rule` (identical NLRI in MP_UNREACH).
+#[must_use]
+pub fn build_flowspec_withdraw(rule: &FlowSpecRule) -> Vec<u8> {
+    let nlri = encode_flowspec_nlri(rule);
+    let mut mp_unreach: Vec<u8> = Vec::new();
+    mp_unreach.extend_from_slice(&afi_of(rule).to_be_bytes());
+    mp_unreach.push(SAFI_FLOWSPEC);
+    mp_unreach.extend_from_slice(&nlri);
+
+    let mut attrs: Vec<u8> = Vec::new();
+    push_attr(&mut attrs, FLAG_OPT_NON_TRANS, ATTR_MP_UNREACH_NLRI, &mp_unreach);
+
+    let total_attr_len = u16::try_from(attrs.len()).expect("path attributes exceed 65535 bytes");
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&total_attr_len.to_be_bytes());
+    body.extend_from_slice(&attrs);
+    encode_header(2, &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +271,54 @@ mod tests {
         let mut out = Vec::new();
         push_two_byte_len(&mut out, 0x0100);
         assert_eq!(out, vec![0xF1, 0x00]);
+    }
+
+    #[test]
+    fn traffic_rate_drop_community_is_zero_float() {
+        assert_eq!(
+            traffic_rate_community(0.0),
+            [0x80, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn traffic_rate_limit_community_encodes_be_float() {
+        let c = traffic_rate_community(1_000_000.0);
+        assert_eq!(&c[0..4], &[0x80, 0x06, 0x00, 0x00]);
+        assert_eq!(&c[4..8], &1_000_000.0f32.to_be_bytes());
+    }
+
+    #[test]
+    fn announce_carries_mp_reach_safi133_nlri_and_action() {
+        let msg = build_flowspec_announce(&rule_v4());
+        let (ty, total) = crate::message::parse_header(&msg).unwrap();
+        assert_eq!(ty, 2); // UPDATE
+        assert_eq!(total, msg.len());
+        // MP_REACH_NLRI attribute (type 14, optional non-transitive 0x80)
+        assert!(msg.windows(2).any(|w| w == [0x80, 14]));
+        // AFI 1 (v4), SAFI 133, nexthop_len 0
+        assert!(msg.windows(4).any(|w| w == [0x00, 0x01, 0x85, 0x00]));
+        // the traffic-rate action community bytes appear
+        assert!(msg.windows(8).any(|w| w == [0x80, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+        // the NLRI appears verbatim
+        let nlri = encode_flowspec_nlri(&rule_v4());
+        assert!(msg.windows(nlri.len()).any(|w| w == nlri.as_slice()));
+    }
+
+    #[test]
+    fn withdraw_uses_mp_unreach_with_identical_nlri() {
+        let msg = build_flowspec_withdraw(&rule_v4());
+        let (ty, _) = crate::message::parse_header(&msg).unwrap();
+        assert_eq!(ty, 2);
+        assert!(msg.windows(2).any(|w| w == [0x80, 15])); // MP_UNREACH_NLRI
+        let nlri = encode_flowspec_nlri(&rule_v4());
+        assert!(msg.windows(nlri.len()).any(|w| w == nlri.as_slice()));
+    }
+
+    #[test]
+    fn announce_v6_uses_afi2() {
+        let r = FlowSpecRule { dst: "2001:db8::7/128".parse().unwrap(), ..rule_v4() };
+        let msg = build_flowspec_announce(&r);
+        assert!(msg.windows(4).any(|w| w == [0x00, 0x02, 0x85, 0x00])); // AFI 2, SAFI 133, nh 0
     }
 }
