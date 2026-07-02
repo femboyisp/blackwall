@@ -426,6 +426,7 @@ mod tests {
             shaping: Vec::new(),
             banner_flux: None,
             dns_flux: None,
+            rtbh: None,
         }
     }
 
@@ -446,6 +447,7 @@ mod tests {
             shaping: Vec::new(),
             banner_flux: None,
             dns_flux: None,
+            rtbh: None,
         }
     }
 
@@ -689,6 +691,7 @@ mod tests {
             shaping: Vec::new(),
             banner_flux: None,
             dns_flux: None,
+            rtbh: None,
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.
