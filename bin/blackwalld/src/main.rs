@@ -510,7 +510,10 @@ async fn apply_request(
             // Cancel any other still-pending add for the same target: the
             // operator's remove is the newer intent, so a pending add must
             // not later announce this target once capacity frees.
-            if let Err(err) = request_store.supersede_pending_adds(req.target).await {
+            if let Err(err) = request_store
+                .supersede_pending_adds(req.target, req.id)
+                .await
+            {
                 tracing::warn!(%err, target = %req.target, "RTBH: failed to supersede pending adds");
             }
             if let Err(err) = request_store

@@ -408,17 +408,27 @@ impl Store {
         Ok(rows_to_requests(rows))
     }
 
-    /// Mark any still-`pending` `add` request for `target` as `applied`
-    /// (with a `"superseded by remove"` note), so a later remove cancels an
-    /// earlier not-yet-applied add for the same target instead of letting it
-    /// re-announce once capacity frees up.
-    pub async fn supersede_pending_adds(&self, target: IpAddr) -> Result<(), StateError> {
+    /// Mark any still-`pending` `add` request for `target` with `id <
+    /// before_id` as `applied` (with a `"superseded by remove"` note), so a
+    /// later remove cancels an earlier not-yet-applied add for the same
+    /// target instead of letting it re-announce once capacity frees up.
+    ///
+    /// Scoped to `before_id` (the remove request's own id) so a re-add that
+    /// races in after the remove was snapshotted — i.e. has a higher id than
+    /// the remove — is never superseded by it.
+    pub async fn supersede_pending_adds(
+        &self,
+        target: IpAddr,
+        before_id: i64,
+    ) -> Result<(), StateError> {
         let target = ipnetwork_addr(target);
         sqlx::query(
             "UPDATE rtbh_requests SET status = 'applied', note = 'superseded by remove', \
-             applied_at = now() WHERE action = 'add' AND target = $1 AND status = 'pending'",
+             applied_at = now() WHERE action = 'add' AND target = $1 AND status = 'pending' \
+             AND id < $2",
         )
         .bind(target)
+        .bind(before_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -803,7 +813,8 @@ mod tests {
             .iter()
             .any(|r| r.id == id));
 
-        store.supersede_pending_adds(t).await.unwrap();
+        let remove_id = store.enqueue_request(t, "remove", "op@host").await.unwrap();
+        store.supersede_pending_adds(t, remove_id).await.unwrap();
 
         let row = store
             .list_requests(None)
@@ -822,6 +833,45 @@ mod tests {
                 .iter()
                 .any(|r| r.id == id),
             "superseded add must no longer be pending"
+        );
+    }
+
+    /// A race: an operator re-adds a target in the window between a tick's
+    /// `pending_requests()` snapshot and that tick processing an earlier
+    /// `remove` for the same target. The newer add (id >= the remove's id)
+    /// must survive; only adds strictly older than the remove are
+    /// superseded.
+    #[tokio::test]
+    async fn rtbh_supersede_pending_adds_scoped_to_before_id() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let t: IpAddr = "203.0.113.12".parse().unwrap();
+
+        let old_add_id = store.enqueue_request(t, "add", "op@host").await.unwrap();
+        let remove_id = store.enqueue_request(t, "remove", "op@host").await.unwrap();
+        // Simulates a re-add racing in after the remove's id was captured
+        // (e.g. after a tick's pending_requests() snapshot already read the
+        // remove) but before supersede_pending_adds runs.
+        let new_add_id = store.enqueue_request(t, "add", "op@host").await.unwrap();
+
+        store.supersede_pending_adds(t, remove_id).await.unwrap();
+
+        let all = store.list_requests(None).await.unwrap();
+        let old_add = all.iter().find(|r| r.id == old_add_id).unwrap();
+        assert_eq!(
+            old_add.status, "applied",
+            "add before the remove's id must be superseded"
+        );
+        assert_eq!(old_add.note.as_deref(), Some("superseded by remove"));
+
+        let new_add = all.iter().find(|r| r.id == new_add_id).unwrap();
+        assert_eq!(
+            new_add.status, "pending",
+            "add with id >= before_id must NOT be superseded (it raced in after the remove)"
         );
     }
 
