@@ -77,12 +77,43 @@ pub enum ApplyOutcome {
 /// journaled — but note this is a known limitation, not a retry mechanism:
 /// on a failed first announce the controller entry is kept in memory while
 /// the route itself is never re-announced automatically. A journal failure
-/// after a successful BGP operation is logged but never causes a live
-/// blackhole to be withdrawn.
+/// after a successful BGP operation is logged, never causes a live
+/// blackhole to be withdrawn, and is queued as a [`MirrorOp`] for a bounded
+/// self-heal retry on the next [`RtbhManager::tick`] — the BGP outcome is
+/// never re-issued, only the mirror write.
 pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     controller: RtbhController,
     bgp: B,
     journal: J,
+    /// Journal writes that failed after their BGP operation already
+    /// succeeded; retried (never re-issued to BGP) by
+    /// [`RtbhManager::retry_pending_mirror`] on the next tick.
+    pending_mirror: Vec<MirrorOp>,
+}
+
+/// A journal mirror write that failed and is queued for a self-heal retry.
+///
+/// The BGP side of the operation already succeeded when this is queued, so
+/// retrying only ever re-attempts the journal write — never BGP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MirrorOp {
+    /// Re-attempt `record_announce` for `target`.
+    Announce {
+        target: IpAddr,
+        origin: BlackholeOrigin,
+        at_ms: u64,
+    },
+    /// Re-attempt `record_withdraw` for `target`.
+    Withdraw { target: IpAddr, at_ms: u64 },
+}
+
+impl MirrorOp {
+    /// The blackhole target this mirror op concerns.
+    fn target(&self) -> IpAddr {
+        match *self {
+            MirrorOp::Announce { target, .. } | MirrorOp::Withdraw { target, .. } => target,
+        }
+    }
 }
 
 impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
@@ -92,6 +123,7 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
             controller,
             bgp,
             journal,
+            pending_mirror: Vec::new(),
         }
     }
 
@@ -101,8 +133,9 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     /// Announces are journaled as [`BlackholeOrigin::Auto`] (the only origin
     /// `on_event` can produce). A BGP error is logged and the action is not
     /// journaled. A journal error after a successful BGP operation is logged
-    /// but the controller entry is kept (never withdraw a live blackhole
-    /// because the DB write failed).
+    /// and queued for a self-heal retry on the next tick (the controller
+    /// entry is kept — never withdraw a live blackhole because the DB write
+    /// failed).
     pub async fn apply_event(&mut self, event: &DetectionEvent, mono_now: u64, wall_now: u64) {
         let actions = self.controller.on_event(event, mono_now);
         for action in actions {
@@ -112,7 +145,13 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
 
     /// Process time-driven withdrawals (deferred clears, TTL expiry) and
     /// execute + journal each one.
+    ///
+    /// Starts by retrying any journal mirror writes queued by a previous
+    /// tick's transient failure (see [`RtbhManager::retry_pending_mirror`]),
+    /// so a self-heal converges within one tick interval of the DB
+    /// recovering.
     pub async fn tick(&mut self, mono_now: u64, wall_now: u64) {
+        self.retry_pending_mirror().await;
         let actions = self.controller.tick(mono_now);
         for action in actions {
             self.execute_and_journal(action, wall_now).await;
@@ -209,8 +248,20 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
             .any(|(t, ..)| *t == target)
     }
 
+    /// Queue a failed mirror write for self-heal, coalescing by target.
+    ///
+    /// The mirror only needs to reflect the current active set, so keeping just
+    /// the latest op per target is both correct (journal ops converge to a final
+    /// state) and bounds the queue to one entry per target — a target that flaps
+    /// while the DB is down can never grow the queue without bound.
+    fn queue_mirror(&mut self, op: MirrorOp) {
+        let target = op.target();
+        self.pending_mirror.retain(|o| o.target() != target);
+        self.pending_mirror.push(op);
+    }
+
     /// Execute one controller action on BGP and mirror it into the journal.
-    async fn execute_and_journal(&self, action: RtbhAction, wall_now: u64) {
+    async fn execute_and_journal(&mut self, action: RtbhAction, wall_now: u64) {
         match action {
             RtbhAction::Announce(route) => {
                 self.execute_and_journal_announce(
@@ -228,14 +279,18 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
                     return;
                 }
                 if let Err(e) = self.journal.record_withdraw(target, wall_now).await {
-                    tracing::error!(%target, error = %e, "RTBH: journal write failed after withdraw; keeping active");
+                    tracing::error!(%target, error = %e, "RTBH: journal withdraw-mirror failed; route already withdrawn from BGP (mirror row will be stale)");
+                    self.queue_mirror(MirrorOp::Withdraw {
+                        target,
+                        at_ms: wall_now,
+                    });
                 }
             }
         }
     }
 
     async fn execute_and_journal_announce(
-        &self,
+        &mut self,
         target: IpAddr,
         route: Route,
         origin: BlackholeOrigin,
@@ -247,12 +302,55 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         }
         if let Err(e) = self.journal.record_announce(target, origin, wall_now).await {
             tracing::error!(%target, error = %e, "RTBH: journal write failed after announce; keeping active");
+            self.queue_mirror(MirrorOp::Announce {
+                target,
+                origin,
+                at_ms: wall_now,
+            });
+        }
+    }
+
+    /// Drain-retry queued mirror writes left over from a transient journal
+    /// failure.
+    ///
+    /// The BGP side of each queued op already succeeded when it was queued,
+    /// so this only ever re-attempts the matching journal call — it never
+    /// re-announces or re-withdraws on BGP. Ops that still fail are kept
+    /// (retried again on the next call); ops that succeed are dropped.
+    /// Queued ops are retried in order, so an Announce followed by a later
+    /// Withdraw for the same target converge correctly.
+    async fn retry_pending_mirror(&mut self) {
+        if self.pending_mirror.is_empty() {
+            return;
+        }
+        let ops = std::mem::take(&mut self.pending_mirror);
+        for op in ops {
+            let result = match &op {
+                MirrorOp::Announce {
+                    target,
+                    origin,
+                    at_ms,
+                } => self.journal.record_announce(*target, *origin, *at_ms).await,
+                MirrorOp::Withdraw { target, at_ms } => {
+                    self.journal.record_withdraw(*target, *at_ms).await
+                }
+            };
+            if let Err(e) = result {
+                tracing::warn!(op = ?op, error = %e, "RTBH: mirror self-heal retry failed; re-queuing");
+                self.pending_mirror.push(op);
+            }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn bgp(&self) -> &B {
         &self.bgp
+    }
+
+    /// Number of journal mirror writes currently queued for self-heal retry.
+    #[cfg(test)]
+    pub(crate) fn pending_mirror_len(&self) -> usize {
+        self.pending_mirror.len()
     }
 
     #[cfg(test)]
@@ -303,6 +401,10 @@ mod tests {
         announced: Mutex<Vec<(IpAddr, BlackholeOrigin)>>,
         withdrawn: Mutex<Vec<IpAddr>>,
         fail: bool,
+        /// Number of upcoming calls (announce or withdraw, whichever comes
+        /// first) that should fail before the journal starts succeeding —
+        /// simulates a transient DB blip that self-heals.
+        fail_calls_remaining: Mutex<usize>,
     }
     #[async_trait]
     impl BlackholeJournal for FakeJournal {
@@ -312,18 +414,30 @@ mod tests {
             o: BlackholeOrigin,
             _at: u64,
         ) -> Result<(), JournalError> {
-            if self.fail {
+            if self.fail || self.take_transient_failure() {
                 return Err(JournalError("boom".into()));
             }
             self.announced.lock().unwrap().push((t, o));
             Ok(())
         }
         async fn record_withdraw(&self, t: IpAddr, _at: u64) -> Result<(), JournalError> {
-            if self.fail {
+            if self.fail || self.take_transient_failure() {
                 return Err(JournalError("boom".into()));
             }
             self.withdrawn.lock().unwrap().push(t);
             Ok(())
+        }
+    }
+    impl FakeJournal {
+        /// Consume one remaining scheduled transient failure, if any.
+        fn take_transient_failure(&self) -> bool {
+            let mut remaining = self.fail_calls_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
         }
     }
     fn cfg() -> RtbhConfig {
@@ -363,6 +477,19 @@ mod tests {
             },
             FakeJournal {
                 fail: fail_j,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A manager whose journal fails its first `n` calls (BGP transient
+    /// blip), then succeeds — used to exercise the mirror self-heal retry.
+    fn mgr_transient_journal_failures(n: usize) -> RtbhManager<FakeBgp, FakeJournal> {
+        RtbhManager::new(
+            RtbhController::new(cfg()),
+            FakeBgp::default(),
+            FakeJournal {
+                fail_calls_remaining: Mutex::new(n),
                 ..Default::default()
             },
         )
@@ -517,5 +644,117 @@ mod tests {
         )
         .await;
         assert!(m.active().is_empty());
+    }
+
+    #[tokio::test]
+    async fn journal_failure_queues_pending_mirror() {
+        // journal fails its one and only scheduled call (the announce).
+        let mut m = mgr_transient_journal_failures(1);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 1234)
+            .await;
+        assert_eq!(
+            m.active().len(),
+            1,
+            "a journal error must not drop a live blackhole"
+        );
+        assert!(
+            m.journal().announced.lock().unwrap().is_empty(),
+            "the failed announce must not have been recorded"
+        );
+        assert_eq!(
+            m.pending_mirror_len(),
+            1,
+            "the failed mirror write must be queued for self-heal retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_drains_pending_mirror_once_journal_recovers() {
+        // journal fails only the first call (the announce); by the time
+        // tick() retries, it's healthy again.
+        let mut m = mgr_transient_journal_failures(1);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 1234)
+            .await;
+        assert_eq!(m.pending_mirror_len(), 1);
+        assert!(m.journal().announced.lock().unwrap().is_empty());
+
+        // Journal is healthy now (the scheduled failure was already
+        // consumed); the tick's leading retry_pending_mirror() should drain
+        // the queued announce.
+        m.tick(1000, 5000).await;
+
+        assert_eq!(
+            m.pending_mirror_len(),
+            0,
+            "the self-heal retry must drain the queue once the journal recovers"
+        );
+        assert_eq!(
+            m.journal().announced.lock().unwrap()[0],
+            (ip("203.0.113.7"), BlackholeOrigin::Auto),
+            "the retried announce must have been recorded with its original origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_pending_mirror_requeues_on_repeat_failure() {
+        // journal fails every call: the queued op must survive repeated
+        // retries rather than being silently dropped.
+        let mut m = mgr(false, true);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 1234)
+            .await;
+        assert_eq!(m.pending_mirror_len(), 1);
+
+        m.tick(1000, 5000).await;
+
+        assert_eq!(
+            m.pending_mirror_len(),
+            1,
+            "a still-failing journal must keep the op queued, not drop it"
+        );
+        assert!(m.journal().announced.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_announce_then_withdraw_for_same_target_coalesces_to_withdraw() {
+        // Announce fails and is queued; a later withdraw for the SAME target
+        // also fails. Coalescing keeps only the latest op (the withdraw): the
+        // mirror only needs to reflect the final state (target no longer active),
+        // and this bounds the queue to one entry per target.
+        let mut m = mgr_transient_journal_failures(2);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 1000)
+            .await;
+        assert_eq!(m.pending_mirror_len(), 1);
+
+        m.apply_remove(ip("203.0.113.7"), 2000).await;
+        assert_eq!(
+            m.pending_mirror_len(),
+            1,
+            "the withdraw coalesces with the queued announce for the same target"
+        );
+        assert!(m.active().is_empty(), "BGP withdraw must still take effect");
+
+        m.tick(3000, 4000).await;
+
+        assert_eq!(m.pending_mirror_len(), 0);
+        // Only the withdraw is replayed; the superseded announce is dropped.
+        assert!(m.journal().announced.lock().unwrap().is_empty());
+        assert_eq!(m.journal().withdrawn.lock().unwrap()[0], ip("203.0.113.7"));
+    }
+
+    #[tokio::test]
+    async fn queue_mirror_coalesces_repeated_failures_for_one_target() {
+        // A single target flapping while the journal is down must never grow
+        // the queue past one entry for that target.
+        let mut m = mgr(false, true); // BGP ok, journal always fails
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 1000)
+            .await;
+        m.apply_remove(ip("203.0.113.7"), 2000).await;
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 3000, 3000)
+            .await;
+        assert_eq!(
+            m.pending_mirror_len(),
+            1,
+            "repeated failures for one target coalesce to a single queued op"
+        );
     }
 }
