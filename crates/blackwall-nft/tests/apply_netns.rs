@@ -25,6 +25,7 @@ fn sample() -> Policy {
         shaping: Vec::new(),
         banner_flux: None,
         dns_flux: None,
+        rtbh: None,
     }
 }
 
@@ -73,6 +74,7 @@ fn stale_set_elements_removed_on_second_apply() {
         shaping: Vec::new(),
         banner_flux: None,
         dns_flux: None,
+        rtbh: None,
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 

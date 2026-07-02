@@ -16,6 +16,8 @@ blackwall-shaper = { path = "../../crates/blackwall-shaper" }
 blackwall-dns = { path = "../../crates/blackwall-dns" }
 blackwall-flow = { path = "../../crates/blackwall-flow" }
 blackwall-speedtest = { path = "../../crates/blackwall-speedtest" }
+blackwall-bgp = { path = "../../crates/blackwall-bgp" }
+blackwall-rtbh = { path = "../../crates/blackwall-rtbh" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
