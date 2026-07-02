@@ -227,7 +227,11 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 let peer_tok = get("peer")?;
                 let peer_addr: SocketAddr = peer_tok
                     .parse::<SocketAddr>()
-                    .or_else(|_| peer_tok.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 179)))
+                    .or_else(|_| {
+                        peer_tok
+                            .parse::<IpAddr>()
+                            .map(|ip| SocketAddr::new(ip, 179))
+                    })
                     .map_err(|_| bad("peer", peer_tok))?;
                 let local_asn: u32 = get("local-as")?
                     .parse()
@@ -272,7 +276,8 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     Some(spec) => {
                         let mut out = Vec::new();
                         for pair in spec.split(',') {
-                            let (a, v) = pair.split_once(':').ok_or_else(|| bad("community", pair))?;
+                            let (a, v) =
+                                pair.split_once(':').ok_or_else(|| bad("community", pair))?;
                             let asn: u16 = a.parse().map_err(|_| bad("community", pair))?;
                             let val: u16 = v.parse().map_err(|_| bad("community", pair))?;
                             out.push((asn, val));
@@ -920,7 +925,10 @@ tenant t {
         assert_eq!(r.peer_addr, "10.0.0.2:179".parse().unwrap());
         assert_eq!(r.local_asn, 214806);
         assert_eq!(r.peer_asn, 214806);
-        assert_eq!(r.router_id, "10.222.255.1".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            r.router_id,
+            "10.222.255.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
         assert_eq!(
             r.next_hop_v4,
             Some("10.222.255.99".parse::<std::net::Ipv4Addr>().unwrap())
@@ -940,7 +948,10 @@ tenant t {
     #[test]
     fn rtbh_parses_custom_communities() {
         let p = parse_text("interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s community=65535:666,65535:667\n").unwrap();
-        assert_eq!(p.rtbh.unwrap().blackhole_communities, vec![(65535, 666), (65535, 667)]);
+        assert_eq!(
+            p.rtbh.unwrap().blackhole_communities,
+            vec![(65535, 666), (65535, 667)]
+        );
     }
 
     #[test]
