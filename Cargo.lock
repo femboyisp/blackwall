@@ -308,6 +308,7 @@ dependencies = [
 name = "blackwalld"
 version = "0.1.0"
 dependencies = [
+ "blackwall-bgp",
  "blackwall-config",
  "blackwall-core",
  "blackwall-deception",
@@ -315,6 +316,7 @@ dependencies = [
  "blackwall-dns",
  "blackwall-flow",
  "blackwall-nft",
+ "blackwall-rtbh",
  "blackwall-shaper",
  "blackwall-speedtest",
  "blackwall-state",
