@@ -3,11 +3,13 @@
 
 mod audit;
 mod error;
+mod rtbh;
 mod services;
 mod sessions;
 mod tenants;
 
 pub use error::StateError;
+pub use rtbh::{RtbhBlackholeRow, RtbhRequestRow};
 pub use services::StoredService;
 pub use sessions::SessionRow;
 
@@ -271,6 +273,245 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// Insert or refresh the active `rtbh_blackholes` mirror row for
+    /// `target`. If an active row already exists, its `origin` is upgraded
+    /// per the announcement but never downgraded from `manual` to `auto`
+    /// (an upsert can race a `manual_add` and must not clobber it).
+    pub async fn record_blackhole(
+        &self,
+        target: IpAddr,
+        origin: &str,
+        at_ms: u64,
+    ) -> Result<(), StateError> {
+        let target = ipnetwork_addr(target);
+        let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
+        sqlx::query(
+            "INSERT INTO rtbh_blackholes (target, origin, announced_at) \
+             VALUES ($1, $2, to_timestamp($3::bigint / 1000.0)) \
+             ON CONFLICT (target) WHERE withdrawn_at IS NULL DO UPDATE SET \
+             origin = CASE WHEN rtbh_blackholes.origin = 'manual' THEN 'manual' ELSE EXCLUDED.origin END",
+        )
+        .bind(target)
+        .bind(origin)
+        .bind(at_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark the active `rtbh_blackholes` row for `target` as withdrawn. When
+    /// `only_auto` is set, only a row with `origin = 'auto'` is cleared (the
+    /// auto-path guard that keeps a Cleared event from withdrawing a manual
+    /// blackhole).
+    pub async fn clear_blackhole(
+        &self,
+        target: IpAddr,
+        at_ms: u64,
+        only_auto: bool,
+    ) -> Result<(), StateError> {
+        let target = ipnetwork_addr(target);
+        let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
+        let query = if only_auto {
+            "UPDATE rtbh_blackholes SET withdrawn_at = to_timestamp($2::bigint / 1000.0) \
+             WHERE target = $1 AND withdrawn_at IS NULL AND origin = 'auto'"
+        } else {
+            "UPDATE rtbh_blackholes SET withdrawn_at = to_timestamp($2::bigint / 1000.0) \
+             WHERE target = $1 AND withdrawn_at IS NULL"
+        };
+        sqlx::query(query)
+            .bind(target)
+            .bind(at_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// List all currently-active (not withdrawn) blackholes.
+    pub async fn list_active_blackholes(&self) -> Result<Vec<RtbhBlackholeRow>, StateError> {
+        let rows: Vec<(
+            sqlx::types::ipnetwork::IpNetwork,
+            String,
+            i64,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT target, origin, \
+                    (EXTRACT(EPOCH FROM announced_at) * 1000)::bigint, \
+                    (EXTRACT(EPOCH FROM withdrawn_at) * 1000)::bigint \
+             FROM rtbh_blackholes WHERE withdrawn_at IS NULL ORDER BY target",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (target, origin, announced_at_ms, withdrawn_at_ms) in rows {
+            let announced_at_ms = u64::try_from(announced_at_ms).map_err(|_| {
+                StateError::Db(sqlx::Error::Decode(
+                    format!("announced_at_ms {announced_at_ms} out of u64 range").into(),
+                ))
+            })?;
+            let withdrawn_at_ms = withdrawn_at_ms
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    StateError::Db(sqlx::Error::Decode(
+                        "withdrawn_at_ms out of u64 range".into(),
+                    ))
+                })?;
+            out.push(RtbhBlackholeRow {
+                target: target.ip(),
+                origin,
+                announced_at_ms,
+                withdrawn_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Append an operator intent row to `rtbh_requests`. Returns the new
+    /// row's id, which callers use as the drain watermark.
+    pub async fn enqueue_request(
+        &self,
+        target: IpAddr,
+        action: &str,
+        created_by: &str,
+    ) -> Result<i64, StateError> {
+        let target = ipnetwork_addr(target);
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO rtbh_requests (target, action, created_by) VALUES ($1, $2, $3) \
+             RETURNING id",
+        )
+        .bind(target)
+        .bind(action)
+        .bind(created_by)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Fetch all requests with `id > after_id`, ordered by id (FIFO drain).
+    pub async fn drain_requests(&self, after_id: i64) -> Result<Vec<RtbhRequestRow>, StateError> {
+        let rows: Vec<(
+            i64,
+            sqlx::types::ipnetwork::IpNetwork,
+            String,
+            String,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, target, action, created_by, status, note \
+             FROM rtbh_requests WHERE id > $1 ORDER BY id",
+        )
+        .bind(after_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows_to_requests(rows))
+    }
+
+    /// Update a request's status (and optional note), stamping `applied_at`.
+    pub async fn set_request_status(
+        &self,
+        id: i64,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<(), StateError> {
+        sqlx::query(
+            "UPDATE rtbh_requests SET status = $2, note = $3, applied_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(note)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List requests, optionally filtered to a single `status`.
+    pub async fn list_requests(
+        &self,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<RtbhRequestRow>, StateError> {
+        let rows: Vec<(
+            i64,
+            sqlx::types::ipnetwork::IpNetwork,
+            String,
+            String,
+            String,
+            Option<String>,
+        )> = match status_filter {
+            Some(status) => {
+                sqlx::query_as(
+                    "SELECT id, target, action, created_by, status, note \
+                     FROM rtbh_requests WHERE status = $1 ORDER BY id",
+                )
+                .bind(status)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, target, action, created_by, status, note \
+                     FROM rtbh_requests ORDER BY id",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows_to_requests(rows))
+    }
+}
+
+/// Map raw `rtbh_requests` rows into [`RtbhRequestRow`]s.
+fn rows_to_requests(
+    rows: Vec<(
+        i64,
+        sqlx::types::ipnetwork::IpNetwork,
+        String,
+        String,
+        String,
+        Option<String>,
+    )>,
+) -> Vec<RtbhRequestRow> {
+    rows.into_iter()
+        .map(
+            |(id, target, action, created_by, status, note)| RtbhRequestRow {
+                id,
+                target: target.ip(),
+                action,
+                created_by,
+                status,
+                note,
+            },
+        )
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl blackwall_rtbh::BlackholeJournal for Store {
+    async fn record_announce(
+        &self,
+        target: IpAddr,
+        origin: blackwall_rtbh::BlackholeOrigin,
+        at_ms: u64,
+    ) -> Result<(), blackwall_rtbh::JournalError> {
+        let o = match origin {
+            blackwall_rtbh::BlackholeOrigin::Auto => "auto",
+            blackwall_rtbh::BlackholeOrigin::Manual => "manual",
+        };
+        self.record_blackhole(target, o, at_ms)
+            .await
+            .map_err(|e| blackwall_rtbh::JournalError(e.to_string()))
+    }
+
+    async fn record_withdraw(
+        &self,
+        target: IpAddr,
+        at_ms: u64,
+    ) -> Result<(), blackwall_rtbh::JournalError> {
+        self.clear_blackhole(target, at_ms, false)
+            .await
+            .map_err(|e| blackwall_rtbh::JournalError(e.to_string()))
+    }
 }
 
 /// Convert an [`IpAddr`] into the `sqlx` INET wire type as a /32 or /128 host.
@@ -428,6 +669,168 @@ mod tests {
             .await
             .expect("record");
         assert_eq!(store.session_count().await.expect("count"), before + 1);
+    }
+
+    #[tokio::test]
+    async fn rtbh_blackhole_roundtrip() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let t: IpAddr = "203.0.113.7".parse().unwrap();
+        store.record_blackhole(t, "auto", 1_000).await.unwrap();
+        let active = store.list_active_blackholes().await.unwrap();
+        assert!(active.iter().any(|r| r.target == t && r.origin == "auto"));
+        // manual upsert must not downgrade origin:
+        store.record_blackhole(t, "manual", 2_000).await.unwrap();
+        store.record_blackhole(t, "auto", 3_000).await.unwrap(); // must NOT downgrade
+        let active = store.list_active_blackholes().await.unwrap();
+        assert_eq!(
+            active.iter().find(|r| r.target == t).unwrap().origin,
+            "manual"
+        );
+        store.clear_blackhole(t, 4_000, false).await.unwrap();
+        assert!(!store
+            .list_active_blackholes()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.target == t));
+    }
+
+    #[tokio::test]
+    async fn rtbh_clear_only_auto_guards_manual() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let t: IpAddr = "203.0.113.70".parse().unwrap();
+        store.record_blackhole(t, "manual", 1_000).await.unwrap();
+        // only_auto=true must not clear a manual entry.
+        store.clear_blackhole(t, 2_000, true).await.unwrap();
+        assert!(store
+            .list_active_blackholes()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.target == t));
+        // only_auto=true does clear an auto entry.
+        let t2: IpAddr = "203.0.113.71".parse().unwrap();
+        store.record_blackhole(t2, "auto", 1_000).await.unwrap();
+        store.clear_blackhole(t2, 2_000, true).await.unwrap();
+        assert!(!store
+            .list_active_blackholes()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.target == t2));
+    }
+
+    #[tokio::test]
+    async fn rtbh_request_queue_roundtrip() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let id = store
+            .enqueue_request("203.0.113.8".parse().unwrap(), "add", "op@host")
+            .await
+            .unwrap();
+        let drained = store.drain_requests(id - 1).await.unwrap();
+        assert!(drained.iter().any(|r| r.id == id && r.action == "add"));
+        store
+            .set_request_status(id, "applied", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_requests(Some("applied"))
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .status,
+            "applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtbh_request_status_note_and_unfiltered_list() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let id = store
+            .enqueue_request(
+                "203.0.113.9".parse().unwrap(),
+                "remove",
+                "op2@host",
+            )
+            .await
+            .unwrap();
+        store
+            .set_request_status(id, "rejected", Some("out of prefix"))
+            .await
+            .unwrap();
+        let all = store.list_requests(None).await.unwrap();
+        let row = all.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.status, "rejected");
+        assert_eq!(row.note.as_deref(), Some("out of prefix"));
+        assert_eq!(row.action, "remove");
+        assert_eq!(row.created_by, "op2@host");
+    }
+
+    #[tokio::test]
+    async fn rtbh_blackhole_journal_impl() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        use blackwall_rtbh::BlackholeJournal;
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let t: IpAddr = "203.0.113.10".parse().unwrap();
+        store
+            .record_announce(t, blackwall_rtbh::BlackholeOrigin::Auto, 1_000)
+            .await
+            .unwrap();
+        assert!(store
+            .list_active_blackholes()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.target == t && r.origin == "auto"));
+        store
+            .record_announce(t, blackwall_rtbh::BlackholeOrigin::Manual, 2_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_active_blackholes()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.target == t)
+                .unwrap()
+                .origin,
+            "manual"
+        );
+        store.record_withdraw(t, 3_000).await.unwrap();
+        assert!(!store
+            .list_active_blackholes()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.target == t));
     }
 
     #[test]

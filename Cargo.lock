@@ -280,6 +280,7 @@ dependencies = [
  "async-trait",
  "blackwall-core",
  "blackwall-flow",
+ "blackwall-rtbh",
  "ipnet",
  "serde_json",
  "sqlx",
