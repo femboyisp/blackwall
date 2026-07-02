@@ -62,6 +62,10 @@ impl Drop for Teardown {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // BIRD daemonizes and is not among `self.children`; kill it by the
+        // pidfile it wrote before the namespace/scratch dir go away (deleting
+        // the netns alone does not stop a running BIRD process).
+        proc::kill_pidfiles(&format!("/run/blackwall-lab/{}", self.run_id));
         for ns in &self.netns {
             let _ = netns::netns_del(ns);
         }
@@ -283,6 +287,15 @@ pub(crate) fn down_all() -> Result<(), LabError> {
             }
         }
     }
+    // Kill any BIRD daemons left running (by pidfile) across every run's
+    // scratch dir before sweeping them away.
+    if let Ok(entries) = std::fs::read_dir("/run/blackwall-lab") {
+        for entry in entries.flatten() {
+            if let Some(dir) = entry.path().to_str() {
+                proc::kill_pidfiles(dir);
+            }
+        }
+    }
     // Remove every run's scratch dir along with the namespace sweep.
     let _ = std::fs::remove_dir_all("/run/blackwall-lab");
     Ok(())
@@ -320,6 +333,9 @@ pub(crate) fn down_scenario(manifest_text: &str) -> Result<(), LabError> {
             .unwrap_or_else(|| crate::plan::netns_name(&id, &node.name));
         netns::netns_del(&ns)?;
     }
+    // Kill any BIRD daemon left running for this scenario before removing
+    // its scratch dir.
+    proc::kill_pidfiles(&format!("/run/blackwall-lab/{id}"));
     // Remove this scenario's run scratch dir (stable id).
     let _ = std::fs::remove_dir_all(format!("/run/blackwall-lab/{id}"));
     Ok(())
