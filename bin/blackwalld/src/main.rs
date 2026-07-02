@@ -420,11 +420,17 @@ fn rtbh_config_from(
 /// Single-owner RTBH reconcile loop: applies auto detection events as they
 /// arrive on `rx`, and on a 1 s tick, calls [`blackwall_rtbh::RtbhManager::tick`]
 /// (completing deferred clears/TTL expiries — mandatory, see the module docs)
-/// and then drains `rtbh_requests` by an id watermark, applying each as
-/// `manual_add`/`manual_remove` and recording the outcome back onto the
-/// request row. Cap-deferred adds are retried from a small FIFO on every
-/// tick, ahead of newly drained requests, and their request row is left
-/// `pending` until they apply.
+/// and then re-reads every `status = 'pending'` row from `rtbh_requests`,
+/// applying each as `manual_add`/`manual_remove` and recording the outcome
+/// back onto the request row.
+///
+/// The drain is purely status-driven: it is not an id watermark, so a
+/// restart re-reads only genuinely-pending intent (queued-while-down or
+/// still capacity-deferred), never replaying `applied`/`rejected` history
+/// (which would re-announce, and transiently null-route, already-removed
+/// targets). A capacity-deferred add is left `pending`, so it is retried
+/// automatically on the next tick's re-read — no separate in-memory FIFO is
+/// needed.
 ///
 /// Runs until `rx` is closed (i.e. for the process's lifetime, since the
 /// paired `ChannelSink`'s sender is held by the running collector).
@@ -433,8 +439,6 @@ async fn rtbh_manager_task(
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
 ) {
-    let mut watermark: i64 = 0;
-    let mut deferred: Vec<(i64, IpAddr)> = Vec::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -452,58 +456,31 @@ async fn rtbh_manager_task(
                 // elapses is deferred and never completed.
                 manager.tick(mono_now(), wall_now()).await;
 
-                deferred = retry_deferred(&mut manager, &request_store, deferred).await;
-
-                match request_store.drain_requests(watermark).await {
+                match request_store.pending_requests().await {
                     Ok(reqs) => {
                         for req in reqs {
-                            watermark = req.id;
-                            apply_request(&mut manager, &request_store, &mut deferred, req).await;
+                            apply_request(&mut manager, &request_store, req).await;
                         }
                     }
-                    Err(err) => tracing::warn!(%err, "RTBH: failed to drain rtbh_requests"),
+                    Err(err) => tracing::warn!(%err, "RTBH: failed to read pending rtbh_requests"),
                 }
             }
         }
     }
 }
 
-/// Retry cap-deferred adds (from a prior tick) before draining new requests.
-/// Returns the still-deferred subset (order preserved, FIFO).
-async fn retry_deferred(
-    manager: &mut blackwall_rtbh::RtbhManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
-    request_store: &blackwall_state::Store,
-    deferred: Vec<(i64, IpAddr)>,
-) -> Vec<(i64, IpAddr)> {
-    let mut still_deferred = Vec::new();
-    for (id, target) in deferred {
-        match manager.apply_add(target, mono_now(), wall_now()).await {
-            blackwall_rtbh::ApplyOutcome::Applied => {
-                if let Err(err) = request_store.set_request_status(id, "applied", None).await {
-                    tracing::warn!(%err, id, "RTBH: failed to mark deferred request applied");
-                }
-            }
-            blackwall_rtbh::ApplyOutcome::Deferred => still_deferred.push((id, target)),
-            blackwall_rtbh::ApplyOutcome::Rejected(reason) => {
-                if let Err(err) = request_store
-                    .set_request_status(id, "rejected", Some(&reason))
-                    .await
-                {
-                    tracing::warn!(%err, id, "RTBH: failed to mark deferred request rejected");
-                }
-            }
-        }
-    }
-    still_deferred
-}
-
-/// Apply one drained `rtbh_requests` row and record its outcome. A rejected
-/// or applied outcome updates the row's status immediately; a capacity-deferred
-/// add is pushed onto `deferred` and left `pending` for a later tick.
+/// Apply one pending `rtbh_requests` row and record its outcome.
+///
+/// For `"add"`: `Applied` marks the row `applied`; `Deferred` leaves the row
+/// `pending` untouched (it is naturally retried on the next tick's
+/// `pending_requests` read); `Rejected` marks the row `rejected` with the
+/// reason. For `"remove"`: withdraws the target, then supersedes any other
+/// still-pending `add` for the same target (the operator's remove is the
+/// newer intent and must win over a not-yet-applied add), then marks this
+/// row `applied`.
 async fn apply_request(
     manager: &mut blackwall_rtbh::RtbhManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
     request_store: &blackwall_state::Store,
-    deferred: &mut Vec<(i64, IpAddr)>,
     req: blackwall_state::RtbhRequestRow,
 ) {
     match req.action.as_str() {
@@ -516,7 +493,9 @@ async fn apply_request(
                     tracing::warn!(%err, id = req.id, "RTBH: failed to set request status");
                 }
             }
-            blackwall_rtbh::ApplyOutcome::Deferred => deferred.push((req.id, req.target)),
+            blackwall_rtbh::ApplyOutcome::Deferred => {
+                // Leave `pending`; picked up again on the next tick.
+            }
             blackwall_rtbh::ApplyOutcome::Rejected(reason) => {
                 if let Err(err) = request_store
                     .set_request_status(req.id, "rejected", Some(&reason))
@@ -527,24 +506,13 @@ async fn apply_request(
             }
         },
         "remove" => {
-            // Supersede any cap-deferred add of the same target: the operator's
-            // remove is the newer intent, so a pending add must not later announce
-            // this target once capacity frees.
-            let superseded: Vec<i64> = deferred
-                .iter()
-                .filter(|(_, t)| *t == req.target)
-                .map(|(id, _)| *id)
-                .collect();
-            deferred.retain(|(_, t)| *t != req.target);
-            for id in superseded {
-                if let Err(err) = request_store
-                    .set_request_status(id, "applied", Some("superseded by remove"))
-                    .await
-                {
-                    tracing::warn!(%err, id, "RTBH: failed to mark superseded add");
-                }
-            }
             manager.apply_remove(req.target, wall_now()).await;
+            // Cancel any other still-pending add for the same target: the
+            // operator's remove is the newer intent, so a pending add must
+            // not later announce this target once capacity frees.
+            if let Err(err) = request_store.supersede_pending_adds(req.target).await {
+                tracing::warn!(%err, target = %req.target, "RTBH: failed to supersede pending adds");
+            }
             if let Err(err) = request_store
                 .set_request_status(req.id, "applied", None)
                 .await
