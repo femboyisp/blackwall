@@ -22,7 +22,7 @@ async fn announces_a_host_route() {
         router_id: "10.222.255.99".parse().unwrap(),
         hold_time: 90,
     };
-    let (handle, _join) = blackwall_bgp::spawn(cfg);
+    let (handle, _join) = blackwall_bgp::spawn(cfg).expect("valid iBGP config");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await; // let it establish
     handle
         .announce(blackwall_bgp::Route {
@@ -32,7 +32,8 @@ async fn announces_a_host_route() {
             communities: vec![(65535, 666)],
             large_communities: vec![],
         })
-        .await;
+        .await
+        .expect("announce succeeds");
     tokio::time::sleep(std::time::Duration::from_secs(5)).await; // observe on the peer
                                                                  // verify on the peer side: `birdc show route 203.0.113.7/32` should list it.
 }

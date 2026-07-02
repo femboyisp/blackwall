@@ -7,6 +7,24 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+/// Why a blackhole is active — governs whether an auto-clear may withdraw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlackholeOrigin {
+    /// Installed automatically by the detector.
+    Auto,
+    /// Installed (or upgraded) by an operator; never auto-cleared.
+    Manual,
+}
+
+/// State for one active blackhole.
+#[derive(Debug, Clone, Copy)]
+struct ActiveEntry {
+    announced_at: u64,
+    last_activity: u64,
+    origin: BlackholeOrigin,
+    clear_requested_at: Option<u64>,
+}
+
 /// RTBH policy configuration.
 ///
 /// Defines the parameters for the blackhole decision engine, including eligible prefixes,
@@ -25,6 +43,9 @@ pub struct RtbhConfig {
     pub max_blackholes: usize,
     /// Minimum time a blackhole stays before a `Cleared` may withdraw it (anti-flap).
     pub hold_down: Duration,
+    /// Maximum lifetime of an auto blackhole (hygiene backstop against a dropped
+    /// or missed `Cleared`); `None` disables the TTL.
+    pub max_ttl: Option<Duration>,
 }
 
 /// A decision the [`RtbhController`] emits for the sink to execute.
@@ -47,7 +68,7 @@ pub enum RtbhAction {
 #[derive(Debug)]
 pub struct RtbhController {
     config: RtbhConfig,
-    active: HashMap<IpAddr, u64>, // target -> announced-at (ms since epoch)
+    active: HashMap<IpAddr, ActiveEntry>,
 }
 
 impl RtbhController {
@@ -71,17 +92,30 @@ impl RtbhController {
     ///
     /// A vector of actions (typically 0 or 1) for the sink to execute.
     /// - `Opened` events may produce an `Announce` action (if eligible, under cap, not already active).
-    /// - `Updated` events produce no action (hold the blackhole as-is).
-    /// - `Cleared` events may produce a `Withdraw` action (only after hold-down has elapsed).
+    /// - `Updated` events produce no action but refresh the TTL activity anchor.
+    /// - `Cleared` events may produce an immediate `Withdraw` (hold-down already elapsed),
+    ///   or defer the withdraw to a later [`Self::tick`] (hold-down not yet elapsed).
+    ///   A `Cleared` for a `Manual` blackhole is ignored entirely.
     pub fn on_event(&mut self, event: &DetectionEvent, now: u64) -> Vec<RtbhAction> {
         match event {
-            DetectionEvent::Opened(d) => self.blackhole(d.target, now),
-            DetectionEvent::Updated(_) => Vec::new(),
-            DetectionEvent::Cleared { target, .. } => self.unblackhole(*target, now),
+            DetectionEvent::Opened(d) => self.blackhole(d.target, now, BlackholeOrigin::Auto),
+            DetectionEvent::Updated(d) => {
+                if let Some(e) = self.active.get_mut(&d.target) {
+                    // Continued traffic: refresh the TTL anchor and cancel any
+                    // pending deferred clear — the attack is not actually over.
+                    e.last_activity = now;
+                    e.clear_requested_at = None;
+                }
+                Vec::new()
+            }
+            DetectionEvent::Cleared { target, .. } => self.request_clear(*target, now),
         }
     }
 
     /// Manually blackhole a target (for the operator CLI + the lab).
+    ///
+    /// If the target is already active as an `Auto` blackhole, this upgrades it to
+    /// `Manual` (and cancels any pending deferred clear) instead of re-announcing.
     ///
     /// # Arguments
     ///
@@ -90,9 +124,15 @@ impl RtbhController {
     ///
     /// # Returns
     ///
-    /// An `Announce` action if successful, empty vector if ineligible or at cap.
+    /// An `Announce` action if newly installed, empty vector if upgraded, ineligible, or at cap.
     pub fn manual_add(&mut self, target: IpAddr, now: u64) -> Vec<RtbhAction> {
-        self.blackhole(target, now)
+        if let Some(e) = self.active.get_mut(&target) {
+            // Already active: upgrade to Manual + cancel any pending clear.
+            e.origin = BlackholeOrigin::Manual;
+            e.clear_requested_at = None;
+            return Vec::new();
+        }
+        self.blackhole(target, now, BlackholeOrigin::Manual)
     }
 
     /// Manually withdraw a target (bypasses hold-down — an operator action is deliberate).
@@ -112,7 +152,80 @@ impl RtbhController {
         }
     }
 
-    fn blackhole(&mut self, target: IpAddr, now: u64) -> Vec<RtbhAction> {
+    /// Process time-driven withdrawals: deferred clears whose hold-down has now
+    /// elapsed, and auto blackholes past their TTL. Call periodically.
+    pub fn tick(&mut self, now: u64) -> Vec<RtbhAction> {
+        let hold_ms = u64::try_from(self.config.hold_down.as_millis()).unwrap_or(u64::MAX);
+        let ttl_ms = self
+            .config
+            .max_ttl
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let mut expired: Vec<IpAddr> = Vec::new();
+        for (target, e) in &self.active {
+            let cleared_due = e
+                .clear_requested_at
+                .is_some_and(|_| now.saturating_sub(e.announced_at) >= hold_ms);
+            let ttl_due = matches!(e.origin, BlackholeOrigin::Auto)
+                && ttl_ms.is_some_and(|ttl| now.saturating_sub(e.last_activity) >= ttl);
+            if cleared_due || ttl_due {
+                expired.push(*target);
+            }
+        }
+        expired
+            .into_iter()
+            .map(|t| {
+                self.active.remove(&t);
+                RtbhAction::Withdraw(host_prefix(t))
+            })
+            .collect()
+    }
+
+    /// Re-install a persisted blackhole on a fresh session (rehydration).
+    pub fn resume(
+        &mut self,
+        target: IpAddr,
+        announced_at: u64,
+        origin: BlackholeOrigin,
+    ) -> Vec<RtbhAction> {
+        self.insert_blackhole(target, announced_at, origin)
+    }
+
+    /// Snapshot the active set (for reconcile mirroring, `list`, and tests).
+    #[must_use]
+    pub fn active_blackholes(&self) -> Vec<(IpAddr, u64, BlackholeOrigin)> {
+        self.active
+            .iter()
+            .map(|(t, e)| (*t, e.announced_at, e.origin))
+            .collect()
+    }
+
+    fn request_clear(&mut self, target: IpAddr, now: u64) -> Vec<RtbhAction> {
+        let hold_ms = u64::try_from(self.config.hold_down.as_millis()).unwrap_or(u64::MAX);
+        match self.active.get_mut(&target) {
+            // Manual blackholes are never auto-cleared.
+            Some(e) if matches!(e.origin, BlackholeOrigin::Manual) => Vec::new(),
+            Some(e) if now.saturating_sub(e.announced_at) >= hold_ms => {
+                self.active.remove(&target);
+                vec![RtbhAction::Withdraw(host_prefix(target))]
+            }
+            Some(e) => {
+                e.clear_requested_at = Some(now);
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn blackhole(&mut self, target: IpAddr, now: u64, origin: BlackholeOrigin) -> Vec<RtbhAction> {
+        self.insert_blackhole(target, now, origin)
+    }
+
+    fn insert_blackhole(
+        &mut self,
+        target: IpAddr,
+        announced_at: u64,
+        origin: BlackholeOrigin,
+    ) -> Vec<RtbhAction> {
         if !self
             .config
             .eligible_prefixes
@@ -122,7 +235,12 @@ impl RtbhController {
             tracing::warn!(%target, "RTBH: target outside eligible prefixes; ignoring");
             return Vec::new();
         }
-        if self.active.contains_key(&target) {
+        if let Some(e) = self.active.get_mut(&target) {
+            // Re-assertion of an already-active target (e.g. a re-attack `Opened`
+            // during a deferred-clear window): cancel any pending clear and refresh
+            // the TTL anchor so `tick` does not withdraw a target under attack again.
+            e.clear_requested_at = None;
+            e.last_activity = announced_at;
             return Vec::new();
         }
         if self.active.len() >= self.config.max_blackholes {
@@ -133,19 +251,16 @@ impl RtbhController {
             tracing::warn!(%target, "RTBH: no next-hop for target family; ignoring");
             return Vec::new();
         };
-        self.active.insert(target, now);
+        self.active.insert(
+            target,
+            ActiveEntry {
+                announced_at,
+                last_activity: announced_at,
+                origin,
+                clear_requested_at: None,
+            },
+        );
         vec![RtbhAction::Announce(route)]
-    }
-
-    fn unblackhole(&mut self, target: IpAddr, now: u64) -> Vec<RtbhAction> {
-        let hold_ms = u64::try_from(self.config.hold_down.as_millis()).unwrap_or(u64::MAX);
-        match self.active.get(&target) {
-            Some(&at) if now.saturating_sub(at) >= hold_ms => {
-                self.active.remove(&target);
-                vec![RtbhAction::Withdraw(host_prefix(target))]
-            }
-            _ => Vec::new(),
-        }
     }
 
     fn host_route(&self, target: IpAddr) -> Option<Route> {
@@ -188,6 +303,14 @@ mod tests {
             next_hop_v6: None,
             max_blackholes: 2,
             hold_down: Duration::from_secs(10),
+            max_ttl: None,
+        }
+    }
+
+    fn cfg_ttl(ms: u64) -> RtbhConfig {
+        RtbhConfig {
+            max_ttl: Some(Duration::from_millis(ms)),
+            ..cfg()
         }
     }
     fn det(ip: &str) -> Detection {
@@ -323,5 +446,157 @@ mod tests {
             panic!()
         };
         assert_eq!(r.prefix, net("2001:db8::7/128"));
+    }
+
+    #[test]
+    fn cleared_before_hold_down_is_deferred_then_withdrawn_on_tick() {
+        let mut c = RtbhController::new(cfg()); // 10s hold-down
+        c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0);
+        // Cleared arrives at 5s — before hold-down. Must NOT drop it forever.
+        assert!(c
+            .on_event(
+                &DetectionEvent::Cleared {
+                    target: ip("203.0.113.7"),
+                    at_ms: 5_000
+                },
+                5_000
+            )
+            .is_empty());
+        // A tick before hold-down: still held.
+        assert!(c.tick(9_000).is_empty());
+        // A tick at/after hold-down: the deferred withdraw fires.
+        assert_eq!(
+            c.tick(10_000),
+            vec![RtbhAction::Withdraw(net("203.0.113.7/32"))]
+        );
+        assert!(c.active_blackholes().is_empty());
+    }
+
+    #[test]
+    fn ttl_withdraws_a_never_cleared_blackhole() {
+        let mut c = RtbhController::new(cfg_ttl(30_000)); // 30s TTL
+        c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0);
+        assert!(c.tick(29_000).is_empty());
+        assert_eq!(
+            c.tick(30_000),
+            vec![RtbhAction::Withdraw(net("203.0.113.7/32"))]
+        );
+    }
+
+    #[test]
+    fn updated_refreshes_ttl_anchor() {
+        let mut c = RtbhController::new(cfg_ttl(30_000));
+        c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0);
+        c.on_event(&DetectionEvent::Updated(det("203.0.113.7")), 20_000); // refresh
+        assert!(
+            c.tick(45_000).is_empty(),
+            "TTL measured from last activity (20s)"
+        );
+        assert_eq!(c.tick(50_000).len(), 1, "expires 30s after the refresh");
+    }
+
+    #[test]
+    fn reattack_opened_during_deferred_clear_cancels_withdraw() {
+        // A Cleared before hold-down defers the withdraw; a re-attack Opened before
+        // the tick fires must cancel it, or tick would withdraw a target under attack.
+        let mut c = RtbhController::new(cfg()); // 10s hold-down
+        c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0);
+        assert!(c
+            .on_event(
+                &DetectionEvent::Cleared {
+                    target: ip("203.0.113.7"),
+                    at_ms: 5_000
+                },
+                5_000
+            )
+            .is_empty());
+        // Re-attack at 6s (idempotent — no new announce) must re-arm the entry.
+        assert!(c
+            .on_event(&DetectionEvent::Opened(det("203.0.113.7")), 6_000)
+            .is_empty());
+        assert!(
+            c.tick(10_000).is_empty(),
+            "re-attack cancelled the deferred withdraw"
+        );
+        assert_eq!(c.active_blackholes().len(), 1);
+    }
+
+    #[test]
+    fn updated_during_deferred_clear_cancels_withdraw() {
+        // Continued traffic (Updated) after an early Cleared also cancels the defer.
+        let mut c = RtbhController::new(cfg());
+        c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0);
+        assert!(c
+            .on_event(
+                &DetectionEvent::Cleared {
+                    target: ip("203.0.113.7"),
+                    at_ms: 5_000
+                },
+                5_000
+            )
+            .is_empty());
+        c.on_event(&DetectionEvent::Updated(det("203.0.113.7")), 6_000);
+        assert!(c.tick(10_000).is_empty());
+        assert_eq!(c.active_blackholes().len(), 1);
+    }
+
+    #[test]
+    fn manual_survives_auto_clear() {
+        let mut c = RtbhController::new(cfg());
+        c.manual_add(ip("203.0.113.7"), 0); // Manual
+        assert!(
+            c.on_event(
+                &DetectionEvent::Cleared {
+                    target: ip("203.0.113.7"),
+                    at_ms: 100_000
+                },
+                100_000
+            )
+            .is_empty(),
+            "auto-clear must not withdraw a manual blackhole"
+        );
+        assert!(c.tick(200_000).is_empty(), "and tick must not either");
+        assert_eq!(c.active_blackholes().len(), 1);
+    }
+
+    #[test]
+    fn manual_add_upgrades_auto_to_manual() {
+        let mut c = RtbhController::new(cfg());
+        assert_eq!(
+            c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0)
+                .len(),
+            1
+        ); // Auto
+        assert!(
+            c.manual_add(ip("203.0.113.7"), 1_000).is_empty(),
+            "already active → no new announce"
+        );
+        // Now an auto-clear can't remove it.
+        c.on_event(
+            &DetectionEvent::Cleared {
+                target: ip("203.0.113.7"),
+                at_ms: 100_000,
+            },
+            100_000,
+        );
+        assert!(c.tick(200_000).is_empty());
+        let snap = c.active_blackholes();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].2, BlackholeOrigin::Manual);
+    }
+
+    #[test]
+    fn resume_reannounces_and_counts_against_cap() {
+        let mut c = RtbhController::new(cfg()); // max 2
+        let a = c.resume(ip("203.0.113.5"), 12_345, BlackholeOrigin::Manual);
+        assert_eq!(a.len(), 1, "resume re-announces");
+        let snap = c.active_blackholes();
+        assert_eq!(
+            snap[0],
+            (ip("203.0.113.5"), 12_345, BlackholeOrigin::Manual)
+        );
+        // counts against the cap
+        assert_eq!(c.manual_add(ip("203.0.113.6"), 0).len(), 1);
+        assert!(c.manual_add(ip("203.0.113.7"), 0).is_empty(), "at cap");
     }
 }

@@ -32,8 +32,16 @@ impl MitigationSink for RtbhSink {
         let actions = self.controller.lock().await.on_event(event, now_ms());
         for action in actions {
             match action {
-                RtbhAction::Announce(route) => self.bgp.announce(route).await,
-                RtbhAction::Withdraw(prefix) => self.bgp.withdraw(prefix).await,
+                RtbhAction::Announce(route) => {
+                    if let Err(e) = self.bgp.announce(route).await {
+                        tracing::warn!(?e, "RTBH announce failed");
+                    }
+                }
+                RtbhAction::Withdraw(prefix) => {
+                    if let Err(e) = self.bgp.withdraw(prefix).await {
+                        tracing::warn!(?e, "RTBH withdraw failed");
+                    }
+                }
             }
         }
     }
