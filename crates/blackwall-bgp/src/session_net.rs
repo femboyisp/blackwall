@@ -261,6 +261,8 @@ async fn session_once(
         router_id: u32::from(cfg.router_id),
         ipv4_unicast: true,
         ipv6_unicast: true,
+        flowspec_v4: true,
+        flowspec_v6: true,
     };
     let open_bytes = encode_open(&local_open);
     if let Err(e) = stream.write_all(&open_bytes).await {
