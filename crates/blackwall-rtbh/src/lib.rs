@@ -5,5 +5,5 @@
 pub mod controller;
 pub mod sink;
 
-pub use controller::{RtbhAction, RtbhConfig, RtbhController};
+pub use controller::{BlackholeOrigin, RtbhAction, RtbhConfig, RtbhController};
 pub use sink::RtbhSink;
