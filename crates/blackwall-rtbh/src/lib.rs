@@ -1,16 +1,15 @@
 //! Remotely-triggered blackhole (RTBH): turn a detected attack into a BGP
-//! blackhole announcement. A pure [`RtbhController`] decides; a thin sink
-//! (added next) executes via the BGP speaker.
+//! blackhole announcement. A pure [`RtbhController`] decides; the
+//! [`manager::RtbhManager`] owns the I/O boundary (BGP session + journal)
+//! that executes its decisions.
 
 pub mod controller;
 pub mod manager;
-pub mod sink;
 
 pub use controller::{BlackholeOrigin, RtbhAction, RtbhConfig, RtbhController};
 pub use manager::{
     ApplyOutcome, BgpError, BgpExecutor, BlackholeJournal, JournalError, RtbhManager,
 };
-pub use sink::RtbhSink;
 
 /// Executes BGP commands against a live session via [`blackwall_bgp::BgpHandle`].
 #[async_trait::async_trait]
