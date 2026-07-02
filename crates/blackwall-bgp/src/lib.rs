@@ -13,5 +13,5 @@ pub use message::{
     HEADER_LEN, MARKER,
 };
 pub use route::{Origin, Route};
-pub use session_net::{spawn, BgpHandle, PeerConfig, SessionCommand};
+pub use session_net::{spawn, BgpHandle, BgpSendError, PeerConfig, PeerConfigError, SessionCommand};
 pub use update::{build_announce, build_withdraw};
