@@ -186,6 +186,12 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
                 .await
             {
                 tracing::error!(%target, error = %e, "RTBH: journal write failed after manual upgrade; keeping active");
+                // Self-heal the mirror on a later tick (issue #80).
+                self.queue_mirror(MirrorOp::Announce {
+                    target,
+                    origin: BlackholeOrigin::Manual,
+                    at_ms: wall_now,
+                });
             }
             return ApplyOutcome::Applied;
         }
@@ -755,6 +761,35 @@ mod tests {
             m.pending_mirror_len(),
             1,
             "repeated failures for one target coalesce to a single queued op"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_upgrade_journal_failure_self_heals_as_manual() {
+        // An Auto entry is active but its mirror write failed; the operator
+        // upgrades it to Manual and THAT journal write also fails. The self-heal
+        // must record the upgrade as Manual (issue #80), not leave the mirror
+        // stuck as Auto.
+        let mut m = mgr_transient_journal_failures(2); // announce + upgrade fail, then heal
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 100)
+            .await;
+        assert_eq!(
+            m.apply_add(ip("203.0.113.7"), 200, 200).await,
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.pending_mirror_len(),
+            1,
+            "the upgrade's failed mirror write is queued for self-heal"
+        );
+
+        m.tick(1000, 1000).await; // journal healthy now -> drains
+
+        assert_eq!(m.pending_mirror_len(), 0);
+        assert_eq!(
+            *m.journal().announced.lock().unwrap(),
+            vec![(ip("203.0.113.7"), BlackholeOrigin::Manual)],
+            "self-heal recorded the Manual upgrade, not the stale Auto origin"
         );
     }
 }
