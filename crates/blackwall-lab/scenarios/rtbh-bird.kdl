@@ -1,7 +1,7 @@
-// RTBH gate: a synthetic attack detection drives the RTBH sink to announce a
-// /32 blackhole (community 65535:666, RFC 7999) via the native BGP speaker;
-// BIRD must show the route carrying that community — the detection→mitigation
-// (D→C) loop end to end.
+// RTBH gate: an RtbhManager drives both an auto-detected blackhole and an
+// operator-manual blackhole via the native BGP speaker; BIRD must show both
+// /32 routes carrying community 65535:666 (RFC 7999) — the detection→
+// mitigation (D→C) loop end to end, plus the manual operator path.
 topology "rtbh-bird" {
     node "peer" {
         daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes"
@@ -17,6 +17,10 @@ topology "rtbh-bird" {
 scenario "blackhole-reaches-bird" {
     step wait   node="peer" until="bgp-established" timeout="20s"
     // `show route ... all` prints the community; BIRD renders 65535:666 as (65535,666).
+    // Auto path: driven by the synthetic detection via RtbhManager::apply_event.
     step assert node="peer" cmd="birdc show route 203.0.113.7/32 all" \
+         contains="(65535,666)" timeout="15s"
+    // Manual path: driven by the operator via RtbhManager::apply_add.
+    step assert node="peer" cmd="birdc show route 203.0.113.8/32 all" \
          contains="(65535,666)" timeout="15s"
 }

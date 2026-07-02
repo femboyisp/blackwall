@@ -1,12 +1,37 @@
-//! Manual/netns interop exercise: a synthetic detection drives the RTBH sink to
-//! announce a /32 blackhole (community 65535:666) via the speaker to a real BGP
-//! peer. Ignored in CI; run by the lab's rtbh-bird scenario.
+//! Manual/netns interop exercise: drives an `RtbhManager` (auto-detection +
+//! operator-manual paths) against a real BGP peer to announce /32 blackholes
+//! (community 65535:666) via the native speaker. Ignored in CI; run by the
+//! lab's rtbh-bird scenario.
 //!   BW_BGP_PEER=10.0.0.1:179 cargo test -p blackwall-rtbh --test interop -- --ignored --nocapture
 
+use async_trait::async_trait;
 use blackwall_bgp::{spawn, PeerConfig};
-use blackwall_flow::{AttackKind, Detection, DetectionEvent, MitigationSink, Severity};
-use blackwall_rtbh::{RtbhConfig, RtbhController, RtbhSink};
+use blackwall_flow::{AttackKind, Detection, DetectionEvent, Severity};
+use blackwall_rtbh::{
+    ApplyOutcome, BlackholeJournal, BlackholeOrigin, JournalError, RtbhConfig, RtbhController,
+    RtbhManager,
+};
+use std::net::IpAddr;
 use std::time::Duration;
+
+/// A no-op journal: this test only exercises the BGP path against real BIRD,
+/// not persistence (covered elsewhere with fakes / real Postgres).
+struct NoopJournal;
+
+#[async_trait]
+impl BlackholeJournal for NoopJournal {
+    async fn record_announce(
+        &self,
+        _target: IpAddr,
+        _origin: BlackholeOrigin,
+        _at_ms: u64,
+    ) -> Result<(), JournalError> {
+        Ok(())
+    }
+    async fn record_withdraw(&self, _target: IpAddr, _at_ms: u64) -> Result<(), JournalError> {
+        Ok(())
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a live BGP peer (BIRD); run in the netns lab"]
@@ -34,21 +59,33 @@ async fn blackholes_a_detected_target() {
         hold_down: Duration::from_secs(0),
         max_ttl: None,
     });
-    let sink = RtbhSink::new(controller, handle);
+    let mut manager = RtbhManager::new(controller, handle, NoopJournal);
 
-    sink.handle(&DetectionEvent::Opened(Detection {
-        target: "203.0.113.7".parse().unwrap(),
-        kind: AttackKind::Volumetric,
-        observed_pps: 200_000.0,
-        observed_bps: 2e9,
-        proto: 17,
-        top_sources: vec![],
-        top_ports: vec![],
-        severity: Severity::High,
-        first_seen_ms: 0,
-        last_seen_ms: 0,
-    }))
-    .await;
+    // Auto path: a synthetic detection drives the controller to announce.
+    manager
+        .apply_event(
+            &DetectionEvent::Opened(Detection {
+                target: "203.0.113.7".parse().unwrap(),
+                kind: AttackKind::Volumetric,
+                observed_pps: 200_000.0,
+                observed_bps: 2e9,
+                proto: 17,
+                top_sources: vec![],
+                top_ports: vec![],
+                severity: Severity::High,
+                first_seen_ms: 0,
+                last_seen_ms: 0,
+            }),
+            1000,
+            1000,
+        )
+        .await;
+
+    // Manual path: an operator directly blackholes a second target.
+    let outcome = manager
+        .apply_add("203.0.113.8".parse().unwrap(), 1000, 1000)
+        .await;
+    assert_eq!(outcome, ApplyOutcome::Applied);
 
     tokio::time::sleep(Duration::from_secs(5)).await; // let BIRD import + the scenario assert
 }
