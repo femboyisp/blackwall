@@ -4,10 +4,10 @@
 use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
-    AllowRule, BannerFluxConfig, DnsFluxConfig, L4Proto, Policy, PortState, ServiceTarget,
-    ShapeBandwidth, ShapeRule, Tenant,
+    AllowRule, BannerFluxConfig, DnsFluxConfig, L4Proto, Policy, PortState, RtbhPolicy,
+    ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
 };
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Parse pre-lexed lines into a [`Policy`].
 pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
@@ -18,6 +18,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut shaping = Vec::new();
     let mut banner_flux: Option<BannerFluxConfig> = None;
     let mut dns_flux: Option<DnsFluxConfig> = None;
+    let mut rtbh: Option<RtbhPolicy> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -174,6 +175,125 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     tsig_path: std::path::PathBuf::from(get("tsig")?),
                 });
             }
+            "rtbh" => {
+                if rtbh.is_some() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "rtbh",
+                        value: "duplicate".to_owned(),
+                    });
+                }
+                let mut kv: std::collections::HashMap<&str, &str> =
+                    std::collections::HashMap::new();
+                for tok in &line.words[1..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "rtbh",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    if !matches!(
+                        k,
+                        "peer"
+                            | "local-as"
+                            | "peer-as"
+                            | "router-id"
+                            | "next-hop-v4"
+                            | "next-hop-v6"
+                            | "max"
+                            | "hold-down"
+                            | "ttl"
+                            | "community"
+                    ) {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "rtbh key",
+                            value: k.to_owned(),
+                        });
+                    }
+                    kv.insert(k, v);
+                }
+                let bad = |what: &'static str, v: &str| ConfigError::BadValue {
+                    line: line.number,
+                    what,
+                    value: v.to_owned(),
+                };
+                let get = |k: &str| -> Result<&str, ConfigError> {
+                    kv.get(k).copied().ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "rtbh missing key",
+                        value: k.to_owned(),
+                    })
+                };
+                let peer_tok = get("peer")?;
+                let peer_addr: SocketAddr = peer_tok
+                    .parse::<SocketAddr>()
+                    .or_else(|_| peer_tok.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 179)))
+                    .map_err(|_| bad("peer", peer_tok))?;
+                let local_asn: u32 = get("local-as")?
+                    .parse()
+                    .map_err(|_| bad("local-as", get("local-as").unwrap_or("")))?;
+                let peer_asn: u32 = get("peer-as")?
+                    .parse()
+                    .map_err(|_| bad("peer-as", get("peer-as").unwrap_or("")))?;
+                if local_asn != peer_asn {
+                    return Err(bad("rtbh local-as/peer-as", "must match (iBGP only)"));
+                }
+                let router_id: Ipv4Addr = get("router-id")?
+                    .parse()
+                    .map_err(|_| bad("router-id", get("router-id").unwrap_or("")))?;
+                let next_hop_v4: Option<Ipv4Addr> = kv
+                    .get("next-hop-v4")
+                    .map(|v| v.parse().map_err(|_| bad("next-hop-v4", v)))
+                    .transpose()?;
+                let next_hop_v6: Option<Ipv6Addr> = kv
+                    .get("next-hop-v6")
+                    .map(|v| v.parse().map_err(|_| bad("next-hop-v6", v)))
+                    .transpose()?;
+                if next_hop_v4.is_none() && next_hop_v6.is_none() {
+                    return Err(bad(
+                        "rtbh",
+                        "at least one of next-hop-v4/next-hop-v6 required",
+                    ));
+                }
+                let max_blackholes: usize = get("max")?
+                    .parse()
+                    .map_err(|_| bad("max", get("max").unwrap_or("")))?;
+                let hold_down = parse_duration(line, get("hold-down")?)?;
+                let max_ttl = match kv.get("ttl") {
+                    Some(t) => Some(parse_duration(line, t)?),
+                    None => None,
+                };
+                if let Some(ttl) = max_ttl {
+                    if ttl < hold_down {
+                        return Err(bad("rtbh ttl", "must be >= hold-down"));
+                    }
+                }
+                let blackhole_communities = match kv.get("community") {
+                    Some(spec) => {
+                        let mut out = Vec::new();
+                        for pair in spec.split(',') {
+                            let (a, v) = pair.split_once(':').ok_or_else(|| bad("community", pair))?;
+                            let asn: u16 = a.parse().map_err(|_| bad("community", pair))?;
+                            let val: u16 = v.parse().map_err(|_| bad("community", pair))?;
+                            out.push((asn, val));
+                        }
+                        out
+                    }
+                    None => vec![(65535, 666)],
+                };
+                rtbh = Some(RtbhPolicy {
+                    local_asn,
+                    peer_asn,
+                    peer_addr,
+                    router_id,
+                    blackhole_communities,
+                    next_hop_v4,
+                    next_hop_v6,
+                    max_blackholes,
+                    hold_down,
+                    max_ttl,
+                });
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -199,7 +319,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         shaping,
         banner_flux,
         dns_flux,
-        rtbh: None,
+        rtbh,
     })
 }
 
@@ -788,6 +908,65 @@ tenant t {
     #[test]
     fn rejects_duplicate_dns_flux() {
         assert!(parse_text("interface wan eth0\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=2 set=1 tsig=/k\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=2 set=1 tsig=/k\n").is_err());
+    }
+
+    #[test]
+    fn parses_rtbh_full() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\n\
+             rtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 next-hop-v4=10.222.255.99 max=256 hold-down=60s ttl=2h\n",
+        ).unwrap();
+        let r = p.rtbh.unwrap();
+        assert_eq!(r.peer_addr, "10.0.0.2:179".parse().unwrap());
+        assert_eq!(r.local_asn, 214806);
+        assert_eq!(r.peer_asn, 214806);
+        assert_eq!(r.router_id, "10.222.255.1".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            r.next_hop_v4,
+            Some("10.222.255.99".parse::<std::net::Ipv4Addr>().unwrap())
+        );
+        assert_eq!(r.max_blackholes, 256);
+        assert_eq!(r.hold_down, std::time::Duration::from_secs(60));
+        assert_eq!(r.max_ttl, Some(std::time::Duration::from_secs(7200)));
+        assert_eq!(r.blackhole_communities, vec![(65535, 666)]); // default
+    }
+
+    #[test]
+    fn rtbh_peer_bare_ip_defaults_179() {
+        let p = parse_text("interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v6=2001:db8::1 max=8 hold-down=30s\n").unwrap();
+        assert_eq!(p.rtbh.unwrap().peer_addr, "10.0.0.2:179".parse().unwrap());
+    }
+
+    #[test]
+    fn rtbh_parses_custom_communities() {
+        let p = parse_text("interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s community=65535:666,65535:667\n").unwrap();
+        assert_eq!(p.rtbh.unwrap().blackhole_communities, vec![(65535, 666), (65535, 667)]);
+    }
+
+    #[test]
+    fn rtbh_rejects_ebgp() {
+        assert!(parse_text("interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=2 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\n").is_err());
+    }
+
+    #[test]
+    fn rtbh_requires_a_next_hop() {
+        assert!(parse_text("interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 max=8 hold-down=30s\n").is_err());
+    }
+
+    #[test]
+    fn rtbh_rejects_ttl_below_hold_down() {
+        assert!(parse_text("interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=60s ttl=30s\n").is_err());
+    }
+
+    #[test]
+    fn rtbh_rejects_unknown_key() {
+        assert!(parse_text("interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s bogus=1\n").is_err());
+    }
+
+    #[test]
+    fn rtbh_rejects_duplicate() {
+        let dup = "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\nrtbh peer=10.0.0.3 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\n";
+        assert!(parse_text(dup).is_err());
     }
 
     #[test]
