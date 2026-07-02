@@ -8,7 +8,7 @@
 //!
 //! [`spawn`] creates an [`mpsc`] channel and [`tokio::spawn`]s [`run`],
 //! returning a [`BgpHandle`] for injecting routes and a
-//! [`JoinHandle`] for shutdown signalling.
+//! [`tokio::task::JoinHandle`] for shutdown signalling.
 //!
 //! [`run`] loops forever (reconnecting on any error):
 //! 1. TCP-connect `cfg.peer_addr`.
@@ -153,7 +153,7 @@ impl BgpHandle {
 
 /// Spawn a BGP session task and return a handle for controlling it.
 ///
-/// The task runs until the process exits (or the [`JoinHandle`] is aborted).
+/// The task runs until the process exits (or the [`tokio::task::JoinHandle`] is aborted).
 /// It reconnects automatically on any I/O error or hold-timer expiry.
 ///
 /// # Errors
