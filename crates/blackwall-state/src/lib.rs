@@ -364,8 +364,8 @@ impl Store {
         Ok(out)
     }
 
-    /// Append an operator intent row to `rtbh_requests`. Returns the new
-    /// row's id, which callers use as the drain watermark.
+    /// Append an operator intent row to `rtbh_requests` (`status = 'pending'`
+    /// by default). Returns the new row's id.
     pub async fn enqueue_request(
         &self,
         target: IpAddr,
@@ -385,8 +385,13 @@ impl Store {
         Ok(row.0)
     }
 
-    /// Fetch all requests with `id > after_id`, ordered by id (FIFO drain).
-    pub async fn drain_requests(&self, after_id: i64) -> Result<Vec<RtbhRequestRow>, StateError> {
+    /// Fetch all requests with `status = 'pending'`, ordered by id.
+    ///
+    /// This is status-driven (not a watermark): every tick re-reads the
+    /// genuinely-pending set, so a capacity-deferred add is naturally
+    /// retried (it's still `pending`) and a restart never replays
+    /// already-`applied`/`rejected` history.
+    pub async fn pending_requests(&self) -> Result<Vec<RtbhRequestRow>, StateError> {
         let rows: Vec<(
             i64,
             sqlx::types::ipnetwork::IpNetwork,
@@ -396,12 +401,27 @@ impl Store {
             Option<String>,
         )> = sqlx::query_as(
             "SELECT id, target, action, created_by, status, note \
-             FROM rtbh_requests WHERE id > $1 ORDER BY id",
+             FROM rtbh_requests WHERE status = 'pending' ORDER BY id",
         )
-        .bind(after_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows_to_requests(rows))
+    }
+
+    /// Mark any still-`pending` `add` request for `target` as `applied`
+    /// (with a `"superseded by remove"` note), so a later remove cancels an
+    /// earlier not-yet-applied add for the same target instead of letting it
+    /// re-announce once capacity frees up.
+    pub async fn supersede_pending_adds(&self, target: IpAddr) -> Result<(), StateError> {
+        let target = ipnetwork_addr(target);
+        sqlx::query(
+            "UPDATE rtbh_requests SET status = 'applied', note = 'superseded by remove', \
+             applied_at = now() WHERE action = 'add' AND target = $1 AND status = 'pending'",
+        )
+        .bind(target)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Update a request's status (and optional note), stamping `applied_at`.
@@ -504,6 +524,9 @@ impl blackwall_rtbh::BlackholeJournal for Store {
         target: IpAddr,
         at_ms: u64,
     ) -> Result<(), blackwall_rtbh::JournalError> {
+        // `only_auto = false` here is safe: the auto-vs-manual guard (never
+        // let an auto-clear withdraw a manually-added blackhole) is enforced
+        // upstream, in `RtbhController::request_clear`, before this ever runs.
         self.clear_blackhole(target, at_ms, false)
             .await
             .map_err(|e| blackwall_rtbh::JournalError(e.to_string()))
@@ -738,8 +761,8 @@ mod tests {
             .enqueue_request("203.0.113.8".parse().unwrap(), "add", "op@host")
             .await
             .unwrap();
-        let drained = store.drain_requests(id - 1).await.unwrap();
-        assert!(drained.iter().any(|r| r.id == id && r.action == "add"));
+        let pending = store.pending_requests().await.unwrap();
+        assert!(pending.iter().any(|r| r.id == id && r.action == "add"));
         store.set_request_status(id, "applied", None).await.unwrap();
         assert_eq!(
             store
@@ -751,6 +774,54 @@ mod tests {
                 .unwrap()
                 .status,
             "applied"
+        );
+        assert!(
+            !store
+                .pending_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id),
+            "an applied request must no longer appear in pending_requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtbh_supersede_pending_adds() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let t: IpAddr = "203.0.113.11".parse().unwrap();
+        let id = store.enqueue_request(t, "add", "op@host").await.unwrap();
+        assert!(store
+            .pending_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id));
+
+        store.supersede_pending_adds(t).await.unwrap();
+
+        let row = store
+            .list_requests(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(row.status, "applied");
+        assert_eq!(row.note.as_deref(), Some("superseded by remove"));
+        assert!(
+            !store
+                .pending_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id),
+            "superseded add must no longer be pending"
         );
     }
 

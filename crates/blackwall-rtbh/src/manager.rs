@@ -74,9 +74,11 @@ pub enum ApplyOutcome {
 /// Owns the pure [`RtbhController`] plus the I/O boundary: it executes the
 /// controller's decisions on a [`BgpExecutor`] and mirrors auto/manual state
 /// via a [`BlackholeJournal`]. A BGP failure is logged and the action is not
-/// journaled (so state stays consistent for a future retry). A journal
-/// failure after a successful BGP operation is logged but never causes a
-/// live blackhole to be withdrawn.
+/// journaled — but note this is a known limitation, not a retry mechanism:
+/// on a failed first announce the controller entry is kept in memory while
+/// the route itself is never re-announced automatically. A journal failure
+/// after a successful BGP operation is logged but never causes a live
+/// blackhole to be withdrawn.
 pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     controller: RtbhController,
     bgp: B,

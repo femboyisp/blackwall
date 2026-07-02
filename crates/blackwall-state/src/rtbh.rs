@@ -19,7 +19,7 @@ pub struct RtbhBlackholeRow {
 /// One row of the `rtbh_requests` append-only operator intent queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtbhRequestRow {
-    /// Monotonically increasing request id (used as the drain watermark).
+    /// Monotonically increasing request id.
     pub id: i64,
     /// The target address the request applies to.
     pub target: IpAddr,
