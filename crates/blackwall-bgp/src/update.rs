@@ -18,6 +18,9 @@ const FLAG_WELL_KNOWN: u8 = 0x40;
 const FLAG_OPT_TRANS: u8 = 0xC0;
 /// Optional non-transitive flag (used for MP_REACH/MP_UNREACH_NLRI per RFC 4760).
 const FLAG_OPT_NON_TRANS: u8 = 0x80;
+/// Extended-Length attribute flag bit (RFC 4271 §4.3): when set, the length
+/// field is two octets instead of one.
+const FLAG_EXTENDED_LEN: u8 = 0x10;
 
 /// ORIGIN attribute type code.
 const ATTR_ORIGIN: u8 = 1;
@@ -55,7 +58,8 @@ pub(crate) fn encode_nlri(prefix: &IpNet) -> Vec<u8> {
     let nbytes = usize::from(bits.div_ceil(8));
     let mut out = Vec::with_capacity(1 + nbytes);
     out.push(bits);
-    let addr_octets: Vec<u8> = match prefix.addr() {
+    // Truncate host bits so a non-host prefix can never emit a malformed NLRI.
+    let addr_octets: Vec<u8> = match prefix.trunc().addr() {
         IpAddr::V4(a) => a.octets().to_vec(),
         IpAddr::V6(a) => a.octets().to_vec(),
     };
@@ -65,12 +69,19 @@ pub(crate) fn encode_nlri(prefix: &IpNet) -> Vec<u8> {
 
 // ── Path-attribute helpers ───────────────────────────────────────────────────
 
-/// Append a short (≤255 byte value) path attribute to `buf`.
+/// Append a path attribute to `buf`, choosing the one-byte or two-byte
+/// (extended-length, RFC 4271 §4.3) length form based on the value size.
 fn push_attr(buf: &mut Vec<u8>, flags: u8, type_code: u8, value: &[u8]) {
-    buf.push(flags);
-    buf.push(type_code);
-    // Length fits in u8 for all attrs this module encodes (enforced at call sites).
-    buf.push(u8::try_from(value.len()).expect("attribute value exceeds 255 bytes"));
+    if let Ok(len) = u8::try_from(value.len()) {
+        buf.push(flags);
+        buf.push(type_code);
+        buf.push(len);
+    } else {
+        let len = u16::try_from(value.len()).expect("attribute value exceeds 65535 bytes");
+        buf.push(flags | FLAG_EXTENDED_LEN);
+        buf.push(type_code);
+        buf.extend_from_slice(&len.to_be_bytes());
+    }
     buf.extend_from_slice(value);
 }
 
@@ -390,5 +401,40 @@ mod tests {
         assert_eq!(u16::from_be_bytes([msg[19], msg[20]]), 0);
         // MP_UNREACH_NLRI attribute type 15 present
         assert!(msg.windows(2).any(|w| w == [0x80, 15]));
+    }
+
+    #[test]
+    fn push_attr_uses_extended_length_past_255_bytes() {
+        // 64 standard communities = 256 bytes of value → must NOT panic and must
+        // use the two-byte extended-length form (flag bit 0x10 set).
+        let communities: Vec<(u16, u16)> = (0..64).map(|i| (65535, i)).collect();
+        let route = Route {
+            prefix: "203.0.113.7/32".parse().unwrap(),
+            next_hop: "10.0.0.1".parse::<IpAddr>().unwrap(),
+            origin: Origin::Igp,
+            communities,
+            large_communities: vec![],
+        };
+        let msg = build_announce(&route); // previously panicked
+        // Find the COMMUNITIES attribute (type 8). Its value is 256 bytes, so the
+        // Extended-Length bit (0x10) must be OR'd into the flags and the length is
+        // two bytes big-endian.
+        // Flags for COMMUNITIES = optional-transitive (0xC0) | extended-length (0x10) = 0xD0.
+        let idx = msg
+            .windows(2)
+            .position(|w| w == [0xD0, 8])
+            .expect("extended-length COMMUNITIES attribute present");
+        let len = u16::from_be_bytes([msg[idx + 2], msg[idx + 3]]);
+        assert_eq!(len, 256, "two-byte extended length == 256");
+    }
+
+    #[test]
+    fn encode_nlri_truncates_host_bits() {
+        // 203.0.113.130/25 → bits=25, nbytes=4; the low 7 bits of the 4th octet
+        // must be masked to 0 (203.0.113.128), not carried as 130.
+        assert_eq!(
+            encode_nlri(&"203.0.113.130/25".parse().unwrap()),
+            vec![25, 203, 0, 113, 128]
+        );
     }
 }
