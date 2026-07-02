@@ -415,11 +415,11 @@ mod tests {
             communities,
             large_communities: vec![],
         };
-        let msg = build_announce(&route); // previously panicked
-        // Find the COMMUNITIES attribute (type 8). Its value is 256 bytes, so the
-        // Extended-Length bit (0x10) must be OR'd into the flags and the length is
-        // two bytes big-endian.
-        // Flags for COMMUNITIES = optional-transitive (0xC0) | extended-length (0x10) = 0xD0.
+        // Previously this panicked. Find the COMMUNITIES attribute (type 8): its
+        // value is 256 bytes, so the Extended-Length bit (0x10) must be OR'd into
+        // the flags and the length written as two big-endian bytes. Flags =
+        // optional-transitive (0xC0) | extended-length (0x10) = 0xD0.
+        let msg = build_announce(&route);
         let idx = msg
             .windows(2)
             .position(|w| w == [0xD0, 8])

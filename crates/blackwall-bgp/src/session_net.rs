@@ -159,9 +159,7 @@ impl BgpHandle {
 /// # Errors
 ///
 /// Returns [`PeerConfigError`] if `cfg` is not a valid iBGP configuration.
-pub fn spawn(
-    cfg: PeerConfig,
-) -> Result<(BgpHandle, tokio::task::JoinHandle<()>), PeerConfigError> {
+pub fn spawn(cfg: PeerConfig) -> Result<(BgpHandle, tokio::task::JoinHandle<()>), PeerConfigError> {
     cfg.validate()?;
     if cfg.hold_time == 0 {
         warn!(peer = %cfg.peer_addr, "hold_time is 0: dead-peer detection disabled");
@@ -351,18 +349,28 @@ async fn session_once(
     // Validate the peer's OPEN. iBGP: the peer's ASN must equal the configured
     // peer ASN. RFC 4271 §6.2: OPEN error (code 2), bad-peer-AS (subcode 2).
     if peer_open.asn != cfg.peer_asn {
-        let notif = encode_notification(&NotificationMsg { code: 2, subcode: 2, data: vec![] });
+        let notif = encode_notification(&NotificationMsg {
+            code: 2,
+            subcode: 2,
+            data: vec![],
+        });
         let _ = stream.write_all(&notif).await;
         return SessionOutcome::Reconnect(format!(
-            "peer ASN {} != configured {}", peer_open.asn, cfg.peer_asn
+            "peer ASN {} != configured {}",
+            peer_open.asn, cfg.peer_asn
         ));
     }
     // RFC 4271 §6.2: unacceptable hold time (subcode 6) for a non-zero value < 3.
     if peer_open.hold_time == 1 || peer_open.hold_time == 2 {
-        let notif = encode_notification(&NotificationMsg { code: 2, subcode: 6, data: vec![] });
+        let notif = encode_notification(&NotificationMsg {
+            code: 2,
+            subcode: 6,
+            data: vec![],
+        });
         let _ = stream.write_all(&notif).await;
         return SessionOutcome::Reconnect(format!(
-            "peer proposed unacceptable hold time {}", peer_open.hold_time
+            "peer proposed unacceptable hold time {}",
+            peer_open.hold_time
         ));
     }
 

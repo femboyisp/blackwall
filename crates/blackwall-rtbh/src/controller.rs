@@ -502,13 +502,22 @@ mod tests {
         let mut c = RtbhController::new(cfg()); // 10s hold-down
         c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0);
         assert!(c
-            .on_event(&DetectionEvent::Cleared { target: ip("203.0.113.7"), at_ms: 5_000 }, 5_000)
+            .on_event(
+                &DetectionEvent::Cleared {
+                    target: ip("203.0.113.7"),
+                    at_ms: 5_000
+                },
+                5_000
+            )
             .is_empty());
         // Re-attack at 6s (idempotent — no new announce) must re-arm the entry.
         assert!(c
             .on_event(&DetectionEvent::Opened(det("203.0.113.7")), 6_000)
             .is_empty());
-        assert!(c.tick(10_000).is_empty(), "re-attack cancelled the deferred withdraw");
+        assert!(
+            c.tick(10_000).is_empty(),
+            "re-attack cancelled the deferred withdraw"
+        );
         assert_eq!(c.active_blackholes().len(), 1);
     }
 
@@ -518,7 +527,13 @@ mod tests {
         let mut c = RtbhController::new(cfg());
         c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 0);
         assert!(c
-            .on_event(&DetectionEvent::Cleared { target: ip("203.0.113.7"), at_ms: 5_000 }, 5_000)
+            .on_event(
+                &DetectionEvent::Cleared {
+                    target: ip("203.0.113.7"),
+                    at_ms: 5_000
+                },
+                5_000
+            )
             .is_empty());
         c.on_event(&DetectionEvent::Updated(det("203.0.113.7")), 6_000);
         assert!(c.tick(10_000).is_empty());
