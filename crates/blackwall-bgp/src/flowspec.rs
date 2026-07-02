@@ -145,7 +145,12 @@ pub fn build_flowspec_announce(rule: &FlowSpecRule) -> Vec<u8> {
     mp_reach.extend_from_slice(&nlri);
 
     let mut attrs: Vec<u8> = Vec::new();
-    push_attr(&mut attrs, FLAG_WELL_KNOWN, ATTR_ORIGIN, &[Origin::Igp.wire()]);
+    push_attr(
+        &mut attrs,
+        FLAG_WELL_KNOWN,
+        ATTR_ORIGIN,
+        &[Origin::Igp.wire()],
+    );
     push_attr(&mut attrs, FLAG_WELL_KNOWN, ATTR_AS_PATH, &[]);
     push_attr(
         &mut attrs,
@@ -153,7 +158,12 @@ pub fn build_flowspec_announce(rule: &FlowSpecRule) -> Vec<u8> {
         ATTR_EXTENDED_COMMUNITIES,
         &traffic_rate_community(rate),
     );
-    push_attr(&mut attrs, FLAG_OPT_NON_TRANS, ATTR_MP_REACH_NLRI, &mp_reach);
+    push_attr(
+        &mut attrs,
+        FLAG_OPT_NON_TRANS,
+        ATTR_MP_REACH_NLRI,
+        &mp_reach,
+    );
 
     let total_attr_len = u16::try_from(attrs.len()).expect("path attributes exceed 65535 bytes");
     let mut body: Vec<u8> = Vec::new();
@@ -173,7 +183,12 @@ pub fn build_flowspec_withdraw(rule: &FlowSpecRule) -> Vec<u8> {
     mp_unreach.extend_from_slice(&nlri);
 
     let mut attrs: Vec<u8> = Vec::new();
-    push_attr(&mut attrs, FLAG_OPT_NON_TRANS, ATTR_MP_UNREACH_NLRI, &mp_unreach);
+    push_attr(
+        &mut attrs,
+        FLAG_OPT_NON_TRANS,
+        ATTR_MP_UNREACH_NLRI,
+        &mp_unreach,
+    );
 
     let total_attr_len = u16::try_from(attrs.len()).expect("path attributes exceed 65535 bytes");
     let mut body: Vec<u8> = Vec::new();
@@ -299,7 +314,9 @@ mod tests {
         // AFI 1 (v4), SAFI 133, nexthop_len 0
         assert!(msg.windows(4).any(|w| w == [0x00, 0x01, 0x85, 0x00]));
         // the traffic-rate action community bytes appear
-        assert!(msg.windows(8).any(|w| w == [0x80, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+        assert!(msg
+            .windows(8)
+            .any(|w| w == [0x80, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
         // the NLRI appears verbatim
         let nlri = encode_flowspec_nlri(&rule_v4());
         assert!(msg.windows(nlri.len()).any(|w| w == nlri.as_slice()));
@@ -317,7 +334,10 @@ mod tests {
 
     #[test]
     fn announce_v6_uses_afi2() {
-        let r = FlowSpecRule { dst: "2001:db8::7/128".parse().unwrap(), ..rule_v4() };
+        let r = FlowSpecRule {
+            dst: "2001:db8::7/128".parse().unwrap(),
+            ..rule_v4()
+        };
         let msg = build_flowspec_announce(&r);
         assert!(msg.windows(4).any(|w| w == [0x00, 0x02, 0x85, 0x00])); // AFI 2, SAFI 133, nh 0
     }
