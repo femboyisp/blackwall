@@ -67,11 +67,42 @@ pub(crate) fn assert_cmd(
     netns::nsexec(ns, &["sh", "-c", &rewritten])
 }
 
+/// Kill any daemon that wrote a `*.pid` file under `run_dir` (best-effort).
+///
+/// BIRD daemonizes itself and returns no [`Child`] handle, so it is not
+/// reaped by the runner's tracked-children teardown; it writes a pidfile
+/// instead (`-P <path>` at [`spawn_bird`]). Callers must invoke this before
+/// removing a run's scratch dir so the daemon is not orphaned. A missing or
+/// stale pidfile, or an already-dead pid, is a harmless no-op. Killing by
+/// PID works from the root netns because `ip netns exec` shares the root PID
+/// namespace with the process it spawns.
+pub(crate) fn kill_pidfiles(run_dir: &str) {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let pid = contents.trim();
+        if pid.is_empty() {
+            continue;
+        }
+        let _ = Command::new("kill").args(["-KILL", pid]).status();
+    }
+}
+
 /// Write config and launch BIRD inside `ns` for this run.
 ///
 /// Creates `/run/blackwall-lab/<run_id>/` if absent, writes `<node>.conf`,
 /// and starts `bird` in the background. The process is detached (no handle
-/// retained); BIRD exits on namespace teardown.
+/// retained); BIRD daemonizes itself and writes a pidfile at `-P <path>`, so
+/// teardown kills it by pidfile via [`kill_pidfiles`] instead of a tracked
+/// `Child` — deleting the namespace alone does NOT stop a running BIRD.
 pub(crate) fn spawn_bird(
     run_id: &str,
     node: &str,
