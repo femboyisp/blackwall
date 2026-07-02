@@ -92,6 +92,16 @@ pub(crate) fn kill_pidfiles(run_dir: &str) {
         if pid.is_empty() {
             continue;
         }
+        // Guard against PID reuse (issue #81): only kill if the live process is
+        // actually the lab's BIRD daemon. A recycled PID (an unrelated process)
+        // has a different `comm`, and a dead pid has no `/proc/<pid>/comm` — both
+        // are skipped.
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        if comm.trim() != "bird" {
+            continue;
+        }
         let _ = Command::new("kill").args(["-KILL", pid]).status();
     }
 }
