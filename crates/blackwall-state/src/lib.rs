@@ -676,6 +676,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detection_open_update_clear_roundtrip() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let t: IpAddr = "203.0.113.20".parse().unwrap();
+        let d = sample_detection(t, 1_000, 1_000);
+        store.open_detection(&d).await.unwrap();
+
+        let row: (f64, f64, bool) = sqlx::query_as(
+            "SELECT observed_pps, observed_bps, cleared_at IS NOT NULL FROM detections \
+             WHERE target = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(ipnetwork_addr(t))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, d.observed_pps);
+        assert_eq!(row.1, d.observed_bps);
+        assert!(!row.2, "freshly opened detection must not be cleared");
+
+        store
+            .update_detection(t, 90_000.0, 700_000_000.0, 2_000)
+            .await
+            .unwrap();
+        let row: (f64, f64) = sqlx::query_as(
+            "SELECT observed_pps, observed_bps FROM detections \
+             WHERE target = $1 AND cleared_at IS NULL",
+        )
+        .bind(ipnetwork_addr(t))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, 90_000.0);
+        assert_eq!(row.1, 700_000_000.0);
+
+        store.clear_detection(t, 3_000).await.unwrap();
+        let cleared: (bool,) = sqlx::query_as(
+            "SELECT cleared_at IS NOT NULL FROM detections \
+             WHERE target = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(ipnetwork_addr(t))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(cleared.0, "detection must be cleared after clear_detection");
+
+        // A second clear_detection is a harmless no-op: the WHERE clause
+        // (cleared_at IS NULL) no longer matches any row for this target.
+        store.clear_detection(t, 4_000).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pg_mitigation_sink_handles_opened_updated_cleared() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Arc::new(Store::connect(&url).await.unwrap());
+        store.migrate().await.unwrap();
+        let sink = PgMitigationSink::new(store.clone());
+        let t: IpAddr = "203.0.113.21".parse().unwrap();
+
+        let opened = sample_detection(t, 5_000, 5_000);
+        sink.handle(&DetectionEvent::Opened(opened.clone())).await;
+        let row: (f64, bool) = sqlx::query_as(
+            "SELECT observed_pps, cleared_at IS NOT NULL FROM detections \
+             WHERE target = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(ipnetwork_addr(t))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, opened.observed_pps);
+        assert!(!row.1, "Opened must insert an uncleared row");
+
+        let mut updated = opened.clone();
+        updated.observed_pps = 123_456.0;
+        updated.observed_bps = 987_654.0;
+        updated.last_seen_ms = 6_000;
+        sink.handle(&DetectionEvent::Updated(updated.clone())).await;
+        let row: (f64, f64) = sqlx::query_as(
+            "SELECT observed_pps, observed_bps FROM detections \
+             WHERE target = $1 AND cleared_at IS NULL",
+        )
+        .bind(ipnetwork_addr(t))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, updated.observed_pps);
+        assert_eq!(row.1, updated.observed_bps);
+
+        sink.handle(&DetectionEvent::Cleared {
+            target: t,
+            at_ms: 7_000,
+        })
+        .await;
+        let cleared: (bool,) = sqlx::query_as(
+            "SELECT cleared_at IS NOT NULL FROM detections \
+             WHERE target = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(ipnetwork_addr(t))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(cleared.0, "Cleared must mark the row cleared");
+    }
+
+    #[tokio::test]
     async fn records_and_counts_sessions() {
         let Some(url) = test_url() else {
             eprintln!("DATABASE_URL not set; skipping");
@@ -973,6 +1084,24 @@ mod tests {
         };
         let row2 = row.clone();
         assert_eq!(row, row2);
+    }
+
+    /// Build a sample [`Detection`] for `target`, with fixed source/port
+    /// breakdowns and `Critical` severity — enough to exercise the
+    /// `top_sources`/`top_ports` JSON encoding on insert.
+    fn sample_detection(target: IpAddr, first_seen_ms: u64, last_seen_ms: u64) -> Detection {
+        Detection {
+            target,
+            kind: blackwall_flow::AttackKind::Volumetric,
+            observed_pps: 50_000.0,
+            observed_bps: 400_000_000.0,
+            proto: 17,
+            top_sources: vec![("198.51.100.5".parse().unwrap(), 40_000.0)],
+            top_ports: vec![(53, 40_000.0)],
+            severity: Severity::Critical,
+            first_seen_ms,
+            last_seen_ms,
+        }
     }
 
     fn blackwall_config_sample() -> Policy {

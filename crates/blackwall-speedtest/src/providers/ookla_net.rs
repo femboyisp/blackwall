@@ -37,7 +37,7 @@ impl OoklaProvider {
     /// Create an [`OoklaProvider`] whose connections bind to `source`.
     ///
     /// The HTTP client used to fetch the server list is also bound to `source`.
-    /// The raw TCP measurement connection is bound via [`connect_bound`].
+    /// The raw TCP measurement connection is bound via `connect_bound`.
     pub fn with_source(source: SpeedtestSource) -> Self {
         OoklaProvider {
             client: super::build_client(&source),
