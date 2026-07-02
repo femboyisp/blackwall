@@ -13,4 +13,4 @@ pub use detector::{AttackKind, Detection, DetectionEvent, Detector, Severity, Th
 pub use error::FlowError;
 pub use observation::FlowObservation;
 pub use sflow::decode_datagram;
-pub use sink::{LogSink, MitigationSink};
+pub use sink::{ChannelSink, FanoutSink, LogSink, MitigationSink};

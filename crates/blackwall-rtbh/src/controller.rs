@@ -199,6 +199,32 @@ impl RtbhController {
             .collect()
     }
 
+    /// Whether `target` falls inside a configured eligible prefix.
+    ///
+    /// Pure accessor over [`RtbhConfig::eligible_prefixes`]; lets a caller
+    /// (e.g. the manager) classify a rejected `manual_add`/`resume` without
+    /// duplicating the controller's eligibility logic.
+    #[must_use]
+    pub fn is_eligible(&self, target: IpAddr) -> bool {
+        self.config
+            .eligible_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+    }
+
+    /// Whether a next-hop is configured for `target`'s address family.
+    ///
+    /// Pure accessor over [`RtbhConfig::next_hop_v4`] / `next_hop_v6`; lets a
+    /// caller classify a rejected `manual_add`/`resume` without duplicating
+    /// the controller's routing logic.
+    #[must_use]
+    pub fn has_next_hop(&self, target: IpAddr) -> bool {
+        match target {
+            IpAddr::V4(_) => self.config.next_hop_v4.is_some(),
+            IpAddr::V6(_) => self.config.next_hop_v6.is_some(),
+        }
+    }
+
     fn request_clear(&mut self, target: IpAddr, now: u64) -> Vec<RtbhAction> {
         let hold_ms = u64::try_from(self.config.hold_down.as_millis()).unwrap_or(u64::MAX);
         match self.active.get_mut(&target) {
@@ -598,5 +624,19 @@ mod tests {
         // counts against the cap
         assert_eq!(c.manual_add(ip("203.0.113.6"), 0).len(), 1);
         assert!(c.manual_add(ip("203.0.113.7"), 0).is_empty(), "at cap");
+    }
+
+    #[test]
+    fn is_eligible_checks_configured_prefixes() {
+        let c = RtbhController::new(cfg());
+        assert!(c.is_eligible(ip("203.0.113.7")));
+        assert!(!c.is_eligible(ip("198.51.100.7")));
+    }
+
+    #[test]
+    fn has_next_hop_checks_family() {
+        let c = RtbhController::new(cfg()); // v4 next-hop set, v6 not
+        assert!(c.has_next_hop(ip("203.0.113.7")));
+        assert!(!c.has_next_hop(ip("2001:db8::7")));
     }
 }

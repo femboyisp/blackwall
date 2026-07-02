@@ -45,4 +45,6 @@ pub struct Policy {
     pub banner_flux: Option<crate::BannerFluxConfig>,
     /// DNS fast-flux config (rotate a name's records over time); `None` disables it.
     pub dns_flux: Option<crate::DnsFluxConfig>,
+    /// RTBH control-plane config (`rtbh` directive); `None` disables RTBH.
+    pub rtbh: Option<crate::RtbhPolicy>,
 }

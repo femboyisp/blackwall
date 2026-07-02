@@ -84,6 +84,7 @@ async fn serves_deception_banner() {
         shaping: Vec::new(),
         banner_flux: None,
         dns_flux: None,
+        rtbh: None,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
@@ -133,6 +134,7 @@ async fn serves_deception_under_load() {
         shaping: Vec::new(),
         banner_flux: None,
         dns_flux: None,
+        rtbh: None,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000

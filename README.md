@@ -64,7 +64,32 @@ tenant acme {
     allow tcp 443 incus:web01     # real service -> forwarded to a container
     allow udp 53  incus:dns01
 }
+
+# RTBH: announce /32 (/128) blackholes for detected/operator-flagged attacks over iBGP.
+# Eligibility reuses the prefixes above (only your own space is ever blackholed).
+rtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 \
+     next-hop-v4=192.0.2.1 max=256 hold-down=60s ttl=2h
 ```
+
+### RTBH operator commands
+
+With an `rtbh` block configured, `blackwalld flow` auto-blackholes detected volumetric
+attacks through the BGP speaker and persists them (re-announced on restart). An operator can
+also drive blackholes manually — these are recorded to Postgres and applied by the running
+daemon (a one-shot CLI can't hold an iBGP route itself):
+
+```bash
+blackwalld rtbh add 203.0.113.7        # queue a manual blackhole (rejected if outside your prefixes)
+blackwalld rtbh remove 203.0.113.7     # release it
+blackwalld rtbh list                   # active blackholes (target, origin, age)
+blackwalld rtbh list --requests        # the operator-intent log with per-request status
+```
+
+> **Ops note:** Postgres is the RTBH authorization boundary — anyone who can write
+> `rtbh_requests` can null-route any IP in your prefixes. Give the CLI a least-privilege DB role
+> (INSERT on `rtbh_requests`, SELECT on the RTBH tables) distinct from the daemon's role, and set
+> `--operator` (or rely on `$USER@host`) so `created_by` attributes each request. BGP transport
+> security (TCP-MD5/GTSM) is not yet implemented — run the session over a trusted peering link.
 
 ## Build & run
 
@@ -123,7 +148,7 @@ Current scenarios (each a CI gate):
 | `deception-nft` | The real nftables ruleset classifies a scanner's TCP connection to a non-real port, **TPROXY**-redirects it to the deception engine, and the SSH emulator answers an `SSH-2.0` banner — the full data path end to end. |
 | `trafficgen-foundation` | A Rust generator floods the victim with the full DDoS pattern set (UDP/SYN/reflection/malformed + benign) over **AF_PACKET**; the victim's per-flow sink + `/proc/net/dev` counters classify delivery and gate fidelity, benign-survival, and measurement-consistency. |
 | `deception-resilience` | A connection flood past the deception engine's `max_concurrent` cap proves its DDoS-defense is correct — drop-at-cap is enforced, legit deception still gets `SSH-2.0`, and the engine survives. A **resilience/correctness** gate, not a throughput benchmark (realistic-scale stress needs kernel-bypass, tracked separately). |
-| `rtbh-bird` | A synthetic attack detection drives the RTBH sink to announce a `/32` blackhole (community `65535:666`, RFC 7999) via the native BGP speaker; real **BIRD2** must show the route carrying that community — the detection→mitigation (D→C) loop end to end. |
+| `rtbh-bird` | The `RtbhManager` announces both an auto-detected and an operator-manual `/32` blackhole (community `65535:666`, RFC 7999) via the native BGP speaker; real **BIRD2** must show both routes carrying that community — the detection→mitigation (D→C) loop, auto and manual, end to end. |
 
 The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
 renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is
@@ -147,7 +172,7 @@ generation to exercise the XDP/eBPF data plane.
 | `blackwall-dns` | RFC 2136 + TSIG DNS fast-flux against a Knot primary. |
 | `blackwall-flow` | sFlow v5 decode + sliding-window volumetric attack detection (sub-project D). |
 | `blackwall-bgp` | Byte-exact BGP codec + injection-only iBGP speaker (sub-project C). |
-| `blackwall-rtbh` | RTBH controller + `MitigationSink` — detected attacks → BGP blackhole announcements (sub-project C). |
+| `blackwall-rtbh` | RTBH controller + single-owner `RtbhManager` — detected/operator attacks → BGP blackhole announcements, persisted and re-announced on restart (sub-project C). |
 | `blackwall-lab` | netns integration-test lab harness (`lab` CLI) — see below. |
 | `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`, `run`, `flow`, …). |
 
