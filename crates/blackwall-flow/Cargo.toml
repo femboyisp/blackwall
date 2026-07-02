@@ -10,7 +10,7 @@ thiserror = { workspace = true }
 ipnet = { workspace = true }
 etherparse = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["time", "net"] }
+tokio = { workspace = true, features = ["time", "net", "sync"] }
 async-trait = { workspace = true }
 
 [dev-dependencies]
