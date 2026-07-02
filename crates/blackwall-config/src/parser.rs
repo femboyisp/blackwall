@@ -199,6 +199,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         shaping,
         banner_flux,
         dns_flux,
+        rtbh: None,
     })
 }
 

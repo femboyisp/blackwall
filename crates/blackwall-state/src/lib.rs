@@ -487,6 +487,7 @@ mod tests {
             shaping: Vec::new(),
             banner_flux: None,
             dns_flux: None,
+            rtbh: None,
         }
     }
 }

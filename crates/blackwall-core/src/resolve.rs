@@ -126,6 +126,7 @@ mod tests {
             shaping: Vec::new(),
             banner_flux: None,
             dns_flux: None,
+            rtbh: None,
         }
     }
 
@@ -260,6 +261,7 @@ mod tests {
             shaping: Vec::new(),
             banner_flux: None,
             dns_flux: None,
+            rtbh: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
