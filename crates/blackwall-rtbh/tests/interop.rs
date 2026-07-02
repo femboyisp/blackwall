@@ -32,6 +32,7 @@ async fn blackholes_a_detected_target() {
         next_hop_v6: None,
         max_blackholes: 64,
         hold_down: Duration::from_secs(0),
+        max_ttl: None,
     });
     let sink = RtbhSink::new(controller, handle);
 
