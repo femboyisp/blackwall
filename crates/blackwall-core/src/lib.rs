@@ -1,6 +1,7 @@
 //! Shared domain types and the policy model for Blackwall.
 
 mod dns;
+mod flowspec;
 mod flux;
 mod policy;
 mod port;
@@ -11,6 +12,7 @@ mod shape;
 mod target;
 
 pub use dns::DnsFluxConfig;
+pub use flowspec::FlowSpecPolicy;
 pub use flux::BannerFluxConfig;
 pub use policy::{AllowRule, Policy, Tenant};
 pub use port::PortState;

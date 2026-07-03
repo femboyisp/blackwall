@@ -29,7 +29,7 @@ pub struct Tenant {
 }
 
 /// The complete desired firewall policy parsed from config.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
     /// The uplink interface Blackwall manages (e.g. `eth0`).
     pub interface: String,
@@ -47,4 +47,6 @@ pub struct Policy {
     pub dns_flux: Option<crate::DnsFluxConfig>,
     /// RTBH control-plane config (`rtbh` directive); `None` disables RTBH.
     pub rtbh: Option<crate::RtbhPolicy>,
+    /// FlowSpec auto-mitigation policy; `None` disables FlowSpec (RTBH-only).
+    pub flowspec: Option<crate::FlowSpecPolicy>,
 }

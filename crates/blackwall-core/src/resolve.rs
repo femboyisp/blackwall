@@ -127,6 +127,7 @@ mod tests {
             banner_flux: None,
             dns_flux: None,
             rtbh: None,
+            flowspec: None,
         }
     }
 
@@ -262,6 +263,7 @@ mod tests {
             banner_flux: None,
             dns_flux: None,
             rtbh: None,
+            flowspec: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
