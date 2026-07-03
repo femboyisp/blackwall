@@ -13,32 +13,34 @@ use std::net::IpAddr;
 // ── Path-attribute flag/type constants ──────────────────────────────────────
 
 /// Well-known mandatory flag (Transitive, not Optional).
-const FLAG_WELL_KNOWN: u8 = 0x40;
+pub(crate) const FLAG_WELL_KNOWN: u8 = 0x40;
 /// Optional transitive flag.
-const FLAG_OPT_TRANS: u8 = 0xC0;
+pub(crate) const FLAG_OPT_TRANS: u8 = 0xC0;
 /// Optional non-transitive flag (used for MP_REACH/MP_UNREACH_NLRI per RFC 4760).
-const FLAG_OPT_NON_TRANS: u8 = 0x80;
+pub(crate) const FLAG_OPT_NON_TRANS: u8 = 0x80;
 /// Extended-Length attribute flag bit (RFC 4271 §4.3): when set, the length
 /// field is two octets instead of one.
 const FLAG_EXTENDED_LEN: u8 = 0x10;
 
 /// ORIGIN attribute type code.
-const ATTR_ORIGIN: u8 = 1;
+pub(crate) const ATTR_ORIGIN: u8 = 1;
 /// AS_PATH attribute type code.
-const ATTR_AS_PATH: u8 = 2;
+pub(crate) const ATTR_AS_PATH: u8 = 2;
 /// NEXT_HOP attribute type code (IPv4 only).
 const ATTR_NEXT_HOP: u8 = 3;
 /// COMMUNITIES attribute type code (RFC 1997).
 const ATTR_COMMUNITIES: u8 = 8;
 /// MP_REACH_NLRI attribute type code (RFC 4760).
-const ATTR_MP_REACH_NLRI: u8 = 14;
+pub(crate) const ATTR_MP_REACH_NLRI: u8 = 14;
 /// MP_UNREACH_NLRI attribute type code (RFC 4760).
-const ATTR_MP_UNREACH_NLRI: u8 = 15;
+pub(crate) const ATTR_MP_UNREACH_NLRI: u8 = 15;
+/// EXTENDED_COMMUNITIES attribute type code (RFC 4360).
+pub(crate) const ATTR_EXTENDED_COMMUNITIES: u8 = 16;
 /// LARGE_COMMUNITIES attribute type code (RFC 8092).
 const ATTR_LARGE_COMMUNITIES: u8 = 32;
 
 /// AFI for IPv6 Unicast (RFC 4760).
-const AFI_IPV6: u16 = 2;
+pub(crate) const AFI_IPV6: u16 = 2;
 /// SAFI for Unicast.
 const SAFI_UNICAST: u8 = 1;
 
@@ -71,7 +73,7 @@ pub(crate) fn encode_nlri(prefix: &IpNet) -> Vec<u8> {
 
 /// Append a path attribute to `buf`, choosing the one-byte or two-byte
 /// (extended-length, RFC 4271 §4.3) length form based on the value size.
-fn push_attr(buf: &mut Vec<u8>, flags: u8, type_code: u8, value: &[u8]) {
+pub(crate) fn push_attr(buf: &mut Vec<u8>, flags: u8, type_code: u8, value: &[u8]) {
     if let Ok(len) = u8::try_from(value.len()) {
         buf.push(flags);
         buf.push(type_code);

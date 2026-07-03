@@ -21,8 +21,9 @@
 //! 7. On any error: drain pending commands, log, sleep 5 s, restart.
 
 use crate::{
-    build_announce, build_withdraw, decode_message, encode_keepalive, encode_notification,
-    encode_open, parse_header, BgpMessage, NotificationMsg, OpenMsg, Route, HEADER_LEN,
+    build_announce, build_flowspec_announce, build_flowspec_withdraw, build_withdraw,
+    decode_message, encode_keepalive, encode_notification, encode_open, parse_header, BgpMessage,
+    FlowSpecRule, NotificationMsg, OpenMsg, Route, HEADER_LEN,
 };
 use ipnet::IpNet;
 use std::{
@@ -103,6 +104,11 @@ pub enum SessionCommand {
     Announce(Route),
     /// Withdraw a previously-announced prefix.
     Withdraw(IpNet),
+    /// Announce a FlowSpec rule; replaces any existing entry with the same
+    /// encoded NLRI.
+    AnnounceFlowSpec(FlowSpecRule),
+    /// Withdraw a previously-announced FlowSpec rule.
+    WithdrawFlowSpec(FlowSpecRule),
 }
 
 /// A handle to a running BGP session for injecting routes.
@@ -147,6 +153,40 @@ impl BgpHandle {
                 BgpSendError
             })
     }
+
+    /// Announce a FlowSpec rule to the BGP peer.
+    ///
+    /// The rule is stored in the session's active FlowSpec set and
+    /// re-announced on reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BgpSendError`] if the session task has exited (the rule is
+    /// not queued). The caller should treat this as a failed announce.
+    pub async fn announce_flowspec(&self, rule: FlowSpecRule) -> Result<(), BgpSendError> {
+        self.tx
+            .send(SessionCommand::AnnounceFlowSpec(rule))
+            .await
+            .map_err(|_| {
+                warn!("BGP FlowSpec announce dropped: session task not running");
+                BgpSendError
+            })
+    }
+
+    /// Withdraw a previously-announced FlowSpec rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BgpSendError`] if the session task has exited.
+    pub async fn withdraw_flowspec(&self, rule: FlowSpecRule) -> Result<(), BgpSendError> {
+        self.tx
+            .send(SessionCommand::WithdrawFlowSpec(rule))
+            .await
+            .map_err(|_| {
+                warn!("BGP FlowSpec withdraw dropped: session task not running");
+                BgpSendError
+            })
+    }
 }
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
@@ -179,9 +219,10 @@ pub fn spawn(cfg: PeerConfig) -> Result<(BgpHandle, tokio::task::JoinHandle<()>)
 /// successful session establishment.
 pub async fn run(cfg: PeerConfig, mut commands: mpsc::Receiver<SessionCommand>) {
     let mut active: HashMap<IpNet, Route> = HashMap::new();
+    let mut active_flowspec: HashMap<Vec<u8>, FlowSpecRule> = HashMap::new();
 
     loop {
-        let outcome = session_once(&cfg, &mut commands, &mut active).await;
+        let outcome = session_once(&cfg, &mut commands, &mut active, &mut active_flowspec).await;
         match outcome {
             SessionOutcome::Reconnect(msg) => {
                 info!(peer = %cfg.peer_addr, "{msg}; reconnecting in 5 s");
@@ -195,7 +236,7 @@ pub async fn run(cfg: PeerConfig, mut commands: mpsc::Receiver<SessionCommand>) 
             }
         }
         // Drain any queued commands before sleeping (keeps active in sync).
-        drain_commands(&mut commands, &mut active);
+        drain_commands(&mut commands, &mut active, &mut active_flowspec);
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -221,6 +262,7 @@ const READ_BUF_LIMIT: usize = 65536;
 fn drain_commands(
     commands: &mut mpsc::Receiver<SessionCommand>,
     active: &mut HashMap<IpNet, Route>,
+    active_flowspec: &mut HashMap<Vec<u8>, FlowSpecRule>,
 ) {
     loop {
         match commands.try_recv() {
@@ -230,6 +272,14 @@ fn drain_commands(
             }
             Ok(SessionCommand::Withdraw(prefix)) => {
                 active.remove(&prefix);
+            }
+            Ok(SessionCommand::AnnounceFlowSpec(rule)) => {
+                let key = crate::flowspec::encode_flowspec_nlri(&rule);
+                active_flowspec.insert(key, rule);
+            }
+            Ok(SessionCommand::WithdrawFlowSpec(rule)) => {
+                let key = crate::flowspec::encode_flowspec_nlri(&rule);
+                active_flowspec.remove(&key);
             }
             Err(_) => break,
         }
@@ -244,6 +294,7 @@ async fn session_once(
     cfg: &PeerConfig,
     commands: &mut mpsc::Receiver<SessionCommand>,
     active: &mut HashMap<IpNet, Route>,
+    active_flowspec: &mut HashMap<Vec<u8>, FlowSpecRule>,
 ) -> SessionOutcome {
     // ── 1. TCP connect ──────────────────────────────────────────────────────
     let mut stream = match TcpStream::connect(cfg.peer_addr).await {
@@ -261,6 +312,8 @@ async fn session_once(
         router_id: u32::from(cfg.router_id),
         ipv4_unicast: true,
         ipv6_unicast: true,
+        flowspec_v4: true,
+        flowspec_v6: true,
     };
     let open_bytes = encode_open(&local_open);
     if let Err(e) = stream.write_all(&open_bytes).await {
@@ -426,8 +479,31 @@ async fn session_once(
         debug!(peer = %cfg.peer_addr, count = active.len(), "re-announced active routes");
     }
 
+    for rule in active_flowspec.values() {
+        let pkt = build_flowspec_announce(rule);
+        if let Err(e) = stream.write_all(&pkt).await {
+            return SessionOutcome::Reconnect(format!("FlowSpec re-announce write failed: {e}"));
+        }
+    }
+    if !active_flowspec.is_empty() {
+        debug!(
+            peer = %cfg.peer_addr,
+            count = active_flowspec.len(),
+            "re-announced active FlowSpec rules"
+        );
+    }
+
     // ── 6. Established event loop ───────────────────────────────────────────
-    established_loop(cfg, commands, active, &mut stream, &mut buf, hold_secs).await
+    established_loop(
+        cfg,
+        commands,
+        active,
+        active_flowspec,
+        &mut stream,
+        &mut buf,
+        hold_secs,
+    )
+    .await
 }
 
 /// Wait for the peer to confirm our OPEN with a KEEPALIVE (or UPDATE), per
@@ -524,6 +600,7 @@ async fn established_loop(
     cfg: &PeerConfig,
     commands: &mut mpsc::Receiver<SessionCommand>,
     active: &mut HashMap<IpNet, Route>,
+    active_flowspec: &mut HashMap<Vec<u8>, FlowSpecRule>,
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
     hold_secs: u16,
@@ -686,6 +763,28 @@ async fn established_loop(
                             );
                         }
                         debug!(peer = %cfg.peer_addr, %prefix, "withdrawn");
+                    }
+                    Some(SessionCommand::AnnounceFlowSpec(rule)) => {
+                        let key = crate::flowspec::encode_flowspec_nlri(&rule);
+                        let pkt = build_flowspec_announce(&rule);
+                        active_flowspec.insert(key, rule);
+                        if let Err(e) = stream.write_all(&pkt).await {
+                            return SessionOutcome::Reconnect(
+                                format!("FlowSpec announce write failed: {e}")
+                            );
+                        }
+                        debug!(peer = %cfg.peer_addr, "FlowSpec rule announced");
+                    }
+                    Some(SessionCommand::WithdrawFlowSpec(rule)) => {
+                        let key = crate::flowspec::encode_flowspec_nlri(&rule);
+                        active_flowspec.remove(&key);
+                        let pkt = build_flowspec_withdraw(&rule);
+                        if let Err(e) = stream.write_all(&pkt).await {
+                            return SessionOutcome::Reconnect(
+                                format!("FlowSpec withdraw write failed: {e}")
+                            );
+                        }
+                        debug!(peer = %cfg.peer_addr, "FlowSpec rule withdrawn");
                     }
                 }
             }

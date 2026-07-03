@@ -1,0 +1,32 @@
+// FlowSpec gate: a native BGP speaker announces a FlowSpec rule (RFC 8955)
+// over an iBGP session to a real BIRD2 peer configured with `flow4`/`flow6`
+// channels; BIRD must show the rule in `flow4` — the whole codec + session
+// path validated end to end against real BIRD.
+//
+// Validation gotcha (RFC 8955 §6): BIRD only accepts a FlowSpec rule whose
+// destination is covered by a route in the unicast table from the *same*
+// origin AS ("safe update" check). A bare flow4-only announce with no
+// covering unicast route gets filtered as invalid. Resolved by having the
+// interop driver announce a covering unicast route (203.0.113.0/24 via
+// 10.0.0.1, our peer's own address) over the same session before the
+// FlowSpec rule, so BIRD's validator finds a same-peer covering route.
+topology "flowspec-bird" {
+    node "peer" {
+        daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes" flowspec="yes"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="cargo test --offline -p blackwall-bgp --test flowspec_interop -- --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "flowspec-reaches-bird" {
+    step wait   node="peer" until="bgp-established" timeout="20s"
+    // Assert the FULL flow-scoped rule reached BIRD (dst + the numeric-op-encoded
+    // proto + dport), not just the destination prefix — this is what distinguishes
+    // FlowSpec from RTBH's whole-IP blackhole. BIRD 2.17 renders it as:
+    //   flow4 { dst 203.0.113.7/32; proto 17; dport 53; }
+    step assert node="peer" cmd="birdc show route table flow4tab" contains="dst 203.0.113.7/32; proto 17; dport 53" timeout="15s"
+}
