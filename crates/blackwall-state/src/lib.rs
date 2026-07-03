@@ -1165,9 +1165,9 @@ mod tests {
             .open_detection(&sample_detection(t, 1_000, 1_000))
             .await
             .expect("open");
-        // `>=` (not `==`): other tests share the `detections` table and may
-        // insert concurrently; our own insert must have raised the count by ≥1.
-        assert!(store.detection_count().await.expect("count") >= before + 1);
+        // `> before` (not `== before + 1`): other tests share the `detections`
+        // table and may insert concurrently; our own insert must have raised it.
+        assert!(store.detection_count().await.expect("count") > before);
     }
 
     #[tokio::test]
