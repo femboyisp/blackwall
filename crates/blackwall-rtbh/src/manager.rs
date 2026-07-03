@@ -22,6 +22,10 @@ pub trait BgpExecutor: Send + Sync {
     async fn announce(&self, route: Route) -> Result<(), BgpError>;
     /// Withdraw a previously-announced blackhole prefix.
     async fn withdraw(&self, prefix: IpNet) -> Result<(), BgpError>;
+    /// Announce a FlowSpec traffic-filter rule.
+    async fn announce_flowspec(&self, rule: blackwall_bgp::FlowSpecRule) -> Result<(), BgpError>;
+    /// Withdraw a previously-announced FlowSpec rule.
+    async fn withdraw_flowspec(&self, rule: blackwall_bgp::FlowSpecRule) -> Result<(), BgpError>;
 }
 
 /// Mirrors blackhole state into persistent storage.
@@ -399,6 +403,28 @@ mod tests {
                 return Err(BgpError);
             }
             self.withdrawn.lock().unwrap().push(prefix);
+            Ok(())
+        }
+        // RtbhManager never calls the FlowSpec side of BgpExecutor; these two
+        // arms exist only so this fake still implements the (now-shared)
+        // trait. FlowSpecManager's own tests exercise a dedicated fake that
+        // records these calls.
+        async fn announce_flowspec(
+            &self,
+            _rule: blackwall_bgp::FlowSpecRule,
+        ) -> Result<(), BgpError> {
+            if self.fail {
+                return Err(BgpError);
+            }
+            Ok(())
+        }
+        async fn withdraw_flowspec(
+            &self,
+            _rule: blackwall_bgp::FlowSpecRule,
+        ) -> Result<(), BgpError> {
+            if self.fail {
+                return Err(BgpError);
+            }
             Ok(())
         }
     }
