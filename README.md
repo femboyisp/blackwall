@@ -130,6 +130,7 @@ self-cleans on any exit.
 
 ```bash
 cargo build -p blackwall-lab
+scripts/build-lab-tests.sh                                                # build the interop drivers the gates run
 sudo ./target/debug/lab test crates/blackwall-lab/scenarios/bgp-bird.kdl   # one scenario
 sudo ./target/debug/lab up   crates/blackwall-lab/scenarios/dns-knot.kdl   # leave it standing
 sudo ./target/debug/lab shell crates/blackwall-lab/scenarios/dns-knot.kdl ns   # poke at a node

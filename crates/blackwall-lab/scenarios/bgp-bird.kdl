@@ -6,7 +6,7 @@ topology "bgp-bird" {
     }
     node "speaker" {
         run "speaker" \
-            cmd="cargo test --offline -p blackwall-bgp --test interop -- announces_a_host_route --ignored --nocapture" \
+            cmd="target/debug/lab-tests/blackwall-bgp-interop announces_a_host_route --ignored --nocapture" \
             env="BW_BGP_PEER={peer.addr}:179 BW_BGP_ASN=214806"
     }
     link "peer" "speaker" subnet="10.0.0.0/30"

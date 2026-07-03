@@ -16,7 +16,7 @@ topology "flowspec-bird" {
     }
     node "speaker" {
         run "speaker" \
-            cmd="cargo test --offline -p blackwall-bgp --test flowspec_interop -- --ignored --nocapture" \
+            cmd="target/debug/lab-tests/blackwall-bgp-flowspec_interop --ignored --nocapture" \
             env="BW_BGP_PEER={peer.addr}:179"
     }
     link "peer" "speaker" subnet="10.0.0.0/30"

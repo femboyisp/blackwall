@@ -283,6 +283,18 @@ pub(crate) fn spawn_run(
     cmd: &str,
     env_resolved: &[(String, String)],
 ) -> Result<Child, LabError> {
+    // Preflight: gates run a pre-built interop binary under `target/debug/
+    // lab-tests/` (built by `scripts/build-lab-tests.sh`, not `cargo test` in
+    // the netns — blackwall#88). If it is missing, fail with a clear pointer
+    // instead of an opaque "No such file" from the spawned shell.
+    if let Some(bin) = cmd.split_whitespace().next() {
+        if bin.starts_with("target/debug/lab-tests/") && !std::path::Path::new(bin).exists() {
+            return Err(LabError::Exec(format!(
+                "lab-test binary `{bin}` is missing; run `scripts/build-lab-tests.sh` first"
+            )));
+        }
+    }
+
     let dir = format!("/run/blackwall-lab/{run_id}/{name}");
     std::fs::create_dir_all(&dir).map_err(|e| LabError::Exec(format!("mkdir {dir}: {e}")))?;
     let log = std::fs::File::create(format!("{dir}/run.log"))

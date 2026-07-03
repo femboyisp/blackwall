@@ -3,7 +3,7 @@
 topology "shaper-cake" {
     node "shaper" {
         run "apply" \
-            cmd="cargo test --offline -p blackwall-shaper --test interop -- applies_cake --ignored --nocapture" \
+            cmd="target/debug/lab-tests/blackwall-shaper-interop applies_cake --ignored --nocapture" \
             env="BW_SHAPE_DOWN=100 BW_SHAPE_UP=50"
     }
     node "sink"

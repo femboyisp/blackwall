@@ -8,7 +8,7 @@ topology "rtbh-bird" {
     }
     node "speaker" {
         run "speaker" \
-            cmd="cargo test --offline -p blackwall-rtbh --test interop -- blackholes_a_detected_target --ignored --nocapture" \
+            cmd="target/debug/lab-tests/blackwall-rtbh-interop blackholes_a_detected_target --ignored --nocapture" \
             env="BW_BGP_PEER={peer.addr}:179"
     }
     link "peer" "speaker" subnet="10.0.0.0/30"
