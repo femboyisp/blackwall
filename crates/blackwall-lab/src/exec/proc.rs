@@ -130,11 +130,25 @@ pub(crate) fn spawn_bird(
     let ctl = bird_ctl(run_id, node);
     let pid_path = format!("{dir}/{node}.pid");
 
+    // Redirect stdio to a log file so neither the launcher nor the daemonized
+    // BIRD it forks inherits and holds the lab's (and thus the CI step's)
+    // stdout pipe open. Otherwise, if the lab process is killed (e.g. by CI's
+    // per-gate `timeout`) before teardown runs, an orphaned BIRD keeps that
+    // pipe open and the runner hangs until the job cap (blackwall#88). Every
+    // other daemon spawn (knotd, hsflowd, run) already does this.
+    let log = std::fs::File::create(format!("{dir}/{node}-bird.log"))
+        .map_err(|e| LabError::Exec(format!("create bird log: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| LabError::Exec(format!("clone bird log handle: {e}")))?;
+
     // Launch BIRD in the background; it daemonizes itself.
     let status = Command::new("ip")
         .args([
             "netns", "exec", ns, "bird", "-c", &conf_path, "-s", &ctl, "-P", &pid_path,
         ])
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .status()
         .map_err(|e| LabError::Exec(format!("spawn bird in {ns}: {e}")))?;
 
