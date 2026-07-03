@@ -1,0 +1,36 @@
+// FlowSpec-auto gate: the pure concentration-based selector (`select()`) picks
+// FlowSpec vs RTBH per detection, and the chosen manager announces it over a
+// real iBGP session to a real BIRD2 peer — proving the auto-mitigation path
+// end to end: a concentrated detection becomes a FlowSpec drop rule; a
+// diffuse detection becomes an RTBH /32 blackhole. Mirrors flowspec-bird.kdl
+// and rtbh-bird.kdl, combined behind the selector.
+//
+// Validation gotcha (RFC 8955 §6, same as flowspec-bird.kdl): BIRD only
+// accepts a FlowSpec rule whose destination is covered by a route in the
+// unicast table from the same origin AS ("safe update" check). Resolved by
+// having the interop driver announce a covering unicast route
+// (203.0.113.0/24 via 10.0.0.1) over the same session before either
+// mitigation.
+topology "flowspec-auto-bird" {
+    node "peer" {
+        daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes" flowspec="yes"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="cargo test --offline -p blackwall-rtbh --test flowspec_auto_interop -- --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "flowspec-auto-reaches-bird" {
+    step wait   node="peer" until="bgp-established" timeout="20s"
+    // Concentrated detection (203.0.113.7, proto 17, dport 53 @ 95%) selects
+    // FlowSpec: BIRD must show the flow-scoped rule in flow4tab (note: `flow4`
+    // is a reserved BIRD keyword — the table is `flow4tab`).
+    step assert node="peer" cmd="birdc show route table flow4tab" contains="dst 203.0.113.7/32; proto 17; dport 53" timeout="15s"
+    // Diffuse detection (203.0.113.8, weight spread across 8 ports) selects
+    // RTBH: BIRD must show the /32 blackhole carrying the well-known
+    // blackhole community (65535,666).
+    step assert node="peer" cmd="birdc show route 203.0.113.8/32 all" contains="(65535,666)" timeout="15s"
+}
