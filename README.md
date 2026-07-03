@@ -151,6 +151,7 @@ Current scenarios (each a CI gate):
 | `deception-resilience` | A connection flood past the deception engine's `max_concurrent` cap proves its DDoS-defense is correct — drop-at-cap is enforced, legit deception still gets `SSH-2.0`, and the engine survives. A **resilience/correctness** gate, not a throughput benchmark (realistic-scale stress needs kernel-bypass, tracked separately). |
 | `rtbh-bird` | The `RtbhManager` announces both an auto-detected and an operator-manual `/32` blackhole (community `65535:666`, RFC 7999) via the native BGP speaker; real **BIRD2** must show both routes carrying that community — the detection→mitigation (D→C) loop, auto and manual, end to end. |
 | `flowspec-bird` | The native speaker injects a BGP **FlowSpec** rule (RFC 8955, SAFI 133) — *drop UDP dport 53 → 203.0.113.7/32* — over iBGP; real **BIRD2** must validate and install it into its `flow4` table with the full match (`dst 203.0.113.7/32; proto 17; dport 53`) — finer-grained mitigation than a whole-IP blackhole. |
+| `flowspec-auto-bird` | The concentration-based selector routes a synthetic detection to the right mitigation: a *concentrated* attack (one dominant port) auto-installs a FlowSpec drop rule in real **BIRD2**'s `flow4tab`, while a *diffuse* attack auto-installs an RTBH `/32` blackhole — the auto-mitigation decision (`FlowSpec` vs `RTBH`) proven end to end. |
 
 The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
 renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is
