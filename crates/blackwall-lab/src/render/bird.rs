@@ -39,6 +39,13 @@ pub fn render_bird(node: &Node, _topo: &Topology, map: &AddressMap) -> Result<St
     let import = get("import")?;
     let passive = daemon.settings.get("passive").map_or("no", String::as_str);
     let flowspec = daemon.settings.get("flowspec").is_some_and(|v| v == "yes");
+    // Optional TCP-MD5 (RFC 2385): a `password="…"` setting emits BIRD's
+    // `password` clause so the neighbor requires an authenticated session.
+    let password = daemon
+        .settings
+        .get("password")
+        .map(|p| format!("    password \"{p}\";\n"))
+        .unwrap_or_default();
     let neighbor_addr = map
         .node_primary(&neighbor_node)
         .ok_or_else(|| LabError::Plan(format!("no address for neighbor `{neighbor_node}`")))?;
@@ -80,6 +87,7 @@ protocol kernel {{\n\
 protocol bgp peer_{neighbor_node} {{\n\
     local as {local_as};\n\
     neighbor {neighbor_addr} as {neighbor_as};\n\
+{password}\
     passive {passive};\n\
     hold time 90;\n\
     keepalive time 30;\n\
@@ -173,6 +181,25 @@ protocol bgp peer_speaker {\n\
     };\n\
 }\n";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn renders_password_when_set() {
+        let mut topo = proof_topo();
+        topo.nodes[0].daemons[0]
+            .settings
+            .insert("password".to_owned(), "s3cr3t".to_owned());
+        let map = allocate(&topo).unwrap();
+        let out = render_bird(&topo.nodes[0], &topo, &map).unwrap();
+        assert!(out.contains("    password \"s3cr3t\";\n"));
+    }
+
+    #[test]
+    fn omits_password_when_unset() {
+        let topo = proof_topo();
+        let map = allocate(&topo).unwrap();
+        let out = render_bird(&topo.nodes[0], &topo, &map).unwrap();
+        assert!(!out.contains("password"));
     }
 
     #[test]
