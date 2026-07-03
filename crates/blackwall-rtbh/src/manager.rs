@@ -82,7 +82,7 @@ pub enum ApplyOutcome {
 /// on a failed first announce the controller entry is kept in memory while
 /// the route itself is never re-announced automatically. A journal failure
 /// after a successful BGP operation is logged, never causes a live
-/// blackhole to be withdrawn, and is queued as a [`MirrorOp`] for a bounded
+/// blackhole to be withdrawn, and is queued as a `MirrorOp` for a bounded
 /// self-heal retry on the next [`RtbhManager::tick`] — the BGP outcome is
 /// never re-issued, only the mirror write.
 pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
@@ -91,7 +91,7 @@ pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     journal: J,
     /// Journal writes that failed after their BGP operation already
     /// succeeded; retried (never re-issued to BGP) by
-    /// [`RtbhManager::retry_pending_mirror`] on the next tick.
+    /// `RtbhManager::retry_pending_mirror` on the next tick.
     pending_mirror: Vec<MirrorOp>,
 }
 
@@ -151,7 +151,7 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     /// execute + journal each one.
     ///
     /// Starts by retrying any journal mirror writes queued by a previous
-    /// tick's transient failure (see [`RtbhManager::retry_pending_mirror`]),
+    /// tick's transient failure (see `RtbhManager::retry_pending_mirror`),
     /// so a self-heal converges within one tick interval of the DB
     /// recovering.
     pub async fn tick(&mut self, mono_now: u64, wall_now: u64) {
