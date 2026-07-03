@@ -322,6 +322,7 @@ dependencies = [
  "blackwall-discovery",
  "blackwall-dns",
  "blackwall-flow",
+ "blackwall-metrics",
  "blackwall-nft",
  "blackwall-rtbh",
  "blackwall-shaper",
