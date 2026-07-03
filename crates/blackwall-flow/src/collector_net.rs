@@ -3,6 +3,7 @@
 
 use crate::detector::Detector;
 use crate::error::FlowError;
+use crate::metrics::CollectorMetrics;
 use crate::sflow::decode_datagram;
 use crate::sink::MitigationSink;
 use std::net::SocketAddr;
@@ -21,11 +22,16 @@ fn now_ms() -> u64 {
 /// Run the collector until the process ends. Binds `listen`, decodes each
 /// datagram into the `detector`, and every `tick_interval_ms` evaluates the
 /// window and forwards events to `sink`. Decode errors are logged and skipped.
+///
+/// When `metrics` is `Some`, the collector increments `datagrams` per received
+/// datagram and `decode_errors` per decode failure, for the `/metrics`
+/// endpoint. Callers with no metrics endpoint pass `None`.
 pub async fn run_collector(
     listen: SocketAddr,
     mut detector: Box<dyn Detector + Send>,
     sink: Arc<dyn MitigationSink>,
     tick_interval_ms: u64,
+    metrics: Option<Arc<CollectorMetrics>>,
 ) -> Result<(), FlowError> {
     let sock = UdpSocket::bind(listen)
         .await
@@ -36,13 +42,19 @@ pub async fn run_collector(
         tokio::select! {
             recv = sock.recv_from(&mut buf) => {
                 match recv {
-                    Ok((n, _from)) => match decode_datagram(&buf[..n]) {
-                        Ok(observations) => {
-                            let t = now_ms();
-                            for o in &observations { detector.observe(o, t); }
+                    Ok((n, _from)) => {
+                        if let Some(m) = &metrics { m.incr_datagrams(); }
+                        match decode_datagram(&buf[..n]) {
+                            Ok(observations) => {
+                                let t = now_ms();
+                                for o in &observations { detector.observe(o, t); }
+                            }
+                            Err(err) => {
+                                if let Some(m) = &metrics { m.incr_decode_errors(); }
+                                tracing::debug!(%err, "sflow decode failed; skipping datagram");
+                            }
                         }
-                        Err(err) => tracing::debug!(%err, "sflow decode failed; skipping datagram"),
-                    },
+                    }
                     Err(err) => tracing::warn!(%err, "udp recv error"),
                 }
             }
