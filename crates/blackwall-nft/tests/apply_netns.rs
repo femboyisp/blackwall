@@ -27,6 +27,7 @@ fn sample() -> Policy {
         dns_flux: None,
         rtbh: None,
         flowspec: None,
+        metrics_listen: None,
     }
 }
 
@@ -77,6 +78,7 @@ fn stale_set_elements_removed_on_second_apply() {
         dns_flux: None,
         rtbh: None,
         flowspec: None,
+        metrics_listen: None,
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 
