@@ -254,6 +254,24 @@ impl FlowSpecController {
             .collect()
     }
 
+    /// Re-assert every active rule for `target` without re-announcing.
+    ///
+    /// Used for [`blackwall_flow::FlowMitigationEvent::Update`], which reports that
+    /// an attack is still ongoing but (unlike `Open`) carries no rule list to
+    /// re-install. Cancels any pending deferred clear and refreshes the TTL
+    /// anchor on every active rule of `target`'s host route, mirroring the
+    /// re-assertion branch of [`Self::insert_rule`] — but for rules already known
+    /// to the controller, so no BGP re-announce or journal write is needed.
+    pub fn refresh_target(&mut self, target: IpAddr, now: u64) {
+        let host = host_prefix(target);
+        for (key, entry) in &mut self.active {
+            if key.0 == host {
+                entry.clear_requested_at = None;
+                entry.last_activity = now;
+            }
+        }
+    }
+
     /// Whether `target`'s host route falls inside a configured eligible prefix.
     ///
     /// Pure accessor over [`FlowSpecConfig::eligible_prefixes`]; lets a caller
@@ -306,7 +324,7 @@ impl FlowSpecController {
 }
 
 /// Derive the `FlowKey` a rule is stored/looked-up under.
-fn key_of(rule: &FlowSpecRule) -> FlowKey {
+pub(crate) fn key_of(rule: &FlowSpecRule) -> FlowKey {
     (
         rule.dst,
         rule.protocol.unwrap_or(0),
@@ -558,6 +576,33 @@ mod tests {
             panic!("expected Announce")
         };
         assert_eq!(r.dst, net("2001:db8::7/128"));
+    }
+
+    #[test]
+    fn refresh_target_cancels_pending_clear_and_survives_tick() {
+        let mut c = FlowSpecController::new(cfg()); // 10s hold-down
+        c.install(ip("203.0.113.7"), &[(17, 53, 1.0)], 0);
+        assert!(c.clear_target(ip("203.0.113.7"), 5_000).is_empty());
+        c.refresh_target(ip("203.0.113.7"), 6_000);
+        assert!(
+            c.tick(10_000).is_empty(),
+            "refresh_target cancelled the deferred withdraw"
+        );
+        assert_eq!(c.active_rules().len(), 1);
+    }
+
+    #[test]
+    fn refresh_target_does_not_affect_other_targets() {
+        let mut c = FlowSpecController::new(cfg());
+        c.install(ip("203.0.113.7"), &[(17, 53, 1.0)], 0);
+        c.install(ip("203.0.113.8"), &[(17, 53, 1.0)], 0);
+        assert!(c.clear_target(ip("203.0.113.7"), 5_000).is_empty());
+        assert!(c.clear_target(ip("203.0.113.8"), 5_000).is_empty());
+        c.refresh_target(ip("203.0.113.7"), 6_000);
+        // only .7 was refreshed; .8's deferred clear still fires at hold-down.
+        let actions = c.tick(10_000);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(c.active_rules().len(), 1);
     }
 
     #[test]
