@@ -18,7 +18,8 @@
 //! 5. Re-announce the full `active` set.
 //! 6. `tokio::select!` over keepalive interval / hold timeout / socket
 //!    readable / command channel.
-//! 7. On any error: drain pending commands, log, sleep 5 s, restart.
+//! 7. On any error: drain pending commands, log, back off (exponential),
+//!    restart.
 
 use crate::{
     build_announce, build_flowspec_announce, build_flowspec_withdraw, build_withdraw,
@@ -26,15 +27,21 @@ use crate::{
     FlowSpecRule, NotificationMsg, OpenMsg, Route, HEADER_LEN,
 };
 use ipnet::IpNet;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashMap,
-    future,
+    future, io,
     net::{Ipv4Addr, SocketAddr},
+    os::unix::io::AsRawFd,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
@@ -54,6 +61,10 @@ pub struct PeerConfig {
     pub router_id: Ipv4Addr,
     /// Proposed hold time in seconds (0 = no hold timer; otherwise ≥ 3).
     pub hold_time: u16,
+    /// Optional TCP-MD5 (RFC 2385) shared secret. When `Some`, the session
+    /// installs the key via `setsockopt(TCP_MD5SIG)` before connecting, so the
+    /// TCP connection itself is authenticated. `None` connects in the clear.
+    pub md5: Option<String>,
 }
 
 /// A `PeerConfig` that cannot form a valid iBGP session.
@@ -111,15 +122,52 @@ pub enum SessionCommand {
     WithdrawFlowSpec(FlowSpecRule),
 }
 
+/// The observable state of a BGP session.
+///
+/// Published on a [`tokio::sync::watch`] channel (see [`BgpHandle::state_watch`])
+/// so a supervisor can react when the session leaves [`SessionState::Established`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    /// No session is running — the command channel closed and the task exited.
+    Idle,
+    /// (Re)connecting: TCP connect plus the OPEN handshake, including the
+    /// exponential backoff between reconnect attempts.
+    Connecting,
+    /// Established: the OPEN handshake completed and routes are being exchanged.
+    Established,
+}
+
 /// A handle to a running BGP session for injecting routes.
 ///
-/// Cheaply cloneable; all clones share the same channel.
+/// Cheaply cloneable; all clones share the same channel and observe the same
+/// session state.
 #[derive(Clone)]
 pub struct BgpHandle {
     tx: mpsc::Sender<SessionCommand>,
+    state: watch::Receiver<SessionState>,
+    reconnects: Arc<AtomicU64>,
 }
 
 impl BgpHandle {
+    /// The latest observed [`SessionState`].
+    #[must_use]
+    pub fn state(&self) -> SessionState {
+        *self.state.borrow()
+    }
+
+    /// A [`watch::Receiver`] for awaiting session-state transitions — e.g. a
+    /// supervisor that warns when the session leaves [`SessionState::Established`].
+    #[must_use]
+    pub fn state_watch(&self) -> watch::Receiver<SessionState> {
+        self.state.clone()
+    }
+
+    /// Total reconnect attempts since [`spawn`] (excludes the initial connect).
+    #[must_use]
+    pub fn reconnects(&self) -> u64 {
+        self.reconnects.load(Ordering::Relaxed)
+    }
+
     /// Announce a route to the BGP peer.
     ///
     /// The route is stored in the session's active set and re-announced on
@@ -205,8 +253,14 @@ pub fn spawn(cfg: PeerConfig) -> Result<(BgpHandle, tokio::task::JoinHandle<()>)
         warn!(peer = %cfg.peer_addr, "hold_time is 0: dead-peer detection disabled");
     }
     let (tx, rx) = mpsc::channel(256);
-    let handle = BgpHandle { tx };
-    let join = tokio::spawn(run(cfg, rx));
+    let (state_tx, state_rx) = watch::channel(SessionState::Idle);
+    let reconnects = Arc::new(AtomicU64::new(0));
+    let handle = BgpHandle {
+        tx,
+        state: state_rx,
+        reconnects: Arc::clone(&reconnects),
+    };
+    let join = tokio::spawn(run(cfg, rx, state_tx, reconnects));
     Ok((handle, join))
 }
 
@@ -217,17 +271,44 @@ pub fn spawn(cfg: PeerConfig) -> Result<(BgpHandle, tokio::task::JoinHandle<()>)
 /// Never returns under normal operation — reconnects indefinitely on error.
 /// Maintains `active: HashMap<IpNet, Route>` and re-advertises after each
 /// successful session establishment.
-pub async fn run(cfg: PeerConfig, mut commands: mpsc::Receiver<SessionCommand>) {
+pub async fn run(
+    cfg: PeerConfig,
+    mut commands: mpsc::Receiver<SessionCommand>,
+    state: watch::Sender<SessionState>,
+    reconnects: Arc<AtomicU64>,
+) {
     let mut active: HashMap<IpNet, Route> = HashMap::new();
     let mut active_flowspec: HashMap<Vec<u8>, FlowSpecRule> = HashMap::new();
+    let mut consecutive_failures: u32 = 0;
+
+    // Announce the initial connect attempt before the first `session_once`.
+    let _ = state.send(SessionState::Connecting);
 
     loop {
-        let outcome = session_once(&cfg, &mut commands, &mut active, &mut active_flowspec).await;
+        let outcome = session_once(
+            &cfg,
+            &mut commands,
+            &mut active,
+            &mut active_flowspec,
+            &state,
+            &mut consecutive_failures,
+        )
+        .await;
         match outcome {
             SessionOutcome::Reconnect(msg) => {
-                info!(peer = %cfg.peer_addr, "{msg}; reconnecting in 5 s");
+                // The session dropped (or never came up): leave Established
+                // immediately so a supervisor sees the outage, then back off.
+                let _ = state.send(SessionState::Connecting);
+                reconnects.fetch_add(1, Ordering::Relaxed);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let delay = backoff_delay(consecutive_failures);
+                info!(peer = %cfg.peer_addr, ?delay, "{msg}; reconnecting");
+                // Drain any queued commands before sleeping (keeps active in sync).
+                drain_commands(&mut commands, &mut active, &mut active_flowspec);
+                tokio::time::sleep(delay).await;
             }
             SessionOutcome::CommandsExhausted => {
+                let _ = state.send(SessionState::Idle);
                 info!(
                     peer = %cfg.peer_addr,
                     "command channel closed; exiting BGP session loop"
@@ -235,9 +316,6 @@ pub async fn run(cfg: PeerConfig, mut commands: mpsc::Receiver<SessionCommand>) 
                 return;
             }
         }
-        // Drain any queued commands before sleeping (keeps active in sync).
-        drain_commands(&mut commands, &mut active, &mut active_flowspec);
-        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -295,9 +373,11 @@ async fn session_once(
     commands: &mut mpsc::Receiver<SessionCommand>,
     active: &mut HashMap<IpNet, Route>,
     active_flowspec: &mut HashMap<Vec<u8>, FlowSpecRule>,
+    state: &watch::Sender<SessionState>,
+    consecutive_failures: &mut u32,
 ) -> SessionOutcome {
     // ── 1. TCP connect ──────────────────────────────────────────────────────
-    let mut stream = match TcpStream::connect(cfg.peer_addr).await {
+    let mut stream = match connect_peer(cfg.peer_addr, cfg.md5.as_deref()).await {
         Ok(s) => {
             info!(peer = %cfg.peer_addr, "TCP connected");
             s
@@ -467,6 +547,8 @@ async fn session_once(
         }
     }
     info!(peer = %cfg.peer_addr, "Established");
+    *consecutive_failures = 0;
+    let _ = state.send(SessionState::Established);
 
     // ── 5. Re-announce the full active set ──────────────────────────────────
     for route in active.values() {
@@ -792,6 +874,124 @@ async fn established_loop(
     }
 }
 
+// ── Reconnect backoff + TCP connect (optional TCP-MD5, RFC 2385) ───────────────
+
+/// Reconnect backoff: 1s, 2, 4, 8, 16, then capped at 30s. Reset to `0` after a
+/// session reaches Established. No jitter — a single local peer, no herd.
+fn backoff_delay(consecutive_failures: u32) -> Duration {
+    let secs = 1u64
+        .checked_shl(consecutive_failures)
+        .unwrap_or(u64::MAX)
+        .min(30);
+    Duration::from_secs(secs)
+}
+
+/// The Linux `struct tcp_md5sig` (RFC 2385), mirrored from
+/// `include/uapi/linux/tcp.h`.
+///
+/// `libc` 0.2.186 exposes the `TCP_MD5SIG*` constants but not this struct, so we
+/// reproduce its `#[repr(C)]` layout: a `sockaddr_storage`, the extension header
+/// (`flags`, `prefixlen`, `keylen`, `ifindex`), then the fixed-length key. We
+/// only use the base `TCP_MD5SIG` option, so `flags`/`prefixlen`/`ifindex`
+/// remain zero.
+#[repr(C)]
+struct TcpMd5Sig {
+    tcpm_addr: libc::sockaddr_storage,
+    tcpm_flags: u8,
+    tcpm_prefixlen: u8,
+    tcpm_keylen: u16,
+    tcpm_ifindex: libc::c_int,
+    tcpm_key: [u8; libc::TCP_MD5SIG_MAXKEYLEN],
+}
+
+/// Connect to `addr`, optionally installing a TCP-MD5 (RFC 2385) signature for
+/// the peer. With `md5 == None` this is exactly [`TcpStream::connect`].
+///
+/// # Errors
+///
+/// Returns any TCP connect error, or an error from installing the MD5 key (e.g.
+/// a key longer than [`libc::TCP_MD5SIG_MAXKEYLEN`] bytes).
+async fn connect_peer(addr: SocketAddr, md5: Option<&str>) -> io::Result<TcpStream> {
+    let Some(key) = md5 else {
+        return TcpStream::connect(addr).await;
+    };
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    set_tcp_md5sig(&sock, addr, key)?;
+    sock.set_nonblocking(true)?;
+    // A nonblocking connect returns EINPROGRESS; hand the fd to tokio, which
+    // drives the connect to completion.
+    match sock.connect(&addr.into()) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+        Err(e) => return Err(e),
+    }
+    let std_stream: std::net::TcpStream = sock.into();
+    let stream = TcpStream::from_std(std_stream)?;
+    stream.writable().await?; // completes the async connect
+    if let Some(err) = stream.take_error()? {
+        return Err(err);
+    }
+    Ok(stream)
+}
+
+/// Install `TCP_MD5SIG` on `sock` for peer `addr` with `key` (Linux, RFC 2385).
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] if `key` exceeds
+/// [`libc::TCP_MD5SIG_MAXKEYLEN`] bytes (the key is never truncated), or the
+/// last OS error if `setsockopt` fails.
+fn set_tcp_md5sig(sock: &Socket, addr: SocketAddr, key: &str) -> io::Result<()> {
+    let key_bytes = key.as_bytes();
+    if key_bytes.len() > libc::TCP_MD5SIG_MAXKEYLEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP-MD5 key exceeds maximum length",
+        ));
+    }
+
+    // SAFETY: `TcpMd5Sig` is a `#[repr(C)]` plain-old-data struct (integers and
+    // byte arrays); an all-zero bit pattern is a valid, well-defined value.
+    let mut sig: TcpMd5Sig = unsafe { std::mem::zeroed() };
+
+    let ss: socket2::SockAddr = addr.into();
+    let copy_len = usize::try_from(ss.len())
+        .unwrap_or(0)
+        .min(std::mem::size_of::<libc::sockaddr_storage>());
+    // SAFETY: `sig.tcpm_addr` is a `sockaddr_storage` sized to hold any address
+    // family; we copy exactly `copy_len` bytes (bounded by the size of
+    // `sockaddr_storage`) from socket2's validated, non-overlapping `SockAddr`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            ss.as_ptr().cast::<u8>(),
+            std::ptr::addr_of_mut!(sig.tcpm_addr).cast::<u8>(),
+            copy_len,
+        );
+    }
+
+    sig.tcpm_keylen = u16::try_from(key_bytes.len()).unwrap_or(0);
+    sig.tcpm_key[..key_bytes.len()].copy_from_slice(key_bytes);
+
+    let optlen = u32::try_from(std::mem::size_of::<TcpMd5Sig>()).unwrap_or(0);
+    // SAFETY: `setsockopt` reads `optlen` bytes from `&sig`, which points to a
+    // live, fully-initialised `TcpMd5Sig` of exactly that size; `sock` owns a
+    // valid file descriptor for the duration of the call. A non-zero return is
+    // mapped to the last OS error.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MD5SIG,
+            std::ptr::addr_of!(sig).cast(),
+            optlen,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,7 +1003,17 @@ mod tests {
             peer_addr: "10.0.0.2:179".parse().unwrap(),
             router_id: "10.0.0.1".parse().unwrap(),
             hold_time: hold,
+            md5: None,
         }
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        assert_eq!(backoff_delay(0), Duration::from_secs(1));
+        assert_eq!(backoff_delay(1), Duration::from_secs(2));
+        assert_eq!(backoff_delay(4), Duration::from_secs(16));
+        assert_eq!(backoff_delay(5), Duration::from_secs(30)); // 32 capped to 30
+        assert_eq!(backoff_delay(99), Duration::from_secs(30));
     }
 
     #[test]

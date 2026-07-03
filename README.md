@@ -70,7 +70,7 @@ tenant acme {
 # RTBH: announce /32 (/128) blackholes for detected/operator-flagged attacks over iBGP.
 # Eligibility reuses the prefixes above (only your own space is ever blackholed).
 rtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 \
-     next-hop-v4=192.0.2.1 max=256 hold-down=60s ttl=2h
+     next-hop-v4=192.0.2.1 max=256 hold-down=60s ttl=2h md5=optional-tcp-md5-secret
 ```
 
 ### RTBH operator commands
@@ -90,8 +90,10 @@ blackwalld rtbh list --requests        # the operator-intent log with per-reques
 > **Ops note:** Postgres is the RTBH authorization boundary — anyone who can write
 > `rtbh_requests` can null-route any IP in your prefixes. Give the CLI a least-privilege DB role
 > (INSERT on `rtbh_requests`, SELECT on the RTBH tables) distinct from the daemon's role, and set
-> `--operator` (or rely on `$USER@host`) so `created_by` attributes each request. BGP transport
-> security (TCP-MD5/GTSM) is not yet implemented — run the session over a trusted peering link.
+> `--operator` (or rely on `$USER@host`) so `created_by` attributes each request. Optional
+> **TCP-MD5** (RFC 2385) authentication is available via `md5=<password>` on the `rtbh` directive
+> (the secret is redacted from logs); GTSM/TTL-security is not yet implemented. The session logs a
+> WARN whenever it leaves the Established state.
 
 ## Build & run
 

@@ -3,6 +3,7 @@
 mod dns;
 mod flowspec;
 mod flux;
+mod md5secret;
 mod policy;
 mod port;
 mod proto;
@@ -14,6 +15,7 @@ mod target;
 pub use dns::DnsFluxConfig;
 pub use flowspec::FlowSpecPolicy;
 pub use flux::BannerFluxConfig;
+pub use md5secret::Md5Secret;
 pub use policy::{AllowRule, Policy, Tenant};
 pub use port::PortState;
 pub use proto::L4Proto;

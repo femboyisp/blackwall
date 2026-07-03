@@ -511,6 +511,35 @@ fn host_prefix(target: IpAddr) -> ipnet::IpNet {
 /// automatically on the next tick's re-read — no separate in-memory FIFO is
 /// needed.
 ///
+/// Observe the BGP session and log loudly when it leaves `Established` — a down
+/// session means auto-mitigations are not reaching the peer (issue #79). Purely
+/// observational; the session task drives reconnect itself. Exits when the
+/// session task is gone (the watch sender drops).
+async fn bgp_supervisor(mut states: tokio::sync::watch::Receiver<blackwall_bgp::SessionState>) {
+    let mut established = false;
+    loop {
+        if states.changed().await.is_err() {
+            return;
+        }
+        let state = *states.borrow_and_update();
+        match (established, state) {
+            (false, blackwall_bgp::SessionState::Established) => {
+                established = true;
+                tracing::info!("BGP session established");
+            }
+            (true, blackwall_bgp::SessionState::Established) => {}
+            (true, _) => {
+                established = false;
+                tracing::warn!(
+                    ?state,
+                    "BGP session DOWN — mitigations are not reaching the peer"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Runs until `rx` is closed (i.e. for the process's lifetime, since the
 /// paired `ChannelSink`'s sender is held by the running collector).
 async fn rtbh_manager_task(
@@ -816,10 +845,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         peer_addr: rtbh.peer_addr,
                         router_id: rtbh.router_id,
                         hold_time: 90,
+                        md5: rtbh.md5.as_ref().map(|s| s.reveal().to_owned()),
                     };
                     // `BgpHandle` is a cloneable mpsc sender; both the RTBH and
                     // (optionally) FlowSpec managers share the one iBGP session.
                     let (bgp, _bgp_join) = blackwall_bgp::spawn(peer)?;
+                    // Supervise the session: log loudly when it leaves Established
+                    // (mitigations aren't reaching the peer) — issue #79.
+                    tokio::spawn(bgp_supervisor(bgp.state_watch()));
                     let controller =
                         blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
                     let journal: blackwall_state::Store = (*store).clone();

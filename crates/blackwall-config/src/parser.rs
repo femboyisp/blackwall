@@ -204,6 +204,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             | "hold-down"
                             | "ttl"
                             | "community"
+                            | "md5"
                     ) {
                         return Err(ConfigError::BadValue {
                             line: line.number,
@@ -298,6 +299,9 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     max_blackholes,
                     hold_down,
                     max_ttl,
+                    md5: kv
+                        .get("md5")
+                        .map(|s| blackwall_core::Md5Secret::new((*s).to_owned())),
                 });
             }
             "flowspec" => {
@@ -1074,6 +1078,19 @@ tenant t {
     fn rtbh_rejects_duplicate() {
         let dup = "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\nrtbh peer=10.0.0.3 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\n";
         assert!(parse_text(dup).is_err());
+    }
+
+    #[test]
+    fn rtbh_parses_optional_md5() {
+        let src = "interface wan eth0\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s md5=s3cret\n";
+        let p = parse_text(src).unwrap();
+        assert_eq!(p.rtbh.unwrap().md5.unwrap().reveal(), "s3cret");
+    }
+
+    #[test]
+    fn rtbh_md5_absent_is_none() {
+        let src = "interface wan eth0\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s\n";
+        assert!(parse_text(src).unwrap().rtbh.unwrap().md5.is_none());
     }
 
     #[test]

@@ -16,6 +16,6 @@ pub use message::{
 };
 pub use route::{Origin, Route};
 pub use session_net::{
-    spawn, BgpHandle, BgpSendError, PeerConfig, PeerConfigError, SessionCommand,
+    spawn, BgpHandle, BgpSendError, PeerConfig, PeerConfigError, SessionCommand, SessionState,
 };
 pub use update::{build_announce, build_withdraw};
