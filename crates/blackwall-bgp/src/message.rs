@@ -143,6 +143,10 @@ pub struct OpenMsg {
     pub ipv4_unicast: bool,
     /// Advertise MP-BGP capability for IPv6 Unicast (AFI 2 / SAFI 1).
     pub ipv6_unicast: bool,
+    /// Advertise MP-BGP capability for IPv4 FlowSpec (AFI 1 / SAFI 133).
+    pub flowspec_v4: bool,
+    /// Advertise MP-BGP capability for IPv6 FlowSpec (AFI 2 / SAFI 133).
+    pub flowspec_v6: bool,
 }
 
 /// AS_TRANS (RFC 6793): used in the legacy 2-octet MY_AS field when the real
@@ -181,6 +185,23 @@ pub fn encode_open(o: &OpenMsg) -> Vec<u8> {
         caps.extend_from_slice(&2u16.to_be_bytes()); // AFI 2
         caps.push(0); // reserved
         caps.push(1); // SAFI 1
+    }
+
+    // MP-BGP capability for IPv4 FlowSpec: AFI=1, SAFI=133
+    if o.flowspec_v4 {
+        caps.push(CAP_MP_BGP);
+        caps.push(4);
+        caps.extend_from_slice(&1u16.to_be_bytes());
+        caps.push(0);
+        caps.push(133);
+    }
+    // MP-BGP capability for IPv6 FlowSpec: AFI=2, SAFI=133
+    if o.flowspec_v6 {
+        caps.push(CAP_MP_BGP);
+        caps.push(4);
+        caps.extend_from_slice(&2u16.to_be_bytes());
+        caps.push(0);
+        caps.push(133);
     }
 
     // Optional Parameter type 2 (Capabilities): [2, param_len, <caps>]
@@ -244,6 +265,8 @@ pub fn decode_open(body: &[u8]) -> Result<OpenMsg, BgpError> {
     let mut asn_4octet: Option<u32> = None;
     let mut ipv4_unicast = false;
     let mut ipv6_unicast = false;
+    let mut flowspec_v4 = false;
+    let mut flowspec_v6 = false;
 
     // Walk optional parameters.
     let mut i = 0usize;
@@ -297,6 +320,8 @@ pub fn decode_open(body: &[u8]) -> Result<OpenMsg, BgpError> {
                         match (afi, safi) {
                             (1, 1) => ipv4_unicast = true,
                             (2, 1) => ipv6_unicast = true,
+                            (1, 133) => flowspec_v4 = true,
+                            (2, 133) => flowspec_v6 = true,
                             _ => {}
                         }
                     }
@@ -319,6 +344,8 @@ pub fn decode_open(body: &[u8]) -> Result<OpenMsg, BgpError> {
         router_id,
         ipv4_unicast,
         ipv6_unicast,
+        flowspec_v4,
+        flowspec_v6,
     })
 }
 
@@ -400,6 +427,8 @@ mod tests {
             router_id: 0x0A_DE_FF_0C,
             ipv4_unicast: true,
             ipv6_unicast: true,
+            flowspec_v4: false,
+            flowspec_v6: false,
         };
         let bytes = encode_open(&o);
         // header
@@ -425,6 +454,23 @@ mod tests {
     }
 
     #[test]
+    fn open_advertises_flowspec_capabilities() {
+        let o = OpenMsg {
+            asn: 214806,
+            hold_time: 90,
+            router_id: 0x0A00_0001,
+            ipv4_unicast: true,
+            ipv6_unicast: true,
+            flowspec_v4: true,
+            flowspec_v6: true,
+        };
+        let msg = encode_open(&o);
+        // MP-BGP cap [CAP_MP_BGP,4, AFI, 0, SAFI]; SAFI 133 = 0x85 for AFI 1 and AFI 2.
+        assert!(msg.windows(4).any(|w| w == [0x00, 0x01, 0x00, 0x85])); // AFI1 SAFI133
+        assert!(msg.windows(4).any(|w| w == [0x00, 0x02, 0x00, 0x85])); // AFI2 SAFI133
+    }
+
+    #[test]
     fn open_small_asn_uses_real_value_in_legacy_field() {
         let o = OpenMsg {
             asn: 64512,
@@ -432,6 +478,8 @@ mod tests {
             router_id: 1,
             ipv4_unicast: true,
             ipv6_unicast: false,
+            flowspec_v4: false,
+            flowspec_v6: false,
         };
         let bytes = encode_open(&o);
         assert_eq!(u16::from_be_bytes([bytes[20], bytes[21]]), 64512);

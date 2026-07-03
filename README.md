@@ -149,6 +149,7 @@ Current scenarios (each a CI gate):
 | `trafficgen-foundation` | A Rust generator floods the victim with the full DDoS pattern set (UDP/SYN/reflection/malformed + benign) over **AF_PACKET**; the victim's per-flow sink + `/proc/net/dev` counters classify delivery and gate fidelity, benign-survival, and measurement-consistency. |
 | `deception-resilience` | A connection flood past the deception engine's `max_concurrent` cap proves its DDoS-defense is correct — drop-at-cap is enforced, legit deception still gets `SSH-2.0`, and the engine survives. A **resilience/correctness** gate, not a throughput benchmark (realistic-scale stress needs kernel-bypass, tracked separately). |
 | `rtbh-bird` | The `RtbhManager` announces both an auto-detected and an operator-manual `/32` blackhole (community `65535:666`, RFC 7999) via the native BGP speaker; real **BIRD2** must show both routes carrying that community — the detection→mitigation (D→C) loop, auto and manual, end to end. |
+| `flowspec-bird` | The native speaker injects a BGP **FlowSpec** rule (RFC 8955, SAFI 133) — *drop UDP dport 53 → 203.0.113.7/32* — over iBGP; real **BIRD2** must validate and install it into its `flow4` table with the full match (`dst 203.0.113.7/32; proto 17; dport 53`) — finer-grained mitigation than a whole-IP blackhole. |
 
 The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
 renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is
@@ -171,7 +172,7 @@ generation to exercise the XDP/eBPF data plane.
 | `blackwall-shaper` | CAKE traffic shaping (egress + IFB ingress) computed from measured bandwidth. |
 | `blackwall-dns` | RFC 2136 + TSIG DNS fast-flux against a Knot primary. |
 | `blackwall-flow` | sFlow v5 decode + sliding-window volumetric attack detection (sub-project D). |
-| `blackwall-bgp` | Byte-exact BGP codec + injection-only iBGP speaker (sub-project C). |
+| `blackwall-bgp` | Byte-exact BGP codec (unicast RTBH routes + FlowSpec rules, RFC 8955/8956) + injection-only iBGP speaker (sub-project C). |
 | `blackwall-rtbh` | RTBH controller + single-owner `RtbhManager` — detected/operator attacks → BGP blackhole announcements, persisted and re-announced on restart (sub-project C). |
 | `blackwall-lab` | netns integration-test lab harness (`lab` CLI) — see below. |
 | `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`, `run`, `flow`, …). |
