@@ -362,6 +362,19 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         return Err(bad("flowspec ttl", "must be >= hold-down"));
                     }
                 }
+                // Reject misconfigurations that silently break selection: a NaN
+                // or out-of-range `concentration` (NaN makes `cumulative >= c`
+                // always false → FlowSpec never chosen), `max-flows` of 0 (loop
+                // never selects), or a negative `rate` (nonsensical traffic-rate).
+                if !(0.0..=1.0).contains(&concentration) {
+                    return Err(bad("flowspec concentration", "must be in 0.0..=1.0"));
+                }
+                if max_flows == 0 {
+                    return Err(bad("flowspec max-flows", "must be >= 1"));
+                }
+                if rate.is_nan() || rate < 0.0 {
+                    return Err(bad("flowspec rate", "must be >= 0"));
+                }
                 flowspec = Some(FlowSpecPolicy {
                     concentration,
                     max_flows,
@@ -1090,6 +1103,20 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s ttl=2h
 ";
         let err = parse_text(src).unwrap_err();
         assert!(format!("{err}").contains("flowspec"));
+    }
+
+    #[test]
+    fn flowspec_rejects_invalid_selection_tunables() {
+        let base = "interface wan eth0\nrtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 next-hop-v4=10.222.255.99 max=256 hold-down=60s ttl=2h\n";
+        for fs in [
+            "flowspec concentration=1.5 max-flows=4 rate=0 max-rules=256 hold-down=60s",
+            "flowspec concentration=nan max-flows=4 rate=0 max-rules=256 hold-down=60s",
+            "flowspec concentration=0.8 max-flows=0 rate=0 max-rules=256 hold-down=60s",
+            "flowspec concentration=0.8 max-flows=4 rate=-1 max-rules=256 hold-down=60s",
+        ] {
+            let src = format!("{base}{fs}\n");
+            assert!(parse_text(&src).is_err(), "should reject: {fs}");
+        }
     }
 
     #[test]
