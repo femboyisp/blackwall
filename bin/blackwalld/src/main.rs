@@ -126,6 +126,17 @@ enum Command {
         #[command(subcommand)]
         action: RtbhCmd,
     },
+    /// Queue FlowSpec operator intent, or inspect the mirror / intent queue.
+    ///
+    /// Like `rtbh`, the CLI never talks to BGP directly: it only appends to
+    /// (or reads) the `flowspec_requests`/`flowspec_rules` tables. A running
+    /// `blackwalld flow` daemon (with `rtbh` + `flowspec` config blocks) is the
+    /// sole applier of intent.
+    Flowspec {
+        /// Which FlowSpec action to perform.
+        #[command(subcommand)]
+        action: FlowspecCmd,
+    },
 }
 
 /// Operator actions for the `rtbh` subcommand.
@@ -154,6 +165,47 @@ enum RtbhCmd {
     /// List the announced blackhole mirror (and, optionally, the intent queue).
     List {
         /// Also print the `rtbh_requests` operator intent queue.
+        #[arg(long)]
+        requests: bool,
+    },
+}
+
+/// Operator actions for the `flowspec` subcommand.
+#[derive(Subcommand)]
+enum FlowspecCmd {
+    /// Queue a FlowSpec-add request for the flow `ip proto port`.
+    ///
+    /// Rejected up front (before any database connection) if `ip` falls
+    /// outside the config's FlowSpec-eligible prefixes.
+    Add {
+        /// The victim address to rate-limit.
+        ip: IpAddr,
+        /// IP protocol number (e.g. 17 = UDP, 6 = TCP).
+        proto: u8,
+        /// Destination port.
+        port: u16,
+        /// Traffic-rate action in bytes/sec; `0.0` = drop.
+        #[arg(long, default_value_t = 0.0)]
+        rate: f32,
+        /// Path to the Blackwall config file (must contain a `flowspec` block).
+        #[arg(long)]
+        config: PathBuf,
+        /// Attribution for the request; defaults to `$USER@<hostname>`.
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Queue a FlowSpec-remove request for the flow `ip proto port`.
+    Remove {
+        /// The victim address to stop rate-limiting.
+        ip: IpAddr,
+        /// IP protocol number.
+        proto: u8,
+        /// Destination port.
+        port: u16,
+    },
+    /// List the announced FlowSpec mirror (and, optionally, the intent queue).
+    List {
+        /// Also print the `flowspec_requests` operator intent queue.
         #[arg(long)]
         requests: bool,
     },
@@ -417,6 +469,33 @@ fn rtbh_config_from(
     }
 }
 
+/// Build a [`blackwall_rtbh::FlowSpecConfig`] from the policy's prefixes and the
+/// config's `flowspec` block. Shared by the CLI's eligibility pre-check and the
+/// `flow` daemon's manager wiring, so both agree on what is eligible. FlowSpec
+/// reuses `Policy.prefixes` for eligibility (no separate next-hop/peer fields).
+fn flowspec_config_from(
+    policy: &blackwall_core::Policy,
+    fs: &blackwall_core::FlowSpecPolicy,
+) -> blackwall_rtbh::FlowSpecConfig {
+    blackwall_rtbh::FlowSpecConfig {
+        eligible_prefixes: policy.prefixes.clone(),
+        max_rules: fs.max_rules,
+        hold_down: fs.hold_down,
+        max_ttl: fs.max_ttl,
+    }
+}
+
+/// Construct a host route (`/32` for IPv4, `/128` for IPv6) for `target`.
+///
+/// Local mirror of `blackwall_rtbh`'s crate-private `host_prefix`, used to
+/// rebuild a FlowSpec destination match from a stored victim address.
+fn host_prefix(target: IpAddr) -> ipnet::IpNet {
+    match target {
+        IpAddr::V4(a) => ipnet::IpNet::V4(ipnet::Ipv4Net::new(a, 32).expect("v4 /32")),
+        IpAddr::V6(a) => ipnet::IpNet::V6(ipnet::Ipv6Net::new(a, 128).expect("v6 /128")),
+    }
+}
+
 /// Single-owner RTBH reconcile loop: applies auto detection events as they
 /// arrive on `rx`, and on a 1 s tick, calls [`blackwall_rtbh::RtbhManager::tick`]
 /// (completing deferred clears/TTL expiries — mandatory, see the module docs)
@@ -533,6 +612,127 @@ async fn apply_request(
     }
 }
 
+/// Single-owner FlowSpec reconcile loop: the FlowSpec analogue of
+/// [`rtbh_manager_task`]. Applies auto mitigation events as they arrive on
+/// `rx` (an `Open`/`Update`/`Clear` from the collector's [`SelectorSink`]),
+/// and on a 1 s tick calls [`blackwall_rtbh::FlowSpecManager::tick`] (deferred
+/// clears / TTL expiry — mandatory) then drains every `status = 'pending'` row
+/// from `flowspec_requests` via [`apply_flowspec_request`].
+///
+/// Runs until `rx` is closed (i.e. for the process's lifetime, since the
+/// paired `SelectorSink`'s sender is held by the running collector).
+async fn flowspec_manager_task(
+    mut manager: blackwall_rtbh::FlowSpecManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+    mut rx: mpsc::Receiver<blackwall_flow::FlowMitigationEvent>,
+    request_store: std::sync::Arc<blackwall_state::Store>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            maybe_ev = rx.recv() => {
+                match maybe_ev {
+                    Some(blackwall_flow::FlowMitigationEvent::Open { target, rules }) => {
+                        manager.apply_open(target, &rules, mono_now(), wall_now()).await;
+                    }
+                    Some(blackwall_flow::FlowMitigationEvent::Update { target }) => {
+                        // `apply_updated` is synchronous (in-memory refresh only).
+                        manager.apply_updated(target, mono_now());
+                    }
+                    Some(blackwall_flow::FlowMitigationEvent::Clear { target }) => {
+                        manager.apply_clear(target, mono_now(), wall_now()).await;
+                    }
+                    None => {
+                        tracing::warn!("FlowSpec: event channel closed; manager task exiting");
+                        return;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                // Mandatory: completes deferred clears / TTL expiry.
+                manager.tick(mono_now(), wall_now()).await;
+
+                match request_store.pending_flowspec_requests().await {
+                    Ok(reqs) => {
+                        for req in reqs {
+                            apply_flowspec_request(&mut manager, &request_store, req).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "FlowSpec: failed to read pending flowspec_requests");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply one pending `flowspec_requests` row and record its outcome — the
+/// FlowSpec analogue of [`apply_request`].
+///
+/// For `"add"`: `Applied` marks the row `applied`; `Deferred` leaves the row
+/// `pending` (retried on the next tick); `Rejected` marks it `rejected` with
+/// the reason. For `"remove"`: withdraws the flow, supersedes any other
+/// still-pending `add` for the same flow key, then marks this row `applied`.
+async fn apply_flowspec_request(
+    manager: &mut blackwall_rtbh::FlowSpecManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+    request_store: &blackwall_state::Store,
+    req: blackwall_state::FlowSpecRequestRow,
+) {
+    let rule = blackwall_bgp::FlowSpecRule {
+        dst: host_prefix(req.dst),
+        protocol: Some(req.proto),
+        dst_port: Some(req.dst_port),
+        action: blackwall_bgp::FlowAction::TrafficRate(req.rate),
+    };
+    match req.action.as_str() {
+        "add" => match manager.apply_add(rule, mono_now(), wall_now()).await {
+            blackwall_rtbh::ApplyOutcome::Applied => {
+                if let Err(err) = request_store
+                    .set_flowspec_request_status(req.id, "applied", None)
+                    .await
+                {
+                    tracing::warn!(%err, id = req.id, "FlowSpec: failed to set request status");
+                }
+            }
+            blackwall_rtbh::ApplyOutcome::Deferred => {
+                // Leave `pending`; picked up again on the next tick.
+            }
+            blackwall_rtbh::ApplyOutcome::Rejected(reason) => {
+                if let Err(err) = request_store
+                    .set_flowspec_request_status(req.id, "rejected", Some(&reason))
+                    .await
+                {
+                    tracing::warn!(%err, id = req.id, "FlowSpec: failed to set request status");
+                }
+            }
+        },
+        "remove" => {
+            manager.apply_remove(rule, wall_now()).await;
+            // The operator's remove is the newer intent: cancel any earlier
+            // still-pending add for the same flow key.
+            if let Err(err) = request_store
+                .supersede_pending_flowspec_adds(req.dst, req.proto, req.dst_port, req.id)
+                .await
+            {
+                tracing::warn!(%err, dst = %req.dst, "FlowSpec: failed to supersede pending adds");
+            }
+            if let Err(err) = request_store
+                .set_flowspec_request_status(req.id, "applied", None)
+                .await
+            {
+                tracing::warn!(%err, id = req.id, "FlowSpec: failed to set request status");
+            }
+        }
+        other => {
+            tracing::warn!(
+                action = other,
+                id = req.id,
+                "FlowSpec: unknown request action; ignoring"
+            );
+        }
+    }
+}
+
 /// Core dispatch logic; returns `Err` on any failure.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -617,11 +817,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         router_id: rtbh.router_id,
                         hold_time: 90,
                     };
+                    // `BgpHandle` is a cloneable mpsc sender; both the RTBH and
+                    // (optionally) FlowSpec managers share the one iBGP session.
                     let (bgp, _bgp_join) = blackwall_bgp::spawn(peer)?;
                     let controller =
                         blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
                     let journal: blackwall_state::Store = (*store).clone();
-                    let mut manager = blackwall_rtbh::RtbhManager::new(controller, bgp, journal);
+                    let mut manager =
+                        blackwall_rtbh::RtbhManager::new(controller, bgp.clone(), journal);
 
                     // Rehydrate the controller from the announced mirror before
                     // this session starts accepting new detections/requests.
@@ -641,12 +844,73 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                     let channel_cap = rtbh.max_blackholes.max(1024);
                     let (tx, rx) = mpsc::channel::<blackwall_flow::DetectionEvent>(channel_cap);
-                    let request_store = store.clone();
-                    tokio::spawn(rtbh_manager_task(manager, rx, request_store));
+                    tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
 
-                    let channel_sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
-                        std::sync::Arc::new(blackwall_flow::ChannelSink::new(tx));
-                    std::sync::Arc::new(blackwall_flow::FanoutSink(vec![pg_sink, channel_sink]))
+                    match policy.flowspec.clone() {
+                        // RTBH-only: today's behaviour, Fanout([Pg, Channel→rtbh]).
+                        None => {
+                            let channel_sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
+                                std::sync::Arc::new(blackwall_flow::ChannelSink::new(tx));
+                            std::sync::Arc::new(blackwall_flow::FanoutSink(vec![
+                                pg_sink,
+                                channel_sink,
+                            ]))
+                        }
+                        // RTBH + FlowSpec: build a second single-owner manager off
+                        // the SAME BGP session and route detections through a
+                        // SelectorSink instead of the plain RTBH ChannelSink.
+                        Some(fs) => {
+                            let fs_controller = blackwall_rtbh::FlowSpecController::new(
+                                flowspec_config_from(&policy, &fs),
+                            );
+                            let fs_journal: blackwall_state::Store = (*store).clone();
+                            let mut fs_manager = blackwall_rtbh::FlowSpecManager::new(
+                                fs_controller,
+                                bgp,
+                                fs_journal,
+                            );
+
+                            // Rehydrate FlowSpec rules from the announced mirror.
+                            let fs_mirror = store.list_active_flowspec().await?;
+                            let fs_rehydrate: Vec<(
+                                blackwall_bgp::FlowSpecRule,
+                                u64,
+                                blackwall_rtbh::BlackholeOrigin,
+                            )> = fs_mirror
+                                .into_iter()
+                                .map(|row| {
+                                    let origin = match row.origin.as_str() {
+                                        "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
+                                        _ => blackwall_rtbh::BlackholeOrigin::Auto,
+                                    };
+                                    let rule = blackwall_bgp::FlowSpecRule {
+                                        dst: host_prefix(row.dst),
+                                        protocol: Some(row.proto),
+                                        dst_port: Some(row.dst_port),
+                                        action: blackwall_bgp::FlowAction::TrafficRate(row.rate),
+                                    };
+                                    (rule, row.announced_at_ms, origin)
+                                })
+                                .collect();
+                            fs_manager.rehydrate(fs_rehydrate, mono_now()).await;
+
+                            let fs_cap = fs.max_rules.max(1024);
+                            let (fs_tx, fs_rx) =
+                                mpsc::channel::<blackwall_flow::FlowMitigationEvent>(fs_cap);
+                            tokio::spawn(flowspec_manager_task(fs_manager, fs_rx, store.clone()));
+
+                            let selection = blackwall_flow::SelectionConfig {
+                                concentration: fs.concentration,
+                                max_flows: fs.max_flows,
+                                rate: fs.rate,
+                            };
+                            let selector: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
+                                std::sync::Arc::new(blackwall_flow::SelectorSink::new(
+                                    fs_tx, tx, selection,
+                                ));
+                            std::sync::Arc::new(blackwall_flow::FanoutSink(vec![pg_sink, selector]))
+                        }
+                    }
                 }
             };
 
@@ -674,6 +938,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::Rtbh { action } => run_rtbh(action).await,
+        Command::Flowspec { action } => run_flowspec(action).await,
         Command::Run {
             config,
             database_url,
@@ -1038,6 +1303,115 @@ async fn rtbh_list(requests: bool) -> Result<(), Box<dyn std::error::Error>> {
                 "{:<6} {:<40} {:<8} {:<10} {}",
                 row.id,
                 row.target,
+                row.action,
+                row.status,
+                row.note.as_deref().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch one `flowspec` subcommand.
+async fn run_flowspec(action: FlowspecCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        FlowspecCmd::Add {
+            ip,
+            proto,
+            port,
+            rate,
+            config,
+            operator,
+        } => flowspec_add(ip, proto, port, rate, &config, operator).await,
+        FlowspecCmd::Remove { ip, proto, port } => flowspec_remove(ip, proto, port).await,
+        FlowspecCmd::List { requests } => flowspec_list(requests).await,
+    }
+}
+
+/// `flowspec add`: reject the flow up front (no database connection made yet)
+/// if `ip` falls outside the config's FlowSpec-eligible prefixes; otherwise
+/// queue an `"add"` intent row. Unlike RTBH there is no next-hop check.
+async fn flowspec_add(
+    ip: IpAddr,
+    proto: u8,
+    port: u16,
+    rate: f32,
+    config: &std::path::Path,
+    operator: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = blackwall_config::parse_file(config)?;
+    let Some(fs) = policy.flowspec.clone() else {
+        return Err("config has no `flowspec` block; FlowSpec is not enabled".into());
+    };
+    let controller = blackwall_rtbh::FlowSpecController::new(flowspec_config_from(&policy, &fs));
+    if !controller.is_eligible(ip) {
+        return Err(format!("{ip} is outside the configured FlowSpec-eligible prefixes").into());
+    }
+
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue a flowspec request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let created_by = operator.unwrap_or_else(default_operator);
+    let id = store
+        .enqueue_flowspec_request(ip, proto, port, rate, "add", &created_by)
+        .await?;
+    println!("queued (request {id}); the running daemon will announce it.");
+    Ok(())
+}
+
+/// `flowspec remove`: queue a `"remove"` intent row (rate `0.0`).
+async fn flowspec_remove(
+    ip: IpAddr,
+    proto: u8,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue a flowspec request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let id = store
+        .enqueue_flowspec_request(ip, proto, port, 0.0, "remove", &default_operator())
+        .await?;
+    println!("queued (request {id}); the running daemon will withdraw it.");
+    Ok(())
+}
+
+/// `flowspec list`: print the announced-FlowSpec mirror, and (with
+/// `--requests`) the operator intent queue.
+async fn flowspec_list(requests: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to list flowspec state")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+
+    let active = store.list_active_flowspec().await?;
+    let now = wall_now();
+    println!(
+        "{:<40} {:<6} {:<6} {:<12} {:<8} AGE",
+        "DST", "PROTO", "PORT", "RATE", "ORIGIN"
+    );
+    for row in &active {
+        let age_secs = now.saturating_sub(row.announced_at_ms) / 1000;
+        println!(
+            "{:<40} {:<6} {:<6} {:<12} {:<8} {age_secs}s",
+            row.dst, row.proto, row.dst_port, row.rate, row.origin
+        );
+    }
+
+    if requests {
+        println!();
+        println!(
+            "{:<6} {:<40} {:<6} {:<6} {:<8} {:<10} NOTE",
+            "ID", "DST", "PROTO", "PORT", "ACTION", "STATUS"
+        );
+        for row in store.list_flowspec_requests(None).await? {
+            println!(
+                "{:<6} {:<40} {:<6} {:<6} {:<8} {:<10} {}",
+                row.id,
+                row.dst,
+                row.proto,
+                row.dst_port,
                 row.action,
                 row.status,
                 row.note.as_deref().unwrap_or("")

@@ -85,6 +85,7 @@ async fn serves_deception_banner() {
         banner_flux: None,
         dns_flux: None,
         rtbh: None,
+        flowspec: None,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
@@ -135,6 +136,7 @@ async fn serves_deception_under_load() {
         banner_flux: None,
         dns_flux: None,
         rtbh: None,
+        flowspec: None,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
