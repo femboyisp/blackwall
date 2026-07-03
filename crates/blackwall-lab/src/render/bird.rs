@@ -7,8 +7,10 @@ use crate::topology::model::{DaemonKind, Node, Topology};
 /// Render the BIRD config for `node`'s `bird` daemon.
 ///
 /// Reads the daemon's `local-as`, `neighbor-node`, `neighbor-as`, `import`,
-/// and `passive` settings; the router id is the node's primary address and the
-/// neighbor address is the neighbor node's primary address.
+/// `passive`, and `flowspec` settings; the router id is the node's primary
+/// address and the neighbor address is the neighbor node's primary address.
+/// When `flowspec="yes"`, the `protocol bgp` block also gets `flow4`/`flow6`
+/// channels (RFC 8955/8956) so the peer negotiates FlowSpec SAFI 133.
 ///
 /// # Errors
 /// Returns [`LabError::Plan`] if the node has no `bird` daemon, a required
@@ -36,14 +38,36 @@ pub fn render_bird(node: &Node, _topo: &Topology, map: &AddressMap) -> Result<St
     let neighbor_as = get("neighbor-as")?;
     let import = get("import")?;
     let passive = daemon.settings.get("passive").map_or("no", String::as_str);
+    let flowspec = daemon.settings.get("flowspec").is_some_and(|v| v == "yes");
     let neighbor_addr = map
         .node_primary(&neighbor_node)
         .ok_or_else(|| LabError::Plan(format!("no address for neighbor `{neighbor_node}`")))?;
+    let flow_tables = if flowspec {
+        "flow4 table flow4tab;\nflow6 table flow6tab;\n\n"
+    } else {
+        ""
+    };
+    let flow_channels = if flowspec {
+        "    flow4 { table flow4tab; import all; };\n    flow6 { table flow6tab; import all; };\n"
+    } else {
+        ""
+    };
+    // RFC 8955 §6 "safe update" validation requires the covering unicast
+    // route's next hop to actually resolve; without a direct-route source,
+    // BIRD treats it as unreachable and drops it at import (confirmed live
+    // against BIRD 2.17.1). `protocol direct` imports the connected /30 so
+    // next-hop resolution succeeds.
+    let direct_proto = if flowspec {
+        "protocol direct {\n    ipv4;\n    ipv6;\n    interface \"*\";\n}\n\n"
+    } else {
+        ""
+    };
 
     Ok(format!(
         "log stderr all;\n\
 router id {router_id};\n\
 \n\
+{flow_tables}\
 protocol device {{\n\
     scan time 5;\n\
 }}\n\
@@ -52,6 +76,7 @@ protocol kernel {{\n\
     ipv4 {{ import none; export none; }};\n\
 }}\n\
 \n\
+{direct_proto}\
 protocol bgp peer_{neighbor_node} {{\n\
     local as {local_as};\n\
     neighbor {neighbor_addr} as {neighbor_as};\n\
@@ -62,6 +87,7 @@ protocol bgp peer_{neighbor_node} {{\n\
         import {import};\n\
         export none;\n\
     }};\n\
+{flow_channels}\
 }}\n"
     ))
 }
@@ -147,6 +173,30 @@ protocol bgp peer_speaker {\n\
     };\n\
 }\n";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn renders_flow_channels_when_flowspec_enabled() {
+        let mut topo = proof_topo();
+        topo.nodes[0].daemons[0]
+            .settings
+            .insert("flowspec".to_owned(), "yes".to_owned());
+        let map = allocate(&topo).unwrap();
+        let out = render_bird(&topo.nodes[0], &topo, &map).unwrap();
+        assert!(out.contains("flow4 table flow4tab;"));
+        assert!(out.contains("flow6 table flow6tab;"));
+        assert!(out.contains("flow4 { table flow4tab; import all; };"));
+        assert!(out.contains("flow6 { table flow6tab; import all; };"));
+        assert!(out.contains("protocol direct {"));
+    }
+
+    #[test]
+    fn omits_flow_channels_when_flowspec_not_set() {
+        let topo = proof_topo();
+        let map = allocate(&topo).unwrap();
+        let out = render_bird(&topo.nodes[0], &topo, &map).unwrap();
+        assert!(!out.contains("flow4"));
+        assert!(!out.contains("flow6"));
     }
 
     #[test]
