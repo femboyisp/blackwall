@@ -6,7 +6,7 @@ topology "flow-sflow-live" {
     node "victim" {
         daemon "hsflowd"
         run "collector" \
-            cmd="cargo test --offline -p blackwall-flow --test interop -- detects_live_sflow_attack --ignored --nocapture"
+            cmd="target/debug/lab-tests/blackwall-flow-interop detects_live_sflow_attack --ignored --nocapture"
     }
     node "attacker"
     link "victim" "attacker" subnet="10.0.0.0/30"

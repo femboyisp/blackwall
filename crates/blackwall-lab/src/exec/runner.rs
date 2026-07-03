@@ -60,7 +60,23 @@ impl Drop for Teardown {
                 .args(["-KILL", &format!("-{}", child.id())])
                 .status();
             let _ = child.kill();
-            let _ = child.wait();
+            // Bounded reap: `child.kill()` SIGKILLs the direct child, so
+            // `try_wait` sees it exit within milliseconds. Give up after a short
+            // grace rather than an unbounded `child.wait()`, which would hang
+            // teardown forever if a grandchild in another group/netns kept the
+            // child unreapable (blackwall#88).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            }
         }
         // BIRD daemonizes and is not among `self.children`; kill it by the
         // pidfile it wrote before the namespace/scratch dir go away (deleting

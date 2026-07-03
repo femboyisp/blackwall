@@ -6,7 +6,7 @@
 topology "deception-resilience" {
     node "victim" {
         run "engine" \
-            cmd="cargo test --offline -p blackwall-deception --test interop -- serves_deception_under_load --ignored --nocapture"
+            cmd="target/debug/lab-tests/blackwall-deception-interop serves_deception_under_load --ignored --nocapture"
     }
     node "attacker" {
         run "wire-flood" \

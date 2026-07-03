@@ -7,7 +7,7 @@ topology "dns-knot" {
     }
     node "updater" {
         run "push" \
-            cmd="cargo test --offline -p blackwall-dns --test interop -- pushes_a_flux_window --ignored --nocapture" \
+            cmd="target/debug/lab-tests/blackwall-dns-interop pushes_a_flux_window --ignored --nocapture" \
             env="BW_DNS_SERVER={ns.addr}:53 BW_DNS_ZONE=lab.test BW_DNS_NAME=host.lab.test BW_DNS_PREFIX=10.9.9.0/24 BW_DNS_KEYNAME=lab-key BW_DNS_ALGO=hmac-sha256 BW_DNS_SECRET=aGVsbG8tdGhpcy1pcy1hLWxhYi1rZXk="
     }
     link "ns" "updater" subnet="10.0.0.0/30"

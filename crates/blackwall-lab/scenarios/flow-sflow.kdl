@@ -6,6 +6,6 @@ topology "flow-sflow" {
 
 scenario "detection-fires" {
     step assert node="flow" \
-         cmd="cargo test --offline -p blackwall-flow --test interop -- detects_volumetric_attack --ignored --nocapture" \
+         cmd="target/debug/lab-tests/blackwall-flow-interop detects_volumetric_attack --ignored --nocapture" \
          exit="0" timeout="40s"
 }
