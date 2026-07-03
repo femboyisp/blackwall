@@ -948,7 +948,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             tracing::info!(%listen, "sflow collector starting");
-            blackwall_flow::run_collector(listen, Box::new(detector), sink, 1000).await?;
+            blackwall_flow::run_collector(listen, Box::new(detector), sink, 1000, None).await?;
             Ok(())
         }
         Command::Apply {

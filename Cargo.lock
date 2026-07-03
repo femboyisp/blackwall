@@ -227,6 +227,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "blackwall-nft"
 version = "0.1.0"
 dependencies = [

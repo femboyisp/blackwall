@@ -110,6 +110,7 @@ async fn detects_volumetric_attack() {
         Box::new(detector),
         sink.clone(),
         1000,
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(300)).await; // let the collector bind
 
@@ -147,7 +148,7 @@ async fn detects_live_sflow_attack() {
     ));
     let sink = Arc::new(CountingSink::default());
     let listen: SocketAddr = "127.0.0.1:6343".parse().expect("addr");
-    tokio::spawn(run_collector(listen, detector, sink.clone(), 250));
+    tokio::spawn(run_collector(listen, detector, sink.clone(), 250, None));
 
     // Poll for hsflowd's real samples to drive an Opened event.
     for _ in 0..120 {
