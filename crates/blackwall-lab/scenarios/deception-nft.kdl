@@ -4,7 +4,7 @@
 topology "deception-nft" {
     node "victim" {
         run "engine" \
-            cmd="cargo test --offline -p blackwall-deception --test interop -- serves_deception_banner --ignored --nocapture"
+            cmd="target/debug/lab-tests/blackwall-deception-interop serves_deception_banner --ignored --nocapture"
     }
     node "scanner"
     link "victim" "scanner" subnet="10.0.0.0/30"
