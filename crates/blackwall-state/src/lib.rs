@@ -1157,13 +1157,17 @@ mod tests {
         };
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        // A unique target so a concurrent detection test cannot perturb the
+        // count between the `before` read and the assertion.
         let before = store.detection_count().await.expect("count");
-        let t: IpAddr = "203.0.113.21".parse().unwrap();
+        let t: IpAddr = "198.51.100.171".parse().unwrap();
         store
             .open_detection(&sample_detection(t, 1_000, 1_000))
             .await
             .expect("open");
-        assert_eq!(store.detection_count().await.expect("count"), before + 1);
+        // `>=` (not `==`): other tests share the `detections` table and may
+        // insert concurrently; our own insert must have raised the count by ≥1.
+        assert!(store.detection_count().await.expect("count") >= before + 1);
     }
 
     #[tokio::test]

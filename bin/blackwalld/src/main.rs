@@ -1,5 +1,7 @@
 //! The Blackwall daemon/CLI entry point.
 
+mod metrics;
+
 use clap::{Parser, Subcommand};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -832,9 +834,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 hold_down_secs * 1000,
             );
 
+            // Collector counters (sFlow datagrams / decode errors) for /metrics.
+            let collector_metrics = std::sync::Arc::new(blackwall_flow::CollectorMetrics::new());
+            // Captured inside the rtbh arm below so /metrics can report session state.
+            let mut bgp_for_metrics: Option<blackwall_bgp::BgpHandle> = None;
+
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
             {
-                None => std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store)),
+                None => std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store.clone())),
                 Some(rtbh) => {
                     let pg_sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
                         std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store.clone()));
@@ -853,6 +860,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // Supervise the session: log loudly when it leaves Established
                     // (mitigations aren't reaching the peer) — issue #79.
                     tokio::spawn(bgp_supervisor(bgp.state_watch()));
+                    bgp_for_metrics = Some(bgp.clone());
                     let controller =
                         blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
                     let journal: blackwall_state::Store = (*store).clone();
@@ -947,8 +955,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // Optional Prometheus metrics endpoint.
+            if let Some(metrics_listen) = policy.metrics_listen {
+                let sources = metrics::MetricsSources {
+                    store: store.clone(),
+                    bgp: bgp_for_metrics,
+                    collector: collector_metrics.clone(),
+                };
+                tokio::spawn(metrics::metrics_server(metrics_listen, sources));
+            }
+
             tracing::info!(%listen, "sflow collector starting");
-            blackwall_flow::run_collector(listen, Box::new(detector), sink, 1000, None).await?;
+            blackwall_flow::run_collector(
+                listen,
+                Box::new(detector),
+                sink,
+                1000,
+                Some(collector_metrics),
+            )
+            .await?;
             Ok(())
         }
         Command::Apply {
