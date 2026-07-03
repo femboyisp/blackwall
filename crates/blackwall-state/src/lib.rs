@@ -1645,6 +1645,7 @@ mod tests {
             banner_flux: None,
             dns_flux: None,
             rtbh: None,
+            flowspec: None,
         }
     }
 }
