@@ -21,6 +21,7 @@ async fn announces_a_host_route() {
         peer_addr: peer,
         router_id: "10.222.255.99".parse().unwrap(),
         hold_time: 90,
+        md5: None,
     };
     let (handle, _join) = blackwall_bgp::spawn(cfg).expect("valid iBGP config");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await; // let it establish
