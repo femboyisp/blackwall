@@ -223,6 +223,14 @@ impl Store {
         Ok(row.0)
     }
 
+    /// Count detection rows (active and cleared).
+    pub async fn detection_count(&self) -> Result<i64, StateError> {
+        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM detections")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
     /// Insert a new active detection row.
     pub async fn open_detection(&self, d: &Detection) -> Result<(), StateError> {
         let target = ipnetwork_addr(d.target);
@@ -1142,6 +1150,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn records_and_counts_detections() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let before = store.detection_count().await.expect("count");
+        let t: IpAddr = "203.0.113.21".parse().unwrap();
+        store
+            .open_detection(&sample_detection(t, 1_000, 1_000))
+            .await
+            .expect("open");
+        assert_eq!(store.detection_count().await.expect("count"), before + 1);
+    }
+
+    #[tokio::test]
     async fn rtbh_blackhole_roundtrip() {
         let Some(url) = test_url() else {
             eprintln!("DATABASE_URL not set; skipping");
@@ -1646,6 +1671,7 @@ mod tests {
             dns_flux: None,
             rtbh: None,
             flowspec: None,
+            metrics_listen: None,
         }
     }
 }
