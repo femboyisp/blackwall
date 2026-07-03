@@ -20,6 +20,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut dns_flux: Option<DnsFluxConfig> = None;
     let mut rtbh: Option<RtbhPolicy> = None;
     let mut flowspec: Option<FlowSpecPolicy> = None;
+    let mut metrics_listen: Option<SocketAddr> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -388,6 +389,28 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     max_ttl,
                 });
             }
+            "metrics" => {
+                for tok in &line.words[1..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "metrics",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    if k != "listen" {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "metrics key",
+                            value: k.to_owned(),
+                        });
+                    }
+                    metrics_listen =
+                        Some(v.parse::<SocketAddr>().map_err(|_| ConfigError::BadValue {
+                            line: line.number,
+                            what: "metrics listen",
+                            value: v.to_owned(),
+                        })?);
+                }
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -425,6 +448,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         dns_flux,
         rtbh,
         flowspec,
+        metrics_listen,
     })
 }
 
@@ -1165,6 +1189,51 @@ rtbh peer=10.0.0.2:179 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.
 flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=1
 ";
         assert!(parse_text(src).is_err());
+    }
+
+    #[test]
+    fn parses_metrics_listen() {
+        let p = parse_text("interface wan eth0\nmetrics listen=127.0.0.1:9100\n").unwrap();
+        assert_eq!(
+            p.metrics_listen,
+            Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn metrics_listen_absent_is_none() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert_eq!(p.metrics_listen, None);
+    }
+
+    #[test]
+    fn rejects_bad_metrics_addr() {
+        let err = parse_text("interface wan eth0\nmetrics listen=not-an-addr\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "metrics listen",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_metrics_unknown_key() {
+        let err = parse_text("interface wan eth0\nmetrics bogus=1\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "metrics key",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
