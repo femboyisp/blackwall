@@ -322,6 +322,7 @@ dependencies = [
  "blackwall-speedtest",
  "blackwall-state",
  "clap",
+ "ipnet",
  "notify",
  "serde_json",
  "tokio",
