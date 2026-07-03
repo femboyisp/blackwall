@@ -28,6 +28,9 @@ pub struct RtbhPolicy {
     pub hold_down: Duration,
     /// Auto-blackhole lifetime backstop; `None` disables the TTL.
     pub max_ttl: Option<Duration>,
+    /// Optional TCP-MD5 (RFC 2385) shared secret for the BGP session; `None`
+    /// leaves the session unauthenticated.
+    pub md5: Option<crate::Md5Secret>,
 }
 
 #[cfg(test)]
@@ -46,6 +49,7 @@ mod tests {
             max_blackholes: 256,
             hold_down: std::time::Duration::from_secs(60),
             max_ttl: Some(std::time::Duration::from_secs(7200)),
+            md5: Some(crate::Md5Secret::new("pw".into())),
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: RtbhPolicy = serde_json::from_str(&json).unwrap();
