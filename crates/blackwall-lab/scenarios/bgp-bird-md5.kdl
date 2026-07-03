@@ -1,0 +1,22 @@
+// BGP TCP-MD5 gate (RFC 2385): the Rust speaker peers with BIRD2 over an
+// authenticated session — BIRD requires a `password` on the neighbor, and the
+// speaker sets the matching key via setsockopt(TCP_MD5SIG). If the MD5 signature
+// were wrong or absent the session would never establish, so the fact that the
+// /32 reaches BIRD's RIB proves the authenticated session came up end to end.
+topology "bgp-bird-md5" {
+    node "peer" {
+        daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes" password="s3cr3t-md5-key"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="target/debug/lab-tests/blackwall-bgp-interop announces_a_host_route --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179 BW_BGP_ASN=214806 BW_BGP_MD5=s3cr3t-md5-key"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "authenticated-session-reaches-bird" {
+    step wait   node="peer" until="bgp-established" timeout="20s"
+    step assert node="peer" cmd="birdc show route 203.0.113.7/32" \
+         contains="203.0.113.7/32" timeout="15s"
+}
