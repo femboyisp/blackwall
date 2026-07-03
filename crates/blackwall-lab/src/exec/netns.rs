@@ -25,13 +25,25 @@ pub(crate) fn run(cmd: &mut Command) -> Result<Captured, LabError> {
     run_bounded(cmd, CMD_TIMEOUT)
 }
 
+/// How long to wait for a pipe-reader thread to finish after the child has
+/// exited (or been killed) before giving up and detaching it. Bounds the join
+/// so a reader blocked on a write-end still held by a detached grandchild can
+/// never hang the caller.
+const JOIN_GRACE: Duration = Duration::from_secs(5);
+
 /// Run `cmd`, killing it (and its process group) if it outlives `timeout`.
 ///
-/// The child is placed in its own process group so the kill reaches any
+/// The child is placed in its own process group so a kill reaches any
 /// grandchildren (`sh -c "cargo …"` spawns a tree). Both pipes are drained on
 /// threads so a chatty child cannot deadlock on a full pipe buffer while we
-/// poll for the deadline. On timeout, returns [`LabError::Exec`] naming the
-/// timeout so the failing step is diagnosable instead of a silent hang.
+/// poll for the deadline.
+///
+/// The one hard guarantee this function makes is that **the calling thread
+/// never blocks longer than `timeout + JOIN_GRACE`**: on timeout it kills the
+/// child and returns immediately (reaping/draining detached to background
+/// threads), and even the success path bounds its pipe-reader joins. On
+/// timeout it returns [`LabError::Exec`] naming the timeout, so a stuck command
+/// fails its step fast and diagnosably instead of a silent hang (blackwall#88).
 pub(crate) fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Captured, LabError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -53,19 +65,29 @@ pub(crate) fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Captur
         b
     });
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    loop {
         match child.try_wait() {
-            Ok(Some(s)) => break s,
+            Ok(Some(status)) => {
+                let stdout = join_bounded(out_h, JOIN_GRACE);
+                let stderr = join_bounded(err_h, JOIN_GRACE);
+                return Ok(Captured {
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    // exit code 0..=255 fits i32 without a lossy `as` cast.
+                    exit: status.code().unwrap_or(-1),
+                });
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Kill the whole process group (negative PID), then reap.
-                    let pid = child.id();
-                    let _ = Command::new("kill")
-                        .args(["-KILL", &format!("-{pid}")])
-                        .status();
-                    let _ = child.wait();
-                    let _ = out_h.join();
-                    let _ = err_h.join();
+                    // Kill the group (best-effort) AND the direct child (which
+                    // `Child::kill` guarantees), then DETACH: reaping and the
+                    // reader threads finish in the background so we return now
+                    // regardless of whether the group kill landed.
+                    kill_group(child.id());
+                    let _ = child.kill();
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                    });
                     return Err(LabError::Exec(format!(
                         "command timed out after {timeout:?} (killed)"
                     )));
@@ -74,15 +96,30 @@ pub(crate) fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Captur
             }
             Err(e) => return Err(LabError::Exec(format!("wait failed: {e}"))),
         }
-    };
-    let stdout = out_h.join().unwrap_or_default();
-    let stderr = err_h.join().unwrap_or_default();
-    Ok(Captured {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        // exit code 0..=255 fits i32 without a lossy `as` cast.
-        exit: status.code().unwrap_or(-1),
-    })
+    }
+}
+
+/// SIGKILL the process group led by `pid` (best-effort). The child was spawned
+/// with `process_group(0)`, so its PGID equals its PID; `kill -<pid>` targets
+/// the whole tree. Failure is ignored — the caller also kills the direct child.
+fn kill_group(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status();
+}
+
+/// Join a pipe-reader thread, but give up after `grace` and return whatever was
+/// read so far (empty) rather than blocking forever if a detached grandchild
+/// still holds the write-end. Never blocks longer than `grace`.
+fn join_bounded(handle: thread::JoinHandle<Vec<u8>>, grace: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + grace;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return Vec::new();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    handle.join().unwrap_or_default()
 }
 
 /// `ip netns add <ns>` (idempotent: ignores "File exists").
@@ -204,9 +241,11 @@ mod tests {
     #[test]
     fn run_bounded_drains_a_chatty_command_without_deadlock() {
         // Emit far more than a pipe buffer (~64KiB) to prove the reader threads
-        // prevent a write-side deadlock under the deadline poll.
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "yes abcdefghij | head -c 200000"]);
+        // prevent a write-side deadlock under the deadline poll. `/dev/zero`
+        // via `head -c` terminates deterministically (no infinite producer /
+        // SIGPIPE dependency).
+        let mut cmd = Command::new("head");
+        cmd.args(["-c", "200000", "/dev/zero"]);
         let c = run_bounded(&mut cmd, Duration::from_secs(10)).expect("chatty command runs");
         assert_eq!(c.stdout.len(), 200_000);
         assert_eq!(c.exit, 0);
