@@ -71,7 +71,14 @@ tenant acme {
 # Eligibility reuses the prefixes above (only your own space is ever blackholed).
 rtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 \
      next-hop-v4=192.0.2.1 max=256 hold-down=60s ttl=2h md5=optional-tcp-md5-secret
+
+# Optional Prometheus metrics endpoint (bind to localhost or a trusted mgmt net — no auth/TLS).
+metrics listen=127.0.0.1:9100
 ```
+
+With a `metrics` block, `blackwalld flow` serves `GET /metrics` (Prometheus text) exposing BGP
+session state + reconnects, sFlow datagrams/decode-errors, active RTBH/FlowSpec rule counts,
+pending operator-intent queue depths, and detection/session/audit totals.
 
 ### RTBH operator commands
 
