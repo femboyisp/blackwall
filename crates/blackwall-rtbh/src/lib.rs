@@ -4,9 +4,11 @@
 //! that executes its decisions.
 
 pub mod controller;
+pub mod flowspec_controller;
 pub mod manager;
 
 pub use controller::{BlackholeOrigin, RtbhAction, RtbhConfig, RtbhController};
+pub use flowspec_controller::{FlowKey, FlowSpecAction, FlowSpecConfig, FlowSpecController};
 pub use manager::{
     ApplyOutcome, BgpError, BgpExecutor, BlackholeJournal, JournalError, RtbhManager,
 };
