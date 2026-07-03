@@ -5,6 +5,7 @@ mod collector_net;
 mod detector;
 mod error;
 mod observation;
+mod select;
 mod sflow;
 mod sink;
 
@@ -12,5 +13,8 @@ pub use collector_net::run_collector;
 pub use detector::{AttackKind, Detection, DetectionEvent, Detector, Severity, ThresholdDetector};
 pub use error::FlowError;
 pub use observation::FlowObservation;
+pub use select::{select, FlowRule, Mitigation, SelectionConfig};
 pub use sflow::decode_datagram;
-pub use sink::{ChannelSink, FanoutSink, LogSink, MitigationSink};
+pub use sink::{
+    ChannelSink, FanoutSink, FlowMitigationEvent, LogSink, MitigationSink, SelectorSink,
+};

@@ -4,9 +4,13 @@
 //! that executes its decisions.
 
 pub mod controller;
+pub mod flowspec_controller;
+pub mod flowspec_manager;
 pub mod manager;
 
 pub use controller::{BlackholeOrigin, RtbhAction, RtbhConfig, RtbhController};
+pub use flowspec_controller::{FlowKey, FlowSpecAction, FlowSpecConfig, FlowSpecController};
+pub use flowspec_manager::{FlowSpecJournal, FlowSpecManager};
 pub use manager::{
     ApplyOutcome, BgpError, BgpExecutor, BlackholeJournal, JournalError, RtbhManager,
 };
@@ -21,6 +25,22 @@ impl manager::BgpExecutor for blackwall_bgp::BgpHandle {
     }
     async fn withdraw(&self, prefix: ipnet::IpNet) -> Result<(), manager::BgpError> {
         blackwall_bgp::BgpHandle::withdraw(self, prefix)
+            .await
+            .map_err(Into::into)
+    }
+    async fn announce_flowspec(
+        &self,
+        rule: blackwall_bgp::FlowSpecRule,
+    ) -> Result<(), manager::BgpError> {
+        blackwall_bgp::BgpHandle::announce_flowspec(self, rule)
+            .await
+            .map_err(Into::into)
+    }
+    async fn withdraw_flowspec(
+        &self,
+        rule: blackwall_bgp::FlowSpecRule,
+    ) -> Result<(), manager::BgpError> {
+        blackwall_bgp::BgpHandle::withdraw_flowspec(self, rule)
             .await
             .map_err(Into::into)
     }
