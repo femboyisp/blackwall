@@ -260,7 +260,7 @@ impl FlowSpecController {
     /// an attack is still ongoing but (unlike `Open`) carries no rule list to
     /// re-install. Cancels any pending deferred clear and refreshes the TTL
     /// anchor on every active rule of `target`'s host route, mirroring the
-    /// re-assertion branch of [`Self::insert_rule`] — but for rules already known
+    /// re-assertion branch of `Self::insert_rule` — but for rules already known
     /// to the controller, so no BGP re-announce or journal write is needed.
     pub fn refresh_target(&mut self, target: IpAddr, now: u64) {
         let host = host_prefix(target);

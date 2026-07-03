@@ -76,7 +76,7 @@ impl MirrorOp {
 /// mechanism: on a failed first announce the controller entry is kept in
 /// memory while the rule itself is never re-announced automatically. A
 /// journal failure after a successful BGP operation is logged, never causes a
-/// live rule to be withdrawn, and is queued as a [`MirrorOp`] for a bounded
+/// live rule to be withdrawn, and is queued as a `MirrorOp` for a bounded
 /// self-heal retry on the next [`FlowSpecManager::tick`] — the BGP outcome is
 /// never re-issued, only the mirror write.
 pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
@@ -85,7 +85,7 @@ pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     journal: J,
     /// Journal writes that failed after their BGP operation already
     /// succeeded; retried (never re-issued to BGP) by
-    /// [`FlowSpecManager::retry_pending_mirror`] on the next tick.
+    /// `FlowSpecManager::retry_pending_mirror` on the next tick.
     pending_mirror: Vec<MirrorOp>,
 }
 
@@ -157,7 +157,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     ///
     /// Starts by retrying any journal mirror writes queued by a previous
     /// tick's transient failure (see
-    /// [`FlowSpecManager::retry_pending_mirror`]), so a self-heal converges
+    /// `FlowSpecManager::retry_pending_mirror`), so a self-heal converges
     /// within one tick interval of the DB recovering.
     pub async fn tick(&mut self, mono_now: u64, wall_now: u64) {
         self.retry_pending_mirror().await;
