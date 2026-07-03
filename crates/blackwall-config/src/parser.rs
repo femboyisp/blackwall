@@ -4,8 +4,8 @@
 use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
-    AllowRule, BannerFluxConfig, DnsFluxConfig, L4Proto, Policy, PortState, RtbhPolicy,
-    ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
+    AllowRule, BannerFluxConfig, DnsFluxConfig, FlowSpecPolicy, L4Proto, Policy, PortState,
+    RtbhPolicy, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -19,6 +19,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut banner_flux: Option<BannerFluxConfig> = None;
     let mut dns_flux: Option<DnsFluxConfig> = None;
     let mut rtbh: Option<RtbhPolicy> = None;
+    let mut flowspec: Option<FlowSpecPolicy> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -299,6 +300,90 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     max_ttl,
                 });
             }
+            "flowspec" => {
+                if flowspec.is_some() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "flowspec",
+                        value: "duplicate".to_owned(),
+                    });
+                }
+                let mut kv: std::collections::HashMap<&str, &str> =
+                    std::collections::HashMap::new();
+                for tok in &line.words[1..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "flowspec",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    if !matches!(
+                        k,
+                        "concentration" | "max-flows" | "rate" | "max-rules" | "hold-down" | "ttl"
+                    ) {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "flowspec key",
+                            value: k.to_owned(),
+                        });
+                    }
+                    kv.insert(k, v);
+                }
+                let bad = |what: &'static str, v: &str| ConfigError::BadValue {
+                    line: line.number,
+                    what,
+                    value: v.to_owned(),
+                };
+                let get = |k: &str| -> Result<&str, ConfigError> {
+                    kv.get(k).copied().ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "flowspec missing key",
+                        value: k.to_owned(),
+                    })
+                };
+                let concentration: f64 = get("concentration")?
+                    .parse()
+                    .map_err(|_| bad("concentration", get("concentration").unwrap_or("")))?;
+                let max_flows: usize = get("max-flows")?
+                    .parse()
+                    .map_err(|_| bad("max-flows", get("max-flows").unwrap_or("")))?;
+                let rate: f32 = get("rate")?
+                    .parse()
+                    .map_err(|_| bad("rate", get("rate").unwrap_or("")))?;
+                let max_rules: usize = get("max-rules")?
+                    .parse()
+                    .map_err(|_| bad("max-rules", get("max-rules").unwrap_or("")))?;
+                let hold_down = parse_duration(line, get("hold-down")?)?;
+                let max_ttl = match kv.get("ttl") {
+                    Some(t) => Some(parse_duration(line, t)?),
+                    None => None,
+                };
+                if let Some(ttl) = max_ttl {
+                    if ttl < hold_down {
+                        return Err(bad("flowspec ttl", "must be >= hold-down"));
+                    }
+                }
+                // Reject misconfigurations that silently break selection: a NaN
+                // or out-of-range `concentration` (NaN makes `cumulative >= c`
+                // always false → FlowSpec never chosen), `max-flows` of 0 (loop
+                // never selects), or a negative `rate` (nonsensical traffic-rate).
+                if !(0.0..=1.0).contains(&concentration) {
+                    return Err(bad("flowspec concentration", "must be in 0.0..=1.0"));
+                }
+                if max_flows == 0 {
+                    return Err(bad("flowspec max-flows", "must be >= 1"));
+                }
+                if rate.is_nan() || rate < 0.0 {
+                    return Err(bad("flowspec rate", "must be >= 0"));
+                }
+                flowspec = Some(FlowSpecPolicy {
+                    concentration,
+                    max_flows,
+                    rate,
+                    max_rules,
+                    hold_down,
+                    max_ttl,
+                });
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -316,6 +401,16 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         expected: "an `interface` directive",
     })?;
 
+    // FlowSpec reuses the `rtbh` block's BGP peer (single shared iBGP session),
+    // so a `flowspec` directive is meaningless without an `rtbh` block.
+    if flowspec.is_some() && rtbh.is_none() {
+        return Err(ConfigError::BadValue {
+            line: eof_line,
+            what: "flowspec",
+            value: "requires an rtbh block (shared BGP session)".to_owned(),
+        });
+    }
+
     Ok(Policy {
         interface,
         prefixes,
@@ -325,6 +420,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         banner_flux,
         dns_flux,
         rtbh,
+        flowspec,
     })
 }
 
@@ -978,6 +1074,80 @@ tenant t {
     fn rtbh_rejects_duplicate() {
         let dup = "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\nrtbh peer=10.0.0.3 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\n";
         assert!(parse_text(dup).is_err());
+    }
+
+    #[test]
+    fn parses_flowspec_directive() {
+        let src = "\
+interface wan eth0
+ipv4 203.0.113.0/24
+rtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 next-hop-v4=10.222.255.99 max=256 hold-down=60s ttl=2h
+flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s ttl=2h
+";
+        let policy = parse_text(src).unwrap();
+        let fs = policy.flowspec.expect("flowspec present");
+        assert_eq!(fs.concentration, 0.8);
+        assert_eq!(fs.max_flows, 4);
+        assert_eq!(fs.rate, 0.0);
+        assert_eq!(fs.max_rules, 256);
+        assert_eq!(fs.hold_down, std::time::Duration::from_secs(60));
+        assert_eq!(fs.max_ttl, Some(std::time::Duration::from_secs(7200)));
+    }
+
+    #[test]
+    fn flowspec_without_rtbh_is_rejected() {
+        let src = "\
+interface wan eth0
+ipv4 203.0.113.0/24
+flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s ttl=2h
+";
+        let err = parse_text(src).unwrap_err();
+        assert!(format!("{err}").contains("flowspec"));
+    }
+
+    #[test]
+    fn flowspec_rejects_invalid_selection_tunables() {
+        let base = "interface wan eth0\nrtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 next-hop-v4=10.222.255.99 max=256 hold-down=60s ttl=2h\n";
+        for fs in [
+            "flowspec concentration=1.5 max-flows=4 rate=0 max-rules=256 hold-down=60s",
+            "flowspec concentration=nan max-flows=4 rate=0 max-rules=256 hold-down=60s",
+            "flowspec concentration=0.8 max-flows=0 rate=0 max-rules=256 hold-down=60s",
+            "flowspec concentration=0.8 max-flows=4 rate=-1 max-rules=256 hold-down=60s",
+        ] {
+            let src = format!("{base}{fs}\n");
+            assert!(parse_text(&src).is_err(), "should reject: {fs}");
+        }
+    }
+
+    #[test]
+    fn duplicate_flowspec_is_rejected() {
+        let src = "\
+interface wan eth0
+rtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 next-hop-v4=10.222.255.99 max=256 hold-down=60s ttl=2h
+flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s ttl=2h
+flowspec concentration=0.9 max-flows=2 rate=0 max-rules=8 hold-down=30s ttl=1h
+";
+        assert!(parse_text(src).is_err());
+    }
+
+    #[test]
+    fn flowspec_rejects_ttl_below_hold_down() {
+        let src = "\
+interface wan eth0
+rtbh peer=10.0.0.2:179 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=60s
+flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s ttl=30s
+";
+        assert!(parse_text(src).is_err());
+    }
+
+    #[test]
+    fn flowspec_rejects_unknown_key() {
+        let src = "\
+interface wan eth0
+rtbh peer=10.0.0.2:179 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=60s
+flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=1
+";
+        assert!(parse_text(src).is_err());
     }
 
     #[test]

@@ -278,6 +278,7 @@ name = "blackwall-state"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blackwall-bgp",
  "blackwall-core",
  "blackwall-flow",
  "blackwall-rtbh",
@@ -321,6 +322,7 @@ dependencies = [
  "blackwall-speedtest",
  "blackwall-state",
  "clap",
+ "ipnet",
  "notify",
  "serde_json",
  "tokio",
