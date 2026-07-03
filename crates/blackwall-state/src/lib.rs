@@ -3,12 +3,14 @@
 
 mod audit;
 mod error;
+mod flowspec;
 mod rtbh;
 mod services;
 mod sessions;
 mod tenants;
 
 pub use error::StateError;
+pub use flowspec::{FlowSpecRequestRow, FlowSpecRuleRow};
 pub use rtbh::{RtbhBlackholeRow, RtbhRequestRow};
 pub use services::StoredService;
 pub use sessions::SessionRow;
@@ -26,6 +28,32 @@ use std::sync::Arc;
 pub struct Store {
     pool: PgPool,
 }
+
+/// Raw column tuple decoded from a `flowspec_rules` row:
+/// `(dst, proto, dst_port, rate::real, origin, announced_at_ms, withdrawn_at_ms)`.
+type FlowSpecRuleTuple = (
+    sqlx::types::ipnetwork::IpNetwork,
+    i32,
+    i32,
+    f32,
+    String,
+    i64,
+    Option<i64>,
+);
+
+/// Raw column tuple decoded from a `flowspec_requests` row:
+/// `(id, dst, proto, dst_port, rate::real, action, created_by, status, note)`.
+type FlowSpecRequestTuple = (
+    i64,
+    sqlx::types::ipnetwork::IpNetwork,
+    i32,
+    i32,
+    f32,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 
 impl Store {
     /// Connect to PostgreSQL at `database_url` (e.g.
@@ -485,6 +513,308 @@ impl Store {
         };
         Ok(rows_to_requests(rows))
     }
+
+    /// Insert or refresh the active `flowspec_rules` mirror row for the
+    /// `(dst, proto, dst_port)` flow key. If an active row already exists its
+    /// `origin` is upgraded per the announcement but never downgraded from
+    /// `manual` to `auto` (an upsert can race a `manual_add` and must not
+    /// clobber it); the `rate` is always refreshed to the latest announcement.
+    pub async fn record_flowspec(
+        &self,
+        dst: IpAddr,
+        proto: u8,
+        dst_port: u16,
+        rate: f32,
+        origin: &str,
+        at_ms: u64,
+    ) -> Result<(), StateError> {
+        let dst = ipnetwork_addr(dst);
+        let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
+        sqlx::query(
+            "INSERT INTO flowspec_rules (dst, proto, dst_port, rate, origin, announced_at) \
+             VALUES ($1, $2, $3, $4, $5, to_timestamp($6::bigint / 1000.0)) \
+             ON CONFLICT (dst, proto, dst_port) WHERE withdrawn_at IS NULL DO UPDATE SET \
+             origin = CASE WHEN flowspec_rules.origin = 'manual' THEN 'manual' ELSE EXCLUDED.origin END, \
+             rate = EXCLUDED.rate",
+        )
+        .bind(dst)
+        .bind(i32::from(proto))
+        .bind(i32::from(dst_port))
+        .bind(f64::from(rate))
+        .bind(origin)
+        .bind(at_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark the active `flowspec_rules` row for the `(dst, proto, dst_port)`
+    /// flow key as withdrawn. When `only_auto` is set, only a row with
+    /// `origin = 'auto'` is cleared (the auto-path guard that keeps a Cleared
+    /// event from withdrawing a manual rule).
+    pub async fn clear_flowspec(
+        &self,
+        dst: IpAddr,
+        proto: u8,
+        dst_port: u16,
+        at_ms: u64,
+        only_auto: bool,
+    ) -> Result<(), StateError> {
+        let dst = ipnetwork_addr(dst);
+        let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
+        let query = if only_auto {
+            "UPDATE flowspec_rules SET withdrawn_at = to_timestamp($4::bigint / 1000.0) \
+             WHERE dst = $1 AND proto = $2 AND dst_port = $3 AND withdrawn_at IS NULL AND origin = 'auto'"
+        } else {
+            "UPDATE flowspec_rules SET withdrawn_at = to_timestamp($4::bigint / 1000.0) \
+             WHERE dst = $1 AND proto = $2 AND dst_port = $3 AND withdrawn_at IS NULL"
+        };
+        sqlx::query(query)
+            .bind(dst)
+            .bind(i32::from(proto))
+            .bind(i32::from(dst_port))
+            .bind(at_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// List all currently-active (not withdrawn) FlowSpec rules.
+    ///
+    /// `rate` is selected as `::real` so SQLx decodes it straight into `f32`
+    /// (avoiding a forbidden `f64 as f32` narrowing cast).
+    pub async fn list_active_flowspec(&self) -> Result<Vec<FlowSpecRuleRow>, StateError> {
+        let rows: Vec<FlowSpecRuleTuple> = sqlx::query_as(
+            "SELECT dst, proto, dst_port, rate::real, origin, \
+                (EXTRACT(EPOCH FROM announced_at) * 1000)::bigint, \
+                (EXTRACT(EPOCH FROM withdrawn_at) * 1000)::bigint \
+             FROM flowspec_rules WHERE withdrawn_at IS NULL ORDER BY dst, proto, dst_port",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (dst, proto, dst_port, rate, origin, announced_at_ms, withdrawn_at_ms) in rows {
+            let announced_at_ms = u64::try_from(announced_at_ms).map_err(|_| {
+                StateError::Db(sqlx::Error::Decode(
+                    format!("announced_at_ms {announced_at_ms} out of u64 range").into(),
+                ))
+            })?;
+            let withdrawn_at_ms = withdrawn_at_ms
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    StateError::Db(sqlx::Error::Decode(
+                        "withdrawn_at_ms out of u64 range".into(),
+                    ))
+                })?;
+            out.push(FlowSpecRuleRow {
+                dst: dst.ip(),
+                proto: narrow_proto(proto)?,
+                dst_port: narrow_port(dst_port)?,
+                rate,
+                origin,
+                announced_at_ms,
+                withdrawn_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Append an operator intent row to `flowspec_requests` (`status =
+    /// 'pending'` by default). Returns the new row's id.
+    pub async fn enqueue_flowspec_request(
+        &self,
+        dst: IpAddr,
+        proto: u8,
+        dst_port: u16,
+        rate: f32,
+        action: &str,
+        created_by: &str,
+    ) -> Result<i64, StateError> {
+        let dst = ipnetwork_addr(dst);
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO flowspec_requests (dst, proto, dst_port, rate, action, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(dst)
+        .bind(i32::from(proto))
+        .bind(i32::from(dst_port))
+        .bind(f64::from(rate))
+        .bind(action)
+        .bind(created_by)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Fetch all FlowSpec requests with `status = 'pending'`, ordered by id.
+    ///
+    /// Status-driven (not a watermark): every tick re-reads the genuinely
+    /// pending set, so a capacity-deferred add is naturally retried (it's still
+    /// `pending`) and a restart never replays already-`applied`/`rejected`
+    /// history.
+    pub async fn pending_flowspec_requests(&self) -> Result<Vec<FlowSpecRequestRow>, StateError> {
+        let rows: Vec<FlowSpecRequestTuple> = sqlx::query_as(
+            "SELECT id, dst, proto, dst_port, rate::real, action, created_by, status, note \
+             FROM flowspec_requests WHERE status = 'pending' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows_to_flowspec_requests(rows)
+    }
+
+    /// Mark any still-`pending` `add` request for the `(dst, proto, dst_port)`
+    /// flow key with `id < before_id` as `applied` (with a `"superseded by
+    /// remove"` note), so a later remove cancels an earlier not-yet-applied add
+    /// for the same flow instead of letting it re-announce once capacity frees.
+    ///
+    /// Scoped to `before_id` (the remove request's own id) so a re-add that
+    /// races in after the remove was snapshotted — i.e. has a higher id than
+    /// the remove — is never superseded by it.
+    pub async fn supersede_pending_flowspec_adds(
+        &self,
+        dst: IpAddr,
+        proto: u8,
+        dst_port: u16,
+        before_id: i64,
+    ) -> Result<(), StateError> {
+        let dst = ipnetwork_addr(dst);
+        sqlx::query(
+            "UPDATE flowspec_requests SET status = 'applied', note = 'superseded by remove', \
+             applied_at = now() WHERE action = 'add' AND dst = $1 AND proto = $2 AND dst_port = $3 \
+             AND status = 'pending' AND id < $4",
+        )
+        .bind(dst)
+        .bind(i32::from(proto))
+        .bind(i32::from(dst_port))
+        .bind(before_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update a FlowSpec request's status (and optional note), stamping
+    /// `applied_at`.
+    pub async fn set_flowspec_request_status(
+        &self,
+        id: i64,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<(), StateError> {
+        sqlx::query(
+            "UPDATE flowspec_requests SET status = $2, note = $3, applied_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(note)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List FlowSpec requests, optionally filtered to a single `status`.
+    pub async fn list_flowspec_requests(
+        &self,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<FlowSpecRequestRow>, StateError> {
+        let rows: Vec<FlowSpecRequestTuple> = match status_filter {
+            Some(status) => sqlx::query_as(
+                "SELECT id, dst, proto, dst_port, rate::real, action, created_by, status, note \
+                     FROM flowspec_requests WHERE status = $1 ORDER BY id",
+            )
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await?,
+            None => sqlx::query_as(
+                "SELECT id, dst, proto, dst_port, rate::real, action, created_by, status, note \
+                     FROM flowspec_requests ORDER BY id",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+        };
+        rows_to_flowspec_requests(rows)
+    }
+}
+
+/// Narrow a Postgres `INTEGER` (`i32`) protocol column to `u8`, mapping an
+/// out-of-range value to a decode error rather than a silent `as` truncation.
+fn narrow_proto(v: i32) -> Result<u8, StateError> {
+    u8::try_from(v).map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))
+}
+
+/// Narrow a Postgres `INTEGER` (`i32`) port column to `u16`, mapping an
+/// out-of-range value to a decode error rather than a silent `as` truncation.
+fn narrow_port(v: i32) -> Result<u16, StateError> {
+    u16::try_from(v).map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))
+}
+
+/// Map raw `flowspec_requests` rows into [`FlowSpecRequestRow`]s, narrowing the
+/// `INTEGER` proto/port columns to `u8`/`u16` (`rate` is already decoded as
+/// `f32` via a `::real` cast in the SELECT).
+fn rows_to_flowspec_requests(
+    rows: Vec<FlowSpecRequestTuple>,
+) -> Result<Vec<FlowSpecRequestRow>, StateError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, dst, proto, dst_port, rate, action, created_by, status, note) in rows {
+        out.push(FlowSpecRequestRow {
+            id,
+            dst: dst.ip(),
+            proto: narrow_proto(proto)?,
+            dst_port: narrow_port(dst_port)?,
+            rate,
+            action,
+            created_by,
+            status,
+            note,
+        });
+    }
+    Ok(out)
+}
+
+#[async_trait::async_trait]
+impl blackwall_rtbh::FlowSpecJournal for Store {
+    async fn record_announce(
+        &self,
+        rule: blackwall_bgp::FlowSpecRule,
+        origin: blackwall_rtbh::BlackholeOrigin,
+        at_ms: u64,
+    ) -> Result<(), blackwall_rtbh::JournalError> {
+        let (dst, proto, port, rate) = flatten_flowspec(&rule);
+        let o = match origin {
+            blackwall_rtbh::BlackholeOrigin::Auto => "auto",
+            blackwall_rtbh::BlackholeOrigin::Manual => "manual",
+        };
+        self.record_flowspec(dst, proto, port, rate, o, at_ms)
+            .await
+            .map_err(|e| blackwall_rtbh::JournalError(e.to_string()))
+    }
+
+    async fn record_withdraw(
+        &self,
+        rule: blackwall_bgp::FlowSpecRule,
+        at_ms: u64,
+    ) -> Result<(), blackwall_rtbh::JournalError> {
+        let (dst, proto, port, _rate) = flatten_flowspec(&rule);
+        // `only_auto = false` here is safe: the auto-vs-manual guard (never let
+        // an auto-clear withdraw a manual rule) is enforced upstream in
+        // `FlowSpecController` before this ever runs (mirrors the RTBH journal).
+        self.clear_flowspec(dst, proto, port, at_ms, false)
+            .await
+            .map_err(|e| blackwall_rtbh::JournalError(e.to_string()))
+    }
+}
+
+/// Flatten a [`blackwall_bgp::FlowSpecRule`] to the Store's `(dst, proto,
+/// dst_port, rate)` scalar columns. The auto-mitigation path always sets
+/// `protocol`/`dst_port` (a concentrated flow has both); absent components
+/// default to `0`, matching how the mirror keys rows.
+fn flatten_flowspec(rule: &blackwall_bgp::FlowSpecRule) -> (IpAddr, u8, u16, f32) {
+    let dst = rule.dst.addr();
+    let proto = rule.protocol.unwrap_or(0);
+    let port = rule.dst_port.unwrap_or(0);
+    let blackwall_bgp::FlowAction::TrafficRate(rate) = rule.action;
+    (dst, proto, port, rate)
 }
 
 /// Map raw `rtbh_requests` rows into [`RtbhRequestRow`]s.
@@ -1052,6 +1382,191 @@ mod tests {
             .unwrap()
             .iter()
             .any(|r| r.target == t));
+    }
+
+    #[tokio::test]
+    async fn flowspec_record_list_clear_roundtrip() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let dst: IpAddr = "203.0.113.7".parse().unwrap();
+        store
+            .record_flowspec(dst, 17, 53, 0.0, "auto", 1_000)
+            .await
+            .unwrap();
+        let active = store.list_active_flowspec().await.unwrap();
+        let row = active.iter().find(|r| r.dst == dst).expect("row present");
+        assert_eq!(row.proto, 17);
+        assert_eq!(row.dst_port, 53);
+        assert_eq!(row.rate, 0.0);
+        assert_eq!(row.origin, "auto");
+        store
+            .clear_flowspec(dst, 17, 53, 2_000, false)
+            .await
+            .unwrap();
+        assert!(!store
+            .list_active_flowspec()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.dst == dst));
+    }
+
+    #[tokio::test]
+    async fn flowspec_no_downgrade_manual_to_auto() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let dst: IpAddr = "203.0.113.8".parse().unwrap();
+        store
+            .record_flowspec(dst, 6, 443, 0.0, "manual", 1_000)
+            .await
+            .unwrap();
+        // Re-announcing as auto must NOT downgrade the manual origin.
+        store
+            .record_flowspec(dst, 6, 443, 0.0, "auto", 1_500)
+            .await
+            .unwrap();
+        let active = store.list_active_flowspec().await.unwrap();
+        assert_eq!(
+            active.iter().find(|r| r.dst == dst).unwrap().origin,
+            "manual"
+        );
+    }
+
+    #[tokio::test]
+    async fn flowspec_clear_only_auto_keeps_manual() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let dst: IpAddr = "203.0.113.9".parse().unwrap();
+        store
+            .record_flowspec(dst, 6, 80, 0.0, "manual", 1_000)
+            .await
+            .unwrap();
+        // only_auto=true must not clear a manual entry.
+        store.clear_flowspec(dst, 6, 80, 2_000, true).await.unwrap();
+        assert!(store
+            .list_active_flowspec()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.dst == dst));
+    }
+
+    #[tokio::test]
+    async fn flowspec_request_queue_and_supersede() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let dst: IpAddr = "203.0.113.10".parse().unwrap();
+        let add_id = store
+            .enqueue_flowspec_request(dst, 17, 53, 0.0, "add", "op")
+            .await
+            .unwrap();
+        let rm_id = store
+            .enqueue_flowspec_request(dst, 17, 53, 0.0, "remove", "op")
+            .await
+            .unwrap();
+        let pending = store.pending_flowspec_requests().await.unwrap();
+        assert!(pending.iter().any(|r| r.id == add_id && r.action == "add"));
+        assert!(pending
+            .iter()
+            .any(|r| r.id == rm_id && r.action == "remove"));
+
+        store
+            .supersede_pending_flowspec_adds(dst, 17, 53, rm_id)
+            .await
+            .unwrap();
+        // The earlier add is now 'applied'; only the remove stays pending.
+        let pending = store.pending_flowspec_requests().await.unwrap();
+        assert!(
+            !pending.iter().any(|r| r.id == add_id),
+            "superseded add must no longer be pending"
+        );
+        assert!(pending.iter().any(|r| r.id == rm_id));
+        let superseded = store
+            .list_flowspec_requests(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == add_id)
+            .unwrap();
+        assert_eq!(superseded.status, "applied");
+        assert_eq!(superseded.note.as_deref(), Some("superseded by remove"));
+
+        store
+            .set_flowspec_request_status(rm_id, "applied", None)
+            .await
+            .unwrap();
+        assert!(!store
+            .pending_flowspec_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.id == rm_id));
+    }
+
+    #[tokio::test]
+    async fn flowspec_journal_impl() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        use blackwall_rtbh::FlowSpecJournal;
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let dst: IpAddr = "203.0.113.13".parse().unwrap();
+        let rule = blackwall_bgp::FlowSpecRule {
+            dst: "203.0.113.13/32".parse().unwrap(),
+            protocol: Some(17),
+            dst_port: Some(53),
+            action: blackwall_bgp::FlowAction::TrafficRate(0.0),
+        };
+        store
+            .record_announce(rule.clone(), blackwall_rtbh::BlackholeOrigin::Auto, 1_000)
+            .await
+            .unwrap();
+        assert!(store
+            .list_active_flowspec()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.dst == dst && r.proto == 17 && r.dst_port == 53 && r.origin == "auto"));
+        store
+            .record_announce(rule.clone(), blackwall_rtbh::BlackholeOrigin::Manual, 2_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_active_flowspec()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.dst == dst)
+                .unwrap()
+                .origin,
+            "manual"
+        );
+        store.record_withdraw(rule, 3_000).await.unwrap();
+        assert!(!store
+            .list_active_flowspec()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.dst == dst));
     }
 
     #[test]

@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+blackwall-bgp = { path = "../blackwall-bgp" }
 blackwall-core = { path = "../blackwall-core" }
 blackwall-flow = { path = "../blackwall-flow" }
 blackwall-rtbh = { path = "../blackwall-rtbh" }
