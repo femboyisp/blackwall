@@ -15,6 +15,7 @@ blackwall-nft = { path = "../../crates/blackwall-nft" }
 blackwall-shaper = { path = "../../crates/blackwall-shaper" }
 blackwall-dns = { path = "../../crates/blackwall-dns" }
 blackwall-flow = { path = "../../crates/blackwall-flow" }
+blackwall-metrics = { path = "../../crates/blackwall-metrics" }
 blackwall-speedtest = { path = "../../crates/blackwall-speedtest" }
 blackwall-bgp = { path = "../../crates/blackwall-bgp" }
 blackwall-rtbh = { path = "../../crates/blackwall-rtbh" }
