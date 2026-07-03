@@ -203,7 +203,9 @@ limiting. The DDoS-lab traffic-generation foundation (`blackwall-trafficgen`) is
 - ✅ **C2a — FlowSpec codec:** RFC 8955/8956 (SAFI 133) rule encoding + speaker inject path.
 - ✅ **C2b-1 — Auto-mitigation core:** concentration-based selection routes a detection to a
   flow-scoped FlowSpec drop (concentrated) or an RTBH blackhole (diffuse).
-- ⏳ **C2b-2 — FlowSpec control plane:** persistence, `flowspec` config, operator CLI, daemon wiring.
+- ✅ **C2b-2 — FlowSpec control plane:** persistence (`flowspec_rules`, re-announced on restart),
+  `flowspec` config directive, `blackwalld flowspec` operator CLI, and daemon wiring — the FlowSpec
+  manager runs alongside RTBH off the shared iBGP session, driven by the selector.
 - ⏳ **C3 — Looking-glass, C4 — auto-peering, scrubbing, dn42** *(later).*
 
 **D — Detection & telemetry** *(in progress)*
