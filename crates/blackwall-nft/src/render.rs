@@ -428,6 +428,7 @@ mod tests {
             dns_flux: None,
             rtbh: None,
             flowspec: None,
+            metrics_listen: None,
         }
     }
 
@@ -450,6 +451,7 @@ mod tests {
             dns_flux: None,
             rtbh: None,
             flowspec: None,
+            metrics_listen: None,
         }
     }
 
@@ -695,6 +697,7 @@ mod tests {
             dns_flux: None,
             rtbh: None,
             flowspec: None,
+            metrics_listen: None,
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.

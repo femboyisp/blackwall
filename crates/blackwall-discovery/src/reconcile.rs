@@ -115,6 +115,7 @@ mod tests {
             dns_flux: None,
             rtbh: None,
             flowspec: None,
+            metrics_listen: None,
         }
     }
 

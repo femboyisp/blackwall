@@ -128,6 +128,7 @@ mod tests {
             dns_flux: None,
             rtbh: None,
             flowspec: None,
+            metrics_listen: None,
         }
     }
 
@@ -264,6 +265,7 @@ mod tests {
             dns_flux: None,
             rtbh: None,
             flowspec: None,
+            metrics_listen: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
