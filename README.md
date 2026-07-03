@@ -10,10 +10,12 @@ the real thing. Blackwall is built for high packet rates and multi-tenant hostin
 nftables data plane today and an XDP/eBPF fast path, BGP scrubbing, and DNS fast-flux on the
 roadmap.
 
-> ⚠️ **Status:** early development. Milestone 1 (the core foundation) is complete; the deception
-> engine and later layers are in progress — see [Roadmap](#roadmap). The current nftables ruleset
-> classifies policy structure but does **not** yet enforce deception/forwarding (that lands in
-> Milestone 2).
+> ⚠️ **Status:** active development. Sub-project **A** (deception firewall) is feature-complete
+> through M3 — the nftables data plane enforces deception (TPROXY/NFQUEUE → honeypot engine) and
+> real-service forwarding, with protocol emulators, Incus discovery, CAKE shaping, and DNS/banner
+> fast-flux. Sub-project **D** ships volumetric detection (D1), and **C** (BGP control plane) ships
+> RTBH end to end plus FlowSpec auto-mitigation. The remaining layers — A·M4 (API/ops) and B (the
+> XDP/eBPF DDoS data plane) — are not yet built. See the [Roadmap](#roadmap).
 
 ## How it works
 
@@ -151,6 +153,7 @@ Current scenarios (each a CI gate):
 | `deception-resilience` | A connection flood past the deception engine's `max_concurrent` cap proves its DDoS-defense is correct — drop-at-cap is enforced, legit deception still gets `SSH-2.0`, and the engine survives. A **resilience/correctness** gate, not a throughput benchmark (realistic-scale stress needs kernel-bypass, tracked separately). |
 | `rtbh-bird` | The `RtbhManager` announces both an auto-detected and an operator-manual `/32` blackhole (community `65535:666`, RFC 7999) via the native BGP speaker; real **BIRD2** must show both routes carrying that community — the detection→mitigation (D→C) loop, auto and manual, end to end. |
 | `flowspec-bird` | The native speaker injects a BGP **FlowSpec** rule (RFC 8955, SAFI 133) — *drop UDP dport 53 → 203.0.113.7/32* — over iBGP; real **BIRD2** must validate and install it into its `flow4` table with the full match (`dst 203.0.113.7/32; proto 17; dport 53`) — finer-grained mitigation than a whole-IP blackhole. |
+| `flowspec-auto-bird` | The concentration-based selector routes a synthetic detection to the right mitigation: a *concentrated* attack (one dominant port) auto-installs a FlowSpec drop rule in real **BIRD2**'s `flow4tab`, while a *diffuse* attack auto-installs an RTBH `/32` blackhole — the auto-mitigation decision (`FlowSpec` vs `RTBH`) proven end to end. |
 
 The architecture is pure-core / thin-IO: the topology compiler, address allocator, config
 renderers, and report serializers are unit-tested to the 90% gate; the netns/process executor is
@@ -180,19 +183,36 @@ generation to exercise the XDP/eBPF data plane.
 
 ## Roadmap
 
-Blackwall is built as four independent sub-projects, each delivered in milestones:
+Blackwall is built as four independent sub-projects, each delivered in milestones.
 
-**A — Deception firewall + orchestrator** *(in progress)*
+**A — Deception firewall + orchestrator**
 - ✅ **M1 — Core foundation:** workspace, domain/policy model, config DSL, PostgreSQL state,
   nftables render + atomic apply, CLI.
-- ⏳ **M2 — Deception engine:** two-tier stateless + interactive honeypot with protocol emulators.
-- ⏳ **M3 — Discovery, shaping, flux:** host/Incus discovery, automatic CAKE shaping + speedtests,
-  signature rotation, DNS fast-flux (Knot DNS).
+- ✅ **M2 — Deception engine:** two-tier stateless + interactive honeypot; SSH/HTTP/SMTP/Redis/
+  MySQL/PostgreSQL emulators; TPROXY/NFQUEUE transports; connection cap + session timeout.
+- ✅ **M3 — Discovery, shaping, flux:** host/Incus discovery + reconciler, automatic CAKE shaping
+  from multi-provider speedtests, banner fast-flux, DNS fast-flux (RFC 2136 + TSIG to Knot).
 - ⏳ **M4 — API & ops:** tenant-scoped REST API, Prometheus metrics, daemon supervision.
 
-**B — DDoS data plane** — XDP/eBPF + AF_XDP fast drop, SYNPROXY, conntrack, rate limiting.
-**C — ISP/BGP control plane** — own-ASN prefix announcement, RTBH, FlowSpec, scrubbing, dn42.
-**D — Detection & telemetry** — sFlow/NetFlow/IPFIX ingest driving B and C.
+**B — DDoS data plane** *(not started)* — XDP/eBPF + AF_XDP fast drop, SYNPROXY, conntrack, rate
+limiting. The DDoS-lab traffic-generation foundation (`blackwall-trafficgen`) is in place ahead of it.
+
+**C — ISP/BGP control plane** *(in progress)* — a native injection-only iBGP speaker to BIRD.
+- ✅ **C1 — RTBH:** byte-exact BGP codec + speaker (C1a); pure blackhole controller (C1b);
+  the full control plane — Postgres persistence, detector auto-trigger, operator CLI (C1c).
+- ✅ **C2a — FlowSpec codec:** RFC 8955/8956 (SAFI 133) rule encoding + speaker inject path.
+- ✅ **C2b-1 — Auto-mitigation core:** concentration-based selection routes a detection to a
+  flow-scoped FlowSpec drop (concentrated) or an RTBH blackhole (diffuse).
+- ⏳ **C2b-2 — FlowSpec control plane:** persistence, `flowspec` config, operator CLI, daemon wiring.
+- ⏳ **C3 — Looking-glass, C4 — auto-peering, scrubbing, dn42** *(later).*
+
+**D — Detection & telemetry** *(in progress)*
+- ✅ **D1 — Volumetric detection:** sFlow v5 ingest + sliding-window threshold detector driving C.
+- ⏳ **D2+ — NetFlow/IPFIX, adaptive baseline detection** *(later).*
+
+**Integration lab** *(cross-cutting)* — a reproducible netns harness (`blackwall-lab`) with one
+`lab` command that runs identically locally and in CI. Every component is gated against the real
+peer software (BIRD, Knot, CAKE, hsflowd, nftables) — see [Integration lab](#integration-lab-blackwall-lab).
 
 ## License
 

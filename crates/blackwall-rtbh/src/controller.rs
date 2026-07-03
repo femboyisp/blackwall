@@ -307,7 +307,7 @@ impl RtbhController {
 /// Construct a host prefix for a target address.
 ///
 /// Returns `/32` for IPv4 or `/128` for IPv6.
-fn host_prefix(target: IpAddr) -> IpNet {
+pub(crate) fn host_prefix(target: IpAddr) -> IpNet {
     match target {
         IpAddr::V4(a) => IpNet::V4(ipnet::Ipv4Net::new(a, 32).expect("v4 /32")),
         IpAddr::V6(a) => IpNet::V6(ipnet::Ipv6Net::new(a, 128).expect("v6 /128")),
