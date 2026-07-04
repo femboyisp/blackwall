@@ -19,6 +19,34 @@ pub fn apply(policy: &Policy) -> Result<(), NftError> {
     Ok(())
 }
 
+/// Remove the deception dataplane on shutdown: delete the `inet blackwall` nft
+/// table and the TPROXY policy route (fwmark rule + table). This is essential on
+/// a graceful stop — if the ruleset were left in place while the engine is down,
+/// the box would keep `tproxy`-diverting deception traffic to a now-dead socket
+/// and silently black-hole most of the managed address space. Every step is
+/// best-effort (a missing table/rule is not an error); needs `CAP_NET_ADMIN`.
+pub fn teardown() {
+    use std::process::Command;
+    // Delete the ruleset. `.output()` swallows the "No such file" if it was
+    // never applied.
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", "blackwall"])
+        .output();
+
+    let table = crate::render::TPROXY_ROUTE_TABLE.to_string();
+    let mark = format!("0x{:x}", crate::render::TPROXY_MARK);
+    for family in [&[][..], &["-6"][..]] {
+        let _ = Command::new("ip")
+            .args(family)
+            .args(["rule", "del", "fwmark", &mark, "lookup", &table])
+            .output();
+        let _ = Command::new("ip")
+            .args(family)
+            .args(["route", "flush", "table", &table])
+            .output();
+    }
+}
+
 /// Install the TPROXY policy route so deception TCP packets the ruleset marked
 /// (`meta mark set` [`crate::render::TPROXY_MARK`]) are delivered to the local
 /// transparent engine socket instead of being forwarded onward. Without this,

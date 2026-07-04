@@ -513,6 +513,25 @@ fn host_prefix(target: IpAddr) -> ipnet::IpNet {
 /// automatically on the next tick's re-read — no separate in-memory FIFO is
 /// needed.
 ///
+/// Resolve when the process is asked to stop: SIGTERM (e.g. `systemctl stop`) or
+/// SIGINT (Ctrl-C). Used to trigger a graceful deception-engine shutdown.
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let term = async {
+        match term.as_mut() {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = term => {}
+    }
+}
+
 /// Observe the BGP session and log loudly when it leaves `Established` — a down
 /// session means auto-mitigations are not reaching the peer (issue #79). Purely
 /// observational; the session task drives reconnect itself. Exits when the
@@ -1265,15 +1284,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            tokio::select! {
+            let clean = tokio::select! {
                 _ = drain => {
                     tracing::warn!("session channel closed; all transports exited");
+                    false
                 }
                 joined = transports.join_next() => {
                     tracing::error!(?joined, "a transport task exited; shutting down");
+                    false
                 }
-            }
-            Err("deception engine transport exited".into())
+                () = wait_for_shutdown() => {
+                    tracing::info!("shutdown signal received; stopping deception engine");
+                    true
+                }
+            };
+            // Remove the dataplane so the box stops diverting deception traffic to
+            // the now-dead engine (leaving it would black-hole the address space).
+            tracing::info!("removing deception ruleset + TPROXY policy route");
+            blackwall_nft::teardown();
+            // Force-exit: the `run_nfqueue` blocking task never returns, so a
+            // normal return would hang the runtime's shutdown waiting on it.
+            std::process::exit(if clean { 0 } else { 1 });
         }
     }
 }
