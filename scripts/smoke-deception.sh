@@ -41,9 +41,13 @@ inscan(){ ip netns exec "$SCAN" "$@"; }
 
 cleanup(){
   step "Teardown"
-  # The engine's NFQUEUE loop + raw sockets can be slow to die; kill hard and
-  # reap before deleting its netns (deleting a netns with a live daemon wedges).
-  [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
+  # SIGTERM triggers the engine's graceful shutdown (removes the ruleset + policy
+  # route, exits 0); fall back to a hard kill if it does not exit promptly.
+  if [ -n "$DAEMON_PID" ]; then
+    kill -TERM "$DAEMON_PID" 2>/dev/null
+    for _ in 1 2 3 4 5 6; do kill -0 "$DAEMON_PID" 2>/dev/null || break; sleep 0.5; done
+    kill -9 "$DAEMON_PID" 2>/dev/null
+  fi
   pkill -9 -f 'target/debug/blackwalld' 2>/dev/null
   sleep 1
   ip netns del "$BOX" 2>/dev/null
