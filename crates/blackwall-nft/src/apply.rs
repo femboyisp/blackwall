@@ -15,7 +15,14 @@ use nftables::helper;
 pub fn apply(policy: &Policy) -> Result<(), NftError> {
     let ruleset = crate::render::render(policy).map_err(|e| NftError::Apply(e.to_string()))?;
     helper::apply_ruleset(&ruleset).map_err(|e| NftError::Apply(e.to_string()))?;
-    ensure_tproxy_route()?;
+    // The ruleset is now installed and diverting deception TCP to the engine. If
+    // the policy route can't be set up, don't leave a black-holing table behind
+    // (deception traffic would be tproxy'd to a socket the route can't reach):
+    // tear the whole dataplane back down and surface the error.
+    if let Err(e) = ensure_tproxy_route() {
+        teardown();
+        return Err(e);
+    }
     Ok(())
 }
 
