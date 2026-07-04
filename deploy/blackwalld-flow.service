@@ -1,0 +1,31 @@
+# Blackwall flow detector + BGP mitigation (RTBH / FlowSpec auto-mitigation).
+# Install:  cp deploy/blackwalld-flow.service /etc/systemd/system/
+#           put DATABASE_URL in /etc/blackwall/flow.env  (0600, dedicated DB role)
+#           tune the thresholds to your baseline (see runbook-flow-mitigation.md)
+#           systemctl enable --now blackwalld-flow
+[Unit]
+Description=Blackwall flow detector + BGP mitigation (blackwalld flow)
+Documentation=file:///usr/share/doc/blackwall/runbook-flow-mitigation.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/blackwall/flow.env
+# Tune --pps-threshold / --bps-threshold to the net's real baseline. Start in
+# detection-only mode by omitting the rtbh/flowspec blocks from the config until
+# you trust the thresholds (see the runbook).
+ExecStart=/usr/local/bin/blackwalld flow \
+    --config /etc/blackwall/blackwall.conf \
+    --listen 0.0.0.0:6343 \
+    --pps-threshold 500000 \
+    --bps-threshold 5000000000
+# CAP_NET_ADMIN is needed for the optional TCP-MD5 setsockopt on the BGP session.
+AmbientCapabilities=CAP_NET_ADMIN
+Restart=always
+RestartSec=5
+# Active mitigations are persisted to Postgres and re-announced on restart, so a
+# restart never drops protection.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+# Blackwall deception firewall (honeypot engine + nft dataplane).
+# Install:  cp deploy/blackwalld-deception.service /etc/systemd/system/
+#           cp target/release/blackwalld /usr/local/bin/
+#           put config at /etc/blackwall/blackwall.conf, banners at /etc/blackwall/banners.txt
+#           put DATABASE_URL in /etc/blackwall/deception.env  (0600, dedicated DB role)
+#           systemctl enable --now blackwalld-deception
+[Unit]
+Description=Blackwall deception firewall (blackwalld run)
+Documentation=file:///usr/share/doc/blackwall/runbook-deception.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/blackwall/deception.env
+ExecStart=/usr/local/bin/blackwalld run \
+    --config /etc/blackwall/blackwall.conf \
+    --banners /etc/blackwall/banners.txt
+# blackwalld run installs nft rules, binds a TPROXY (IP_TRANSPARENT) socket, opens
+# NFQUEUE 0, and raw sockets: it needs CAP_NET_ADMIN + CAP_NET_RAW.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+# SIGTERM triggers graceful shutdown: it removes the nft ruleset + policy route
+# and exits 0, so systemctl stop is clean (don't SIGKILL — that leaves the box
+# black-holing deception traffic to a dead engine).
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
