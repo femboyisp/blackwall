@@ -130,7 +130,7 @@ expression: json
               "accept": null
             }
           ],
-          "comment": "real service: accept (DNAT to backend deferred to M3)"
+          "comment": "real service: accept (nat: targets DNAT'd in the nat chain)"
         }
       }
     },
@@ -194,7 +194,7 @@ expression: json
               "accept": null
             }
           ],
-          "comment": "real service: accept (DNAT to backend deferred to M3)"
+          "comment": "real service: accept (nat: targets DNAT'd in the nat chain)"
         }
       }
     },
@@ -318,6 +318,19 @@ expression: json
             }
           ],
           "comment": "deception ICMP/UDP: queue to nfqueue 0"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "table": "blackwall",
+          "name": "dnat",
+          "type": "nat",
+          "hook": "prerouting",
+          "prio": -100,
+          "policy": "accept"
         }
       }
     }

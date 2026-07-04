@@ -7,7 +7,8 @@
 //!   tuples for every Open IPv6 service in the policy.
 //! * Chain `prerouting` — base chain with classifier rules scoped to the
 //!   managed interface via an `iifname` match:
-//!   1. Real-service membership → accept (DNAT to backend deferred to M3).
+//!   1. Real-service membership → accept (host/incus reach the backend directly;
+//!      `nat:` targets are DNAT'd in a separate `nat` chain).
 //!   2. Deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
 //!   3. Deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
 //!   4. If default_state == Closed → an interface-scoped terminal `drop` rule
@@ -17,14 +18,14 @@
 //! This module is pure: it builds the schema only. Applying it is handled by
 //! the `apply` function in the crate root.
 
-use blackwall_core::{Policy, PolicyError, PortState};
+use blackwall_core::{Policy, PolicyError, PortState, ServiceTarget};
 use nftables::{
     expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix},
     schema::{
         Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetType,
         SetTypeValue, Table,
     },
-    stmt::{Mangle, Match, Operator, Queue, Statement, TProxy},
+    stmt::{Mangle, Match, NATFamily, Operator, Queue, Statement, TProxy, NAT},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 
@@ -84,7 +85,7 @@ pub(crate) const TPROXY_ROUTE_TABLE: u32 = 100;
 /// 5. `add chain inet blackwall prerouting { type filter hook prerouting priority -300; }`
 ///    (no device binding — device binding is rejected by nft for prerouting chains;
 ///    the managed interface is scoped per-rule via `iifname == policy.interface`)
-/// 6. Rule: `iifname` match + real-service membership → accept (DNAT deferred to M3)
+/// 6. Rule: `iifname` match + real-service membership → accept (nat: targets DNAT'd in the nat chain)
 /// 7. Rule: `iifname` match + deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT
 /// 8. Rule: `iifname` match + deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE
 ///
@@ -199,8 +200,8 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
 
     // 6. Rule: real-service membership check — accept.
     //    daddr . l4proto . dport in @real_v4 → accept
-    //    (DNAT to Incus backend is deferred to M3; for now, accept passes the
-    //    packet to the host stack which will reach the real service.)
+    //    (host:/incus: targets pass to the host stack / instance address; a
+    //    fixed `nat:` backend is rewritten by the DNAT chain built below.)
     //
     //    Note: we emit one rule per address family so the concat type matches.
     //    IPv4: meta nfproto ipv4 ip daddr . meta l4proto . th dport @real_v4 accept
@@ -244,13 +245,13 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
                     right: Expression::String(format!("@{set_name}").into()),
                     op: Operator::IN,
                 }),
-                // accept — DNAT to backend deferred to M3
+                // accept — host/incus reach the backend directly; nat: is DNAT'd in the nat chain
                 Statement::Accept(None),
             ]
             .into(),
             handle: None,
             index: None,
-            comment: Some("real service: accept (DNAT to backend deferred to M3)".into()),
+            comment: Some("real service: accept (nat: targets DNAT'd in the nat chain)".into()),
         };
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
             accept_rule,
@@ -401,6 +402,93 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         ))));
     }
 
+    // 6b. Real-service DNAT for `nat:<ip>:<port>` targets. A `filter` chain can
+    //     not DNAT, so this needs a separate `nat` chain at `dstnat` priority
+    //     (-100). `host:`/`incus:` targets keep the plain accept above (the
+    //     packet reaches the host stack / the instance address directly); only
+    //     an explicit fixed backend is rewritten here. Cross-family targets
+    //     (v4 frontend → v6 backend) are skipped (nft can't dnat across
+    //     families in one rule).
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(
+        Chain {
+            family: FAMILY,
+            table: TABLE.into(),
+            name: "dnat".into(),
+            newname: None,
+            handle: None,
+            _type: Some(NfChainType::NAT),
+            hook: Some(NfHook::Prerouting),
+            prio: Some(-100),
+            dev: None,
+            policy: Some(NfChainPolicy::Accept),
+        },
+    ))));
+    for svc in &resolved {
+        let ServiceTarget::Nat(backend) = svc.target else {
+            continue;
+        };
+        if svc.addr.is_ipv4() != backend.is_ipv4() {
+            continue; // cross-family DNAT unsupported in a single rule
+        }
+        let (daddr_field, nat_family) = if svc.addr.is_ipv4() {
+            ("ip", NATFamily::IP)
+        } else {
+            ("ip6", NATFamily::IP6)
+        };
+        let dnat_rule = Rule {
+            family: FAMILY,
+            table: TABLE.into(),
+            chain: "dnat".into(),
+            expr: vec![
+                iifname_match(&policy.interface),
+                // <ip|ip6> daddr == frontend address
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                        PayloadField {
+                            protocol: daddr_field.into(),
+                            field: "daddr".into(),
+                        },
+                    ))),
+                    right: Expression::String(svc.addr.to_string().into()),
+                    op: Operator::EQ,
+                }),
+                // meta l4proto == tcp|udp
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::L4proto,
+                    })),
+                    right: Expression::String(svc.proto.to_string().into()),
+                    op: Operator::EQ,
+                }),
+                // th dport == frontend port
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                        PayloadField {
+                            protocol: "th".into(),
+                            field: "dport".into(),
+                        },
+                    ))),
+                    right: Expression::Number(u32::from(svc.port)),
+                    op: Operator::EQ,
+                }),
+                // dnat <ip|ip6> to <backend-ip>:<backend-port>
+                Statement::DNAT(Some(NAT {
+                    addr: Some(Expression::String(backend.ip().to_string().into())),
+                    family: Some(nat_family),
+                    port: Some(Expression::Number(u32::from(backend.port()))),
+                    flags: None,
+                })),
+            ]
+            .into(),
+            handle: None,
+            index: None,
+            comment: Some(format!("real service DNAT → {backend}").into()),
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+            dnat_rule,
+        ))));
+    }
+
     Ok(Nftables {
         objects: objects.into(),
     })
@@ -491,8 +579,8 @@ mod tests {
     fn renders_table_set_and_chain() {
         let ruleset = render(&sample()).expect("render");
         // sample() has 1 prefix → 2 accept rules (v4+v6) + 1 tproxy rule + 1 queue rule = 4 rules
-        // Total objects: add-table, flush-table, real_v4, real_v6, chain, + 4 rules = 9
-        assert_eq!(ruleset.objects.len(), 9);
+        // Objects: add-table, flush-table, real_v4, real_v6, prerouting chain, 4 rules, + dnat chain = 10
+        assert_eq!(ruleset.objects.len(), 10);
 
         // Assert structural order and types.
         assert!(
@@ -602,6 +690,39 @@ mod tests {
     }
 
     #[test]
+    fn renders_dnat_rule_for_nat_target() {
+        let mut policy = sample();
+        policy.tenants[0].allows[0].target = ServiceTarget::Nat("10.0.0.9:8443".parse().unwrap());
+        let ruleset = render(&policy).expect("render");
+        let has_nat_chain = ruleset.objects.iter().any(|o| {
+            matches!(o, NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(c)))
+                if c.name == "dnat" && c._type == Some(NfChainType::NAT))
+        });
+        assert!(has_nat_chain, "a nat chain must be emitted");
+        let has_dnat_rule = ruleset.objects.iter().any(|o| {
+            matches!(o, NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r)))
+                if r.chain == "dnat" && r.expr.iter().any(|s| matches!(s, Statement::DNAT(_))))
+        });
+        assert!(
+            has_dnat_rule,
+            "a DNAT rule must be emitted for a nat: target"
+        );
+    }
+
+    #[test]
+    fn no_dnat_rule_for_incus_or_host_target() {
+        // sample() uses an Incus target: the nat chain exists but carries no rule.
+        let ruleset = render(&sample()).expect("render");
+        let has_dnat_rule = ruleset.objects.iter().any(|o| {
+            matches!(o, NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) if r.chain == "dnat")
+        });
+        assert!(
+            !has_dnat_rule,
+            "incus/host targets must not emit a DNAT rule"
+        );
+    }
+
+    #[test]
     fn ruleset_json_snapshot() {
         let json = ruleset_json(&sample()).expect("render json");
         insta::assert_snapshot!(json);
@@ -623,10 +744,20 @@ mod tests {
 
         // The Closed posture is enforced by a terminal drop rule appended after
         // the classifier rules, scoped to the managed interface by `iifname`.
-        let drop_rule = match ruleset.objects.last().expect("a terminal rule") {
-            NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) => r,
-            other => panic!("expected terminal drop rule, got {other:?}"),
-        };
+        // Find the closed-posture drop rule by content (the dnat chain is
+        // emitted after it, so it is no longer the last object).
+        let drop_rule = ruleset
+            .objects
+            .iter()
+            .find_map(|o| match o {
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r)))
+                    if r.expr.iter().any(|s| matches!(s, Statement::Drop(None))) =>
+                {
+                    Some(r)
+                }
+                _ => None,
+            })
+            .expect("a terminal drop rule");
         assert!(
             matches!(
                 drop_rule.expr.first(),
@@ -714,8 +845,8 @@ mod tests {
         ];
         let ruleset = render(&policy).expect("render");
         // 2 accept rules (real_v4, real_v6) + 2 tproxy rules + 2 queue rules = 6 rules
-        // plus table, flush-table, real_v4, real_v6, chain = 5 structural → 11 total
-        assert_eq!(ruleset.objects.len(), 11);
+        // plus table, flush, real_v4, real_v6, prerouting chain, dnat chain = 6 structural → 12 total
+        assert_eq!(ruleset.objects.len(), 12);
     }
 
     #[test]
@@ -734,7 +865,7 @@ mod tests {
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.
-        // Objects: table + flush + real_v4 + real_v6 + chain + 2 accept + 1 tproxy + 1 queue = 9
-        assert_eq!(ruleset.objects.len(), 9);
+        // Objects: table + flush + real_v4 + real_v6 + prerouting chain + 2 accept + 1 tproxy + 1 queue + dnat chain = 10
+        assert_eq!(ruleset.objects.len(), 10);
     }
 }
