@@ -979,7 +979,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let sources = metrics::MetricsSources {
                     store: store.clone(),
                     bgp: bgp_for_metrics,
-                    collector: collector_metrics.clone(),
+                    collector: Some(collector_metrics.clone()),
+                    inflight: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1126,12 +1127,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let (tx, mut rx) = mpsc::channel(256);
 
+            // Live in-flight deception-session gauge (shared with /metrics).
+            let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
             let mut transports = tokio::task::JoinSet::new();
             transports.spawn(serve(
                 listener_v4,
                 registry.clone(),
                 tx.clone(),
                 EngineLimits::default(),
+                inflight.clone(),
             ));
             let has_v6 = listener_v6.is_some();
             if let Some(v6) = listener_v6 {
@@ -1140,7 +1145,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     registry.clone(),
                     tx.clone(),
                     EngineLimits::default(),
+                    inflight.clone(),
                 ));
+            }
+
+            // Optional Prometheus metrics endpoint (deception gauges).
+            if let Some(metrics_listen) = policy.metrics_listen {
+                let sources = metrics::MetricsSources {
+                    store: std::sync::Arc::new(store.clone()),
+                    bgp: None,
+                    collector: None,
+                    inflight: Some(inflight.clone()),
+                };
+                tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
             transports.spawn(async move {
                 // run_nfqueue is blocking/sync; run it on a blocking thread.

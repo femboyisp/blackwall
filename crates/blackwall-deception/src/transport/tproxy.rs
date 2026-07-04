@@ -8,9 +8,28 @@ use crate::limits::EngineLimits;
 use blackwall_core::L4Proto;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
+
+/// RAII counter for live in-flight deception sessions: increments on
+/// construction, decrements on drop (covering every task exit path — success,
+/// emulator error, timeout, or panic). Read by the `/metrics` endpoint.
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl InflightGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// A TPROXY-enabled TCP listener that preserves the original destination address
 /// of each diverted connection.
@@ -79,6 +98,7 @@ pub async fn serve(
     registry: Arc<EmulatorRegistry>,
     sessions: mpsc::Sender<SessionRecord>,
     limits: EngineLimits,
+    inflight: Arc<AtomicUsize>,
 ) {
     let permits = Arc::new(Semaphore::new(limits.max_concurrent));
     loop {
@@ -91,11 +111,13 @@ pub async fn serve(
                         continue;
                     }
                 };
+                let guard = InflightGuard::new(inflight.clone());
                 let registry = registry.clone();
                 let sessions = sessions.clone();
                 let timeout = limits.session_timeout;
                 tokio::spawn(async move {
                     let _permit = permit; // released when the task ends
+                    let _guard = guard; // decrements the in-flight gauge on exit
                     let emulator = registry.for_port(meta.local.port());
                     let name = emulator.name().to_owned();
                     let conn = DeceptionConn {

@@ -99,7 +99,14 @@ async fn serves_deception_banner() {
     let listener = TproxyListener::bind("0.0.0.0:61000".parse().unwrap()).expect("bind tproxy");
     let (tx, mut rx) = mpsc::channel::<SessionRecord>(64);
     tokio::spawn(async move { while rx.recv().await.is_some() {} }); // drain sessions
-    serve(listener, registry, tx, EngineLimits::default()).await; // runs until the lab kills it
+    serve(
+        listener,
+        registry,
+        tx,
+        EngineLimits::default(),
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+    .await; // runs until the lab kills it
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -158,5 +165,12 @@ async fn serves_deception_under_load() {
         max_concurrent: 256,
         session_timeout: Duration::from_secs(60),
     };
-    serve(listener, registry, tx, limits).await; // runs until the lab kills it
+    serve(
+        listener,
+        registry,
+        tx,
+        limits,
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+    .await; // runs until the lab kills it
 }
