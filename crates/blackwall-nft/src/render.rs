@@ -24,7 +24,7 @@ use nftables::{
         Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetType,
         SetTypeValue, Table,
     },
-    stmt::{Match, Operator, Queue, Statement, TProxy},
+    stmt::{Mangle, Match, Operator, Queue, Statement, TProxy},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 
@@ -60,6 +60,19 @@ const ENGINE_TPROXY_PORT: u16 = 61000;
 /// queue mechanism and generates appropriate honeypot responses. The engine
 /// is wired in Task 9.
 const DECEPTION_QUEUE: u16 = 0;
+
+/// Firewall mark set on deception-TCP packets by the tproxy rule.
+///
+/// TPROXY only delivers a packet to the local transparent socket if the routing
+/// decision keeps it local; for a *forwarded* managed prefix (the dst is not a
+/// local address) it would otherwise be routed onward. Marking the packet lets
+/// a policy route (`ip rule fwmark <mark> lookup <table>` + a `local default`
+/// route in that table — installed by [`crate::apply`]) send it to the local
+/// input path instead. Must match [`TPROXY_ROUTE_TABLE`] in `apply`.
+pub(crate) const TPROXY_MARK: u32 = 0x1;
+
+/// Routing table holding the `local default` route for TPROXY-marked packets.
+pub(crate) const TPROXY_ROUTE_TABLE: u32 = 100;
 
 /// Build the full nftables ruleset for `policy`.
 ///
@@ -118,7 +131,15 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             ),
             policy: None,
             flags: None,
-            elem: Some(v4_elements.into()),
+            // Omit `elem` entirely when empty: nft rejects `"elem": []` on a
+            // typed set ("Invalid set elem expression"), which breaks any
+            // single-family policy (e.g. IPv4-only, or a family with no real
+            // services). An absent `elem` declares an empty set correctly.
+            elem: if v4_elements.is_empty() {
+                None
+            } else {
+                Some(v4_elements.into())
+            },
             timeout: None,
             gc_interval: None,
             size: None,
@@ -140,7 +161,11 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             ),
             policy: None,
             flags: None,
-            elem: Some(v6_elements.into()),
+            elem: if v6_elements.is_empty() {
+                None
+            } else {
+                Some(v6_elements.into())
+            },
             timeout: None,
             gc_interval: None,
             size: None,
@@ -279,6 +304,13 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
                     family: Some(addr_family.into()),
                     port: ENGINE_TPROXY_PORT,
                     addr: None,
+                }),
+                // meta mark set TPROXY_MARK — so the policy route installed by
+                // `apply` delivers this (possibly forwarded) packet to the local
+                // transparent socket instead of routing it onward.
+                Statement::Mangle(Mangle {
+                    key: Expression::Named(NamedExpression::Meta(Meta { key: MetaKey::Mark })),
+                    value: Expression::Number(TPROXY_MARK),
                 }),
             ]
             .into(),
@@ -561,10 +593,11 @@ mod tests {
             other => panic!("expected real_v4 set, got {other:?}"),
         };
         assert_eq!(v4_set.name, "real_v4");
-        let v4_elems = v4_set.elem.as_ref().expect("real_v4 elem vec present");
+        // No v4 services → the v4 set omits `elem` entirely (an empty `elem: []`
+        // is invalid nft JSON).
         assert!(
-            v4_elems.is_empty(),
-            "v4 set must be empty for IPv6-only policy"
+            v4_set.elem.is_none(),
+            "v4 set must omit elem for an IPv6-only policy"
         );
     }
 
