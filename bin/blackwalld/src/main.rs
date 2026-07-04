@@ -513,6 +513,21 @@ fn host_prefix(target: IpAddr) -> ipnet::IpNet {
 /// automatically on the next tick's re-read — no separate in-memory FIFO is
 /// needed.
 ///
+/// Fail fast if the config's managed interface does not exist. Otherwise the
+/// rendered `iifname` match silently never fires and the box classifies no
+/// traffic — a common, hard-to-diagnose deployment footgun.
+fn ensure_interface_exists(iface: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if std::path::Path::new(&format!("/sys/class/net/{iface}")).exists() {
+        Ok(())
+    } else {
+        Err(format!(
+            "configured interface `{iface}` does not exist \
+             (check the `interface` directive) — the ruleset would classify no traffic"
+        )
+        .into())
+    }
+}
+
 /// Resolve when the process is asked to stop: SIGTERM (e.g. `systemctl stop`) or
 /// SIGINT (Ctrl-C). Used to trigger a graceful deception-engine shutdown.
 async fn wait_for_shutdown() {
@@ -979,7 +994,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let sources = metrics::MetricsSources {
                     store: store.clone(),
                     bgp: bgp_for_metrics,
-                    collector: collector_metrics.clone(),
+                    collector: Some(collector_metrics.clone()),
+                    inflight: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1000,6 +1016,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             database_url,
         } => {
             let policy = blackwall_config::parse_file(&config)?;
+            ensure_interface_exists(&policy.interface)?;
             let store = blackwall_state::Store::connect(&database_url).await?;
             store.migrate().await?;
             let n = store.apply_policy(&policy, "blackwalld").await?;
@@ -1034,6 +1051,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let policy = blackwall_config::parse_file(&config)?;
+            ensure_interface_exists(&policy.interface)?;
 
             // Connect and migrate the store early so discovery can persist its results.
             let store = blackwall_state::Store::connect(&database_url).await?;
@@ -1126,12 +1144,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let (tx, mut rx) = mpsc::channel(256);
 
+            // Live in-flight deception-session gauge (shared with /metrics).
+            let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
             let mut transports = tokio::task::JoinSet::new();
             transports.spawn(serve(
                 listener_v4,
                 registry.clone(),
                 tx.clone(),
                 EngineLimits::default(),
+                inflight.clone(),
             ));
             let has_v6 = listener_v6.is_some();
             if let Some(v6) = listener_v6 {
@@ -1140,7 +1162,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     registry.clone(),
                     tx.clone(),
                     EngineLimits::default(),
+                    inflight.clone(),
                 ));
+            }
+
+            // Optional Prometheus metrics endpoint (deception gauges).
+            if let Some(metrics_listen) = policy.metrics_listen {
+                let sources = metrics::MetricsSources {
+                    store: std::sync::Arc::new(store.clone()),
+                    bgp: None,
+                    collector: None,
+                    inflight: Some(inflight.clone()),
+                };
+                tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
             transports.spawn(async move {
                 // run_nfqueue is blocking/sync; run it on a blocking thread.

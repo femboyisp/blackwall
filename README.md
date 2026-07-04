@@ -23,7 +23,7 @@ Every `(IP, protocol, port)` across your prefixes is in exactly one of three sta
 
 | State | Behaviour |
 |-------|-----------|
-| **Open** | A real service — traffic is forwarded (NAT'd) to the backing host, VM, or container and rides an nftables flowtable fast path. The deception engine never touches it, so real traffic stays at near line rate. |
+| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. *(A flowtable/XDP fast path for near-line-rate forwarding is on the roadmap, not yet implemented.)* |
 | **Deception** *(default)* | Looks open and alive. Closed ports answer a real TCP handshake and carry on a believable, protocol-aware conversation (SSH, HTTP, SMTP, databases, …) like an interactive honeypot — but nothing real is ever reached, and every probe is logged. |
 | **Closed** | Silently dropped (e.g. management ports). |
 
@@ -38,8 +38,9 @@ deception) while real services stay stable.
   volume, plus per-protocol emulators that hold real multi-turn conversations and capture
   attacker activity.
 - **Declarative config DSL** — high-level, readable rules compiled down to nftables.
-- **Fast nftables data plane** — real traffic accepted/DNAT'd on a flowtable fast path; deception
-  traffic handed to userspace; designed so an XDP/AF_XDP fast path slots in later.
+- **nftables data plane** — real traffic accepted/DNAT'd (`nat:` targets), deception traffic handed
+  to userspace via TPROXY/NFQUEUE; designed so a flowtable + XDP/AF_XDP fast path slots in later
+  (not yet implemented).
 - **Multi-tenant** — per-tenant IP/prefix ownership; tenants manage ports only on their own
   addresses, via config or API.
 - **PostgreSQL-backed state** with a full audit log of every policy change.

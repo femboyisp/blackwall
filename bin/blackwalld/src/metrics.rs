@@ -16,7 +16,10 @@ pub(crate) struct MetricsSources {
     pub store: Arc<blackwall_state::Store>,
     /// `None` when no `rtbh` block is configured (no BGP session to report).
     pub bgp: Option<blackwall_bgp::BgpHandle>,
-    pub collector: Arc<blackwall_flow::CollectorMetrics>,
+    /// `None` for the deception engine (no sFlow collector).
+    pub collector: Option<Arc<blackwall_flow::CollectorMetrics>>,
+    /// Live in-flight deception sessions; `None` outside the deception engine.
+    pub inflight: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -57,18 +60,28 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
         });
     }
 
-    m.push(Metric {
-        name: "blackwall_flow_datagrams_total",
-        help: "sFlow datagrams received by the collector",
-        kind: MetricKind::Counter,
-        value: u64_to_f64(sources.collector.datagrams()),
-    });
-    m.push(Metric {
-        name: "blackwall_flow_decode_errors_total",
-        help: "sFlow datagrams that failed to decode",
-        kind: MetricKind::Counter,
-        value: u64_to_f64(sources.collector.decode_errors()),
-    });
+    if let Some(collector) = &sources.collector {
+        m.push(Metric {
+            name: "blackwall_flow_datagrams_total",
+            help: "sFlow datagrams received by the collector",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(collector.datagrams()),
+        });
+        m.push(Metric {
+            name: "blackwall_flow_decode_errors_total",
+            help: "sFlow datagrams that failed to decode",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(collector.decode_errors()),
+        });
+    }
+    if let Some(inflight) = &sources.inflight {
+        m.push(Metric {
+            name: "blackwall_deception_sessions_active",
+            help: "Deception honeypot sessions currently in flight",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(inflight.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
 
     let s = &sources.store;
     match s.list_active_blackholes().await {
