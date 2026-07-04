@@ -22,7 +22,7 @@ blackwall-rtbh = { path = "../../crates/blackwall-rtbh" }
 clap = { workspace = true }
 ipnet = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 notify = { workspace = true }

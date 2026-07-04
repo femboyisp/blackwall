@@ -45,12 +45,14 @@ run` (which applies nft + the policy route + binds the engine) → the scanner
 connects to a routed victim and must receive `SSH-2.0` → checks a
 `deception_sessions` row landed in Postgres.
 
-> **Teardown note:** the engine's NFQUEUE loop + raw sockets can be slow to die;
-> the script `kill -9`s the daemon and `pkill`s any stragglers before deleting
-> the netns (deleting a netns with a live daemon can wedge). If a run is
-> interrupted, clean up with `sudo pkill -9 -f target/debug/blackwalld` and
-> `sudo ip netns del bw-dec-box bw-dec-scan`. A clean graceful shutdown for the
-> engine is a tracked follow-on.
+> **Stopping the engine:** send **SIGTERM** (or Ctrl-C / `systemctl stop`). The
+> engine catches it, **removes the nft ruleset + TPROXY policy route** (so the box
+> stops diverting deception traffic to a now-dead socket), and exits 0. This is
+> important: if the ruleset were left in place while the engine is down, the box
+> would black-hole most of the managed address space. If a run is force-killed
+> (`kill -9`) instead, clean up the leftover dataplane manually:
+> `sudo nft delete table inet blackwall`, `sudo ip rule del fwmark 0x1 lookup 100`,
+> `sudo ip route flush table 100`.
 
 ## First real run
 
@@ -76,5 +78,3 @@ connects to a routed victim and must receive `SSH-2.0` → checks a
 - Real-service DNAT is not implemented — declared real services are accepted to
   the host stack, not forwarded to a separate backend.
 - `run` does not expose `/metrics` (only `blackwalld flow` does).
-- Graceful engine shutdown (clean NFQUEUE teardown on SIGTERM) is a follow-on;
-  for now stop it with SIGKILL and expect to clean up its netns manually.
