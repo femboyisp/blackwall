@@ -53,8 +53,7 @@ expression: json
             "ipv6_addr",
             "inet_proto",
             "inet_service"
-          ],
-          "elem": []
+          ]
         }
       }
     },
@@ -249,6 +248,16 @@ expression: json
               "tproxy": {
                 "family": "ip",
                 "port": 61000
+              }
+            },
+            {
+              "mangle": {
+                "key": {
+                  "meta": {
+                    "key": "mark"
+                  }
+                },
+                "value": 1
               }
             }
           ],

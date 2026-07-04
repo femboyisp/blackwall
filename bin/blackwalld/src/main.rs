@@ -986,12 +986,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let n = store.apply_policy(&policy, "blackwalld").await?;
             tracing::info!(services = n, "policy persisted");
             blackwall_nft::apply(&policy)?;
-            tracing::info!("ruleset applied");
+            tracing::info!("deception ruleset + TPROXY policy route applied");
             tracing::warn!(
-                "deception/forwarding enforcement is NOT yet active (Milestone 2); \
-                 the applied ruleset classifies structure only and does not yet \
-                 protect services — NFQUEUE redirect and real-service DNAT rules \
-                 are deferred to Milestone 2"
+                "`apply` installs the ruleset only — run `blackwalld run` for the \
+                 honeypot engine to answer the diverted deception traffic. \
+                 Real-service DNAT is not yet implemented: declared real services \
+                 are accepted to the host stack, not forwarded to a backend."
             );
             Ok(())
         }
