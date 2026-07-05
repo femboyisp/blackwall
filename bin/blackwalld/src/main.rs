@@ -228,17 +228,65 @@ async fn main() -> ExitCode {
 /// Apply the effective policy derived from `base` merged with `discovered`.
 ///
 /// Calls [`blackwall_discovery::reconcile`] to compute the effective policy,
-/// persists it via [`blackwall_state::Store::apply_policy`], and then pushes it
-/// to the kernel via [`blackwall_nft::apply`].
+/// pushes it to the kernel via [`blackwall_nft::apply`], and then records it via
+/// [`blackwall_state::Store::apply_policy`].
+///
+/// The kernel is applied *before* the DB write on purpose: the nft ruleset is
+/// the safety-critical side (it actually classifies traffic), so on a partial
+/// failure the running data plane must reflect the latest computed policy even
+/// if the DB record lags. The reverse order would leave the kernel enforcing a
+/// stale policy while the DB claims the new one is applied. Both are idempotent,
+/// so the next event re-applies cleanly either way.
 async fn apply_effective(
     base: &blackwall_core::Policy,
     discovered: &[blackwall_discovery::DiscoveredService],
     store: &blackwall_state::Store,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let effective = blackwall_discovery::reconcile(base, discovered);
-    store.apply_policy(&effective, "discovery").await?;
     blackwall_nft::apply(&effective)?;
+    store.apply_policy(&effective, "discovery").await?;
     Ok(())
+}
+
+/// Drain the Incus lifecycle event stream, reconciling on each relevant event.
+///
+/// Returns when the stream ends (`Ok(None)`) or errors, so the caller can
+/// reconnect. Malformed events are logged and skipped without ending the stream.
+async fn drain_incus_events(
+    client: &mut blackwall_discovery::UnixIncusClient,
+    discover_host: bool,
+    base: &blackwall_core::Policy,
+    store: &blackwall_state::Store,
+) {
+    use blackwall_discovery::{DiscoveryError, InstanceChange};
+    loop {
+        match client.next_event().await {
+            Ok(Some(ev)) => match ev.change {
+                InstanceChange::Started | InstanceChange::Stopped | InstanceChange::Updated => {
+                    tracing::info!(
+                        instance = %ev.instance,
+                        change = ?ev.change,
+                        "Incus lifecycle event; reconciling"
+                    );
+                    let discovered = build_discovered(discover_host, Some(&*client)).await;
+                    if let Err(err) = apply_effective(base, &discovered, store).await {
+                        tracing::warn!(%err, "reconcile after Incus event failed");
+                    }
+                }
+            },
+            Ok(None) => {
+                tracing::warn!("Incus event stream ended; will reconnect");
+                return;
+            }
+            Err(DiscoveryError::Parse(msg)) => {
+                tracing::warn!(%msg, "skipping malformed Incus event");
+            }
+            Err(err) => {
+                tracing::warn!(%err, "Incus event stream error; will reconnect");
+                return;
+            }
+        }
+    }
 }
 
 /// Build the discovered-service list from host sockets and/or an Incus client.
@@ -1223,26 +1271,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
             });
 
-            // Spawn the Incus discovery event loop as a supervised task (non-fatal exit).
-            if let Some(mut client) = incus_client {
+            // Spawn the Incus discovery loop as a supervised task that reconnects
+            // forever. Without this, an Incus restart ends the event stream and
+            // discovery would go permanently stale. Spawns even when the initial
+            // connect failed, so a late Incus start is also picked up.
+            {
                 let policy_for_task = policy.clone();
                 let store_for_task = store.clone();
+                let socket_for_task = incus_socket.clone();
+                let mut current = incus_client;
                 tokio::spawn(async move {
+                    let mut backoff = std::time::Duration::from_secs(1);
+                    let max_backoff = std::time::Duration::from_secs(30);
                     loop {
-                        match client.next_event().await {
-                            Ok(Some(ev)) => {
-                                use blackwall_discovery::InstanceChange;
-                                match ev.change {
-                                    InstanceChange::Started
-                                    | InstanceChange::Stopped
-                                    | InstanceChange::Updated => {
+                        // Ensure we have a connected client, reconnecting with
+                        // exponential backoff. On a fresh connection, do a
+                        // catch-up reconcile so events missed while disconnected
+                        // are not lost.
+                        let mut client = match current.take() {
+                            Some(c) => c,
+                            None => loop {
+                                sleep(backoff).await;
+                                match blackwall_discovery::UnixIncusClient::connect(
+                                    &socket_for_task,
+                                ) {
+                                    Ok(c) => {
+                                        backoff = std::time::Duration::from_secs(1);
                                         tracing::info!(
-                                            instance = %ev.instance,
-                                            change = ?ev.change,
-                                            "Incus lifecycle event; reconciling"
+                                            socket = %socket_for_task.display(),
+                                            "reconnected to Incus; re-reconciling"
                                         );
                                         let discovered =
-                                            build_discovered(discover_host, Some(&client)).await;
+                                            build_discovered(discover_host, Some(&c)).await;
                                         if let Err(err) = apply_effective(
                                             &policy_for_task,
                                             &discovered,
@@ -1252,28 +1312,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         {
                                             tracing::warn!(
                                                 %err,
-                                                "reconcile after Incus event failed"
+                                                "catch-up reconcile after Incus reconnect failed"
                                             );
                                         }
+                                        break c;
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            %err,
+                                            ?backoff,
+                                            "Incus reconnect failed; retrying"
+                                        );
+                                        backoff = (backoff * 2).min(max_backoff);
                                     }
                                 }
-                            }
-                            Ok(None) => {
-                                tracing::warn!("Incus event stream ended; discovery loop exiting");
-                                break;
-                            }
-                            Err(blackwall_discovery::DiscoveryError::Parse(msg)) => {
-                                tracing::warn!(%msg, "skipping malformed Incus event");
-                                continue;
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    %err,
-                                    "Incus event stream error; discovery stopping"
-                                );
-                                break;
-                            }
-                        }
+                            },
+                        };
+                        drain_incus_events(
+                            &mut client,
+                            discover_host,
+                            &policy_for_task,
+                            &store_for_task,
+                        )
+                        .await;
+                        // Stream ended/errored: drop the client and reconnect.
                     }
                 });
             }
