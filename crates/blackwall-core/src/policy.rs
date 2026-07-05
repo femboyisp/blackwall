@@ -15,6 +15,11 @@ pub struct AllowRule {
     pub port: u16,
     /// Where matching traffic is forwarded.
     pub target: ServiceTarget,
+    /// Optional per-address scope. `None` opens the port on **all** of the
+    /// tenant's owned addresses (config-file `allow` semantics). `Some(addr)`
+    /// opens it only on `addr` — used by discovery so a service observed on one
+    /// address does not open that port on the tenant's other addresses.
+    pub scope: Option<IpAddr>,
 }
 
 /// A customer who owns one or more addresses and may expose ports on them.

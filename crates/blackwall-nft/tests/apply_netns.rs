@@ -20,6 +20,7 @@ fn sample() -> Policy {
                 proto: L4Proto::Tcp,
                 port: 443,
                 target: ServiceTarget::Host,
+                scope: None,
             }],
         }],
         shaping: Vec::new(),
