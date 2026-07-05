@@ -31,6 +31,11 @@ pub struct RtbhPolicy {
     /// Optional TCP-MD5 (RFC 2385) shared secret for the BGP session; `None`
     /// leaves the session unauthenticated.
     pub md5: Option<crate::Md5Secret>,
+    /// Optional GTSM (RFC 5082) TTL-security hop count for the BGP session.
+    /// `Some(n)` requires received packets to have TTL ≥ `256 - n` (so `1` =
+    /// directly connected peer, TTL 255) and sends with TTL 255; `None`
+    /// disables the TTL check.
+    pub gtsm_hops: Option<u8>,
 }
 
 #[cfg(test)]
@@ -50,6 +55,7 @@ mod tests {
             hold_down: std::time::Duration::from_secs(60),
             max_ttl: Some(std::time::Duration::from_secs(7200)),
             md5: Some(crate::Md5Secret::new("pw".into())),
+            gtsm_hops: Some(1),
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: RtbhPolicy = serde_json::from_str(&json).unwrap();
