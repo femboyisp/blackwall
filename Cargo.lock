@@ -359,6 +359,7 @@ dependencies = [
  "blackwall-flow",
  "blackwall-xdp-common",
  "ipnet",
+ "libc",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

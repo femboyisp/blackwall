@@ -1,0 +1,82 @@
+//! Build script: compile the `blackwall-xdp-ebpf` crate to a
+//! `bpfel-unknown-none` object and stage it at `$OUT_DIR/blackwall-xdp` so
+//! `lib.rs` can embed it with `aya::include_bytes_aligned!`.
+//!
+//! This deliberately does **not** use `aya_build::build_ebpf`: that helper
+//! resolves the eBPF crate with `cargo build --package <name>` from the parent
+//! workspace context, which triggers a cargo feature-resolver panic when the
+//! target package is an excluded path build-dependency of a large workspace.
+//! Instead we invoke the pinned nightly toolchain directly against the eBPF
+//! crate's own manifest (it is its own standalone workspace), mirroring the
+//! flags `aya-build` would pass (`-Z build-std=core`, BTF/debuginfo, and the
+//! `bpf_target_arch` cfg).
+
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+const EBPF_PACKAGE: &str = "blackwall-xdp-ebpf";
+const EBPF_MANIFEST: &str = "../blackwall-xdp-ebpf/Cargo.toml";
+const EBPF_SRC: &str = "../blackwall-xdp-ebpf/src";
+const BIN_NAME: &str = "blackwall-xdp";
+const BPF_TARGET: &str = "bpfel-unknown-none";
+const TOOLCHAIN: &str = "nightly";
+
+fn main() {
+    println!("cargo:rerun-if-changed={EBPF_SRC}");
+    println!("cargo:rerun-if-changed={EBPF_MANIFEST}");
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    let ebpf_target_dir = out_dir.join(EBPF_PACKAGE);
+
+    let bpf_target_arch =
+        env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is set by cargo");
+
+    // Mirror the rustflags aya-build would set, unit-separated as cargo expects.
+    let mut rustflags = OsString::new();
+    for part in [
+        format!("--cfg=bpf_target_arch=\"{bpf_target_arch}\""),
+        "\u{1f}".to_owned(),
+        "-Cdebuginfo=2".to_owned(),
+        "\u{1f}".to_owned(),
+        "-Clink-arg=--btf".to_owned(),
+    ] {
+        rustflags.push(part);
+    }
+
+    let mut cmd = Command::new("rustup");
+    cmd.args(["run", TOOLCHAIN, "cargo", "build"])
+        .args(["--manifest-path", EBPF_MANIFEST])
+        .args(["-Z", "build-std=core"])
+        .arg("--bins")
+        .arg("--release")
+        .args(["--target", BPF_TARGET])
+        .arg("--target-dir")
+        .arg(&ebpf_target_dir)
+        .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
+        .env("CARGO_CFG_BPF_TARGET_ARCH", &bpf_target_arch);
+    // The parent build sets these to route rustc through its own wrapper; the
+    // nested nightly build must use its own rustc.
+    cmd.env_remove("RUSTC");
+    cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+
+    let status = cmd
+        .status()
+        .expect("failed to spawn nightly cargo for the eBPF build");
+    assert!(status.success(), "eBPF build failed: {status}");
+
+    let produced = ebpf_target_dir
+        .join(BPF_TARGET)
+        .join("release")
+        .join(BIN_NAME);
+    let embedded = out_dir.join(BIN_NAME);
+    let _: u64 = fs::copy(&produced, &embedded).unwrap_or_else(|err| {
+        panic!(
+            "failed to stage eBPF object {} -> {}: {err}",
+            produced.display(),
+            embedded.display()
+        )
+    });
+}

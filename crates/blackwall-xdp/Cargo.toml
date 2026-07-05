@@ -18,6 +18,7 @@ aya = "0.13.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+libc = { workspace = true }
 
 [lints]
 workspace = true
