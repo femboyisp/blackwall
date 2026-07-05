@@ -21,8 +21,8 @@ jobs:
     env:
       DATABASE_URL: postgres://blackwall:blackwall@localhost:5432/blackwall
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
       - name: Format
@@ -32,7 +32,9 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2
+        with:
+          tool: cargo-llvm-cov
       # The coverage gate (90%) and its exclusion list live in scripts/coverage.sh,
       # the single source of truth shared by CI and local runs so the two cannot drift.
       - name: Test with coverage gate
@@ -44,8 +46,8 @@ jobs:
     # Cap the whole job so a hung gate fails in minutes, not after hours.
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Install BIRD2 + Knot + nftables + iproute2 + build hsflowd
         run: |
           sudo apt-get update && sudo apt-get install -y bird2 knot knot-dnsutils nftables iproute2 libpcap-dev
@@ -154,7 +156,7 @@ jobs:
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-auto-bird.kdl lab-junit-flowspec-auto.xml
       - name: Upload JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lab-junit
           path: |
