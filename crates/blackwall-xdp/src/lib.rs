@@ -3,12 +3,14 @@ pub mod control;
 pub mod dataplane;
 pub mod keys;
 pub mod manager;
+pub mod sink;
 
 pub use control::{XdpAction, XdpController, XdpOrigin};
 pub use dataplane::{XdpDataplane, XdpError, XdpStats};
 pub use manager::{
     ApplyOutcome, XdpExecError, XdpExecutor, XdpJournal, XdpJournalError, XdpManager,
 };
+pub use sink::XdpMitigationSink;
 
 /// The compiled `bpfel-unknown-none` object for the `xdp_filter` program,
 /// embedded at build time from the `blackwall-xdp-ebpf` crate.

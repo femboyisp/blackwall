@@ -13,11 +13,12 @@ ipnet = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 # aya added in Task 4 (dataplane):
 aya = "0.13.1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 libc = { workspace = true }
 
 [lints]
