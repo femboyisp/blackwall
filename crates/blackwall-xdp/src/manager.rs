@@ -141,7 +141,7 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
                     .await;
                 ApplyOutcome::Applied
             }
-            Err(e) if self.controller.is_own_prefix(net) => ApplyOutcome::Rejected(e),
+            Err(e) if self.controller.overlaps_own_prefix(net) => ApplyOutcome::Rejected(e),
             Err(_) => ApplyOutcome::Deferred,
         }
     }
@@ -531,5 +531,21 @@ mod tests {
             "a still-failing journal must keep the op queued, not drop it"
         );
         assert!(m.journal().recorded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mirror_retry_coalesces_repeated_failures() {
+        // A single source flapping (re-issued) while the journal is down
+        // must never grow the queue past one entry for that source.
+        let mut m = mgr(false, true); // executor ok, journal always fails
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        m.apply_rate_limit(addr, 500, 500, 1000).await;
+        m.apply_rate_limit(addr, 500, 500, 2000).await;
+        m.apply_rate_limit(addr, 500, 500, 3000).await;
+        assert_eq!(
+            m.pending_mirror_len(),
+            1,
+            "repeated failures for one source coalesce to a single queued op"
+        );
     }
 }

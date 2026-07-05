@@ -20,6 +20,17 @@ pub enum XdpOrigin {
     Manual,
 }
 
+/// A tracked rate-limited source: the origin that installed it plus its
+/// currently-effective rate/burst, so `active_entries` can report a manually
+/// customized limit (e.g. `manual_rate_limit(addr, 500, 500)`) faithfully
+/// instead of reconstructing it from the auto default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateLimitEntry {
+    origin: XdpOrigin,
+    pps: u64,
+    burst: u64,
+}
+
 /// A decision the [`XdpController`] emits for the executor to apply.
 ///
 /// Actions are keyed by the attacker source (`RateLimit`/`ClearRate`) or by an
@@ -67,8 +78,9 @@ pub struct XdpController {
     prefixes: Vec<IpNet>,
     max_entries: usize,
     default_rate_pps: u64,
-    /// All currently rate-limited sources, with the origin that installed them.
-    rate_limited: HashMap<IpAddr, XdpOrigin>,
+    /// All currently rate-limited sources, with the origin and effective
+    /// rate/burst that installed them.
+    rate_limited: HashMap<IpAddr, RateLimitEntry>,
     /// All currently blocked networks, with the origin that installed them.
     blocked_nets: HashMap<IpNet, XdpOrigin>,
     /// Victim target -> the (auto) sources currently rate-limited on its
@@ -125,7 +137,7 @@ impl XdpController {
     /// entry cap. Re-blocking an already-blocked network is idempotent and
     /// always succeeds.
     pub fn manual_block(&mut self, net: IpNet) -> Result<XdpAction, String> {
-        if self.is_own_prefix(net) {
+        if self.overlaps_own_prefix(net) {
             return Err(format!(
                 "{net} is inside an own prefix; refusing to self-block"
             ));
@@ -168,9 +180,14 @@ impl XdpController {
         burst: u64,
     ) -> Result<XdpAction, String> {
         let at_cap = self.total_active() >= self.max_entries;
+        let entry = RateLimitEntry {
+            origin: XdpOrigin::Manual,
+            pps,
+            burst,
+        };
         match self.rate_limited.entry(addr) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                e.insert(XdpOrigin::Manual);
+                e.insert(entry);
                 return Ok(XdpAction::RateLimit {
                     src: addr,
                     pps,
@@ -184,7 +201,7 @@ impl XdpController {
                 ));
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(XdpOrigin::Manual);
+                e.insert(entry);
             }
         }
         Ok(XdpAction::RateLimit {
@@ -194,13 +211,20 @@ impl XdpController {
         })
     }
 
-    /// Whether `net` overlaps one of the configured own prefixes.
+    /// Whether `net` overlaps one of the configured own prefixes, in either
+    /// direction.
     ///
+    /// Catches both a subnet-or-equal of an own prefix (`net` inside `p`) and
+    /// a supernet that swallows one (`p` inside `net`) — an operator block of
+    /// e.g. `203.0.0.0/16` when own space is `203.0.113.0/24` is just as much
+    /// a self-inflicted denial of service as blocking the /24 directly.
     /// Pure accessor; lets a caller (e.g. the manager) classify a rejected
     /// `manual_block` without duplicating the controller's eligibility logic.
     #[must_use]
-    pub fn is_own_prefix(&self, net: IpNet) -> bool {
-        self.prefixes.iter().any(|p| p.contains(&net))
+    pub fn overlaps_own_prefix(&self, net: IpNet) -> bool {
+        self.prefixes
+            .iter()
+            .any(|p| p.contains(&net) || net.contains(p))
     }
 
     /// Whether the controller is at its combined active-entry cap.
@@ -215,14 +239,14 @@ impl XdpController {
         let mut entries: Vec<(XdpAction, XdpOrigin)> = self
             .rate_limited
             .iter()
-            .map(|(src, origin)| {
+            .map(|(src, entry)| {
                 (
                     XdpAction::RateLimit {
                         src: *src,
-                        pps: self.default_rate_pps,
-                        burst: self.default_rate_pps,
+                        pps: entry.pps,
+                        burst: entry.burst,
                     },
-                    *origin,
+                    entry.origin,
                 )
             })
             .collect();
@@ -239,8 +263,9 @@ impl XdpController {
     /// own — the caller (the manager) re-issues the executor call directly.
     pub fn mark_resumed(&mut self, action: &XdpAction, origin: XdpOrigin) {
         match *action {
-            XdpAction::RateLimit { src, .. } => {
-                self.rate_limited.insert(src, origin);
+            XdpAction::RateLimit { src, pps, burst } => {
+                self.rate_limited
+                    .insert(src, RateLimitEntry { origin, pps, burst });
             }
             XdpAction::Block { net } => {
                 self.blocked_nets.insert(net, origin);
@@ -271,7 +296,14 @@ impl XdpController {
                 );
                 break;
             }
-            self.rate_limited.insert(*src, XdpOrigin::Auto);
+            self.rate_limited.insert(
+                *src,
+                RateLimitEntry {
+                    origin: XdpOrigin::Auto,
+                    pps: self.default_rate_pps,
+                    burst: self.default_rate_pps,
+                },
+            );
             self.by_target.entry(d.target).or_default().insert(*src);
             actions.push(XdpAction::RateLimit {
                 src: *src,
@@ -288,7 +320,15 @@ impl XdpController {
         };
         let mut actions = Vec::new();
         for src in sources {
-            match self.rate_limited.get(&src) {
+            // A source shared with another still-open victim must not be
+            // cleared here: doing so would re-expose that other victim to
+            // the very source it's still under attack from. Only clear once
+            // no *other* remaining target still references this source.
+            let still_needed = self.by_target.values().any(|others| others.contains(&src));
+            if still_needed {
+                continue;
+            }
+            match self.rate_limited.get(&src).map(|e| e.origin) {
                 Some(XdpOrigin::Manual) => {
                     // A manually-installed (or upgraded) rate limit is never
                     // auto-cleared, mirroring RTBH's manual-survives-auto-clear rule.
@@ -421,5 +461,72 @@ mod tests {
         assert!(c.manual_unblock(net).is_ok());
         assert!(c.manual_unblock(net).is_ok());
         assert!(c.active_entries().is_empty());
+    }
+
+    #[test]
+    fn shared_source_kept_until_last_victim_clears() {
+        // Source X floods two of our own victims, A and B, simultaneously.
+        let mut c = XdpController::new(own(), 100, 1000);
+        c.on_detection(&DetectionEvent::Opened(det(
+            "203.0.113.7", // A
+            vec!["198.51.100.9"],
+        )));
+        c.on_detection(&DetectionEvent::Opened(det(
+            "203.0.113.8", // B
+            vec!["198.51.100.9"],
+        )));
+
+        // Clearing A alone must not release X: B is still under attack from it.
+        let acts = c.on_detection(&DetectionEvent::Cleared {
+            target: "203.0.113.7".parse().unwrap(),
+            at_ms: 1000,
+        });
+        assert!(
+            acts.is_empty(),
+            "shared source must not be cleared while another victim is still active"
+        );
+        assert_eq!(
+            c.active_entries().len(),
+            1,
+            "X must remain rate-limited for B's sake"
+        );
+
+        // Clearing B (the last remaining victim) must now release X.
+        let acts = c.on_detection(&DetectionEvent::Cleared {
+            target: "203.0.113.8".parse().unwrap(),
+            at_ms: 2000,
+        });
+        assert_eq!(acts.len(), 1);
+        assert!(matches!(acts[0], XdpAction::ClearRate { .. }));
+        assert!(c.active_entries().is_empty());
+    }
+
+    #[test]
+    fn manual_block_of_supernet_covering_own_space_is_rejected() {
+        // Own space is 203.0.113.0/24; a supernet block of 203.0.0.0/16 would
+        // swallow it — the self-block guard must catch this direction too.
+        let mut c = XdpController::new(own(), 100, 1000);
+        assert!(c.manual_block("203.0.0.0/16".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn manual_rate_limit_preserved_in_active_entries() {
+        let mut c = XdpController::new(own(), 100, 1000);
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        c.manual_rate_limit(addr, 500, 500).unwrap();
+
+        let entries = c.active_entries();
+        let (action, origin) = entries
+            .iter()
+            .find(|(a, _)| matches!(a, XdpAction::RateLimit { src, .. } if *src == addr))
+            .expect("manually rate-limited source must be in active_entries");
+        assert_eq!(*origin, XdpOrigin::Manual);
+        match action {
+            XdpAction::RateLimit { pps, burst, .. } => {
+                assert_eq!(*pps, 500, "custom pps must be preserved, not defaulted");
+                assert_eq!(*burst, 500, "custom burst must be preserved, not defaulted");
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
     }
 }
