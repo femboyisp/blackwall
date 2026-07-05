@@ -87,6 +87,4 @@ Also: Postgres tables (`detections`, `rtbh_blackholes`, `flowspec_rules`, the
   there is no kernel-bypass offload yet (sub-project B). Fine for moderate rates,
   not for line-rate volumetric attack traffic *on the box* (BGP mitigation pushes
   that to your router instead).
-- `run` engine limits (concurrency 1024, session timeout 60s) and the TPROXY
-  port (61000) / NFQUEUE (0) are not configurable.
 - No GTSM/TTL-security on BGP (TCP-MD5 only).

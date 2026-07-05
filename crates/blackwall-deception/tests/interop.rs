@@ -87,6 +87,7 @@ async fn serves_deception_banner() {
         rtbh: None,
         flowspec: None,
         metrics_listen: None,
+        engine: blackwall_core::EngineConfig::default(),
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
@@ -146,6 +147,7 @@ async fn serves_deception_under_load() {
         rtbh: None,
         flowspec: None,
         metrics_listen: None,
+        engine: blackwall_core::EngineConfig::default(),
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000

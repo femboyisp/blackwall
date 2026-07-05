@@ -3,7 +3,7 @@
 mod metrics;
 
 use clap::{Parser, Subcommand};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -1126,17 +1126,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let registry = std::sync::Arc::new(default_registry(shared.clone()));
 
-            // TPROXY listener binds on port 61000 (ENGINE_TPROXY_PORT in blackwall-nft).
-            let listener_v4 = TproxyListener::bind("0.0.0.0:61000".parse()?)?;
+            // Engine wiring (port/queue/limits) is a single source of truth in the
+            // policy: the nft rules point at exactly these values.
+            let tproxy_port = policy.engine.tproxy_port;
+            let nfqueue_num = policy.engine.nfqueue_num;
+            let engine_limits = EngineLimits {
+                max_concurrent: policy.engine.max_concurrent,
+                session_timeout: std::time::Duration::from_secs(policy.engine.session_timeout_secs),
+            };
+
+            // TPROXY listener binds on the configured engine port.
+            let listener_v4 =
+                TproxyListener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), tproxy_port))?;
 
             // Attempt to bind an IPv6 TPROXY listener for the ip6 tproxy nft rule.
-            let listener_v6 = match TproxyListener::bind("[::]:61000".parse()?) {
+            let listener_v6 = match TproxyListener::bind(SocketAddr::new(
+                Ipv6Addr::UNSPECIFIED.into(),
+                tproxy_port,
+            )) {
                 Ok(v6_listener) => Some(v6_listener),
                 Err(err) => {
                     tracing::warn!(
                         %err,
-                        "failed to bind IPv6 TPROXY listener on [::]:61000 \
-                         (IPv6 may be disabled on this host); continuing with IPv4 only"
+                        port = tproxy_port,
+                        "failed to bind IPv6 TPROXY listener (IPv6 may be disabled on \
+                         this host); continuing with IPv4 only"
                     );
                     None
                 }
@@ -1152,7 +1166,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 listener_v4,
                 registry.clone(),
                 tx.clone(),
-                EngineLimits::default(),
+                engine_limits,
                 inflight.clone(),
             ));
             let has_v6 = listener_v6.is_some();
@@ -1161,7 +1175,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     v6,
                     registry.clone(),
                     tx.clone(),
-                    EngineLimits::default(),
+                    engine_limits,
                     inflight.clone(),
                 ));
             }
@@ -1178,8 +1192,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             transports.spawn(async move {
                 // run_nfqueue is blocking/sync; run it on a blocking thread.
-                let _ = tokio::task::spawn_blocking(|| {
-                    if let Err(err) = run_nfqueue(0) {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(err) = run_nfqueue(nfqueue_num) {
                         tracing::error!(%err, "nfqueue loop exited");
                     }
                 })
@@ -1294,10 +1308,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             if has_v6 {
                 tracing::info!(
-                    "deception engine running (TPROXY 0.0.0.0:61000 + [::]:61000, NFQUEUE 0)"
+                    port = tproxy_port,
+                    nfqueue = nfqueue_num,
+                    "deception engine running (TPROXY 0.0.0.0 + [::] on port, NFQUEUE)"
                 );
             } else {
-                tracing::info!("deception engine running (TPROXY 0.0.0.0:61000, NFQUEUE 0)");
+                tracing::info!(
+                    port = tproxy_port,
+                    nfqueue = nfqueue_num,
+                    "deception engine running (TPROXY 0.0.0.0 on port, NFQUEUE)"
+                );
             }
 
             let drain = async {

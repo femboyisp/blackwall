@@ -4,8 +4,8 @@
 use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
-    AllowRule, BannerFluxConfig, DnsFluxConfig, FlowSpecPolicy, L4Proto, Policy, PortState,
-    RtbhPolicy, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
+    AllowRule, BannerFluxConfig, DnsFluxConfig, EngineConfig, FlowSpecPolicy, L4Proto, Policy,
+    PortState, RtbhPolicy, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -21,6 +21,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut rtbh: Option<RtbhPolicy> = None;
     let mut flowspec: Option<FlowSpecPolicy> = None;
     let mut metrics_listen: Option<SocketAddr> = None;
+    let mut engine = EngineConfig::default();
 
     let mut i = 0;
     while i < lines.len() {
@@ -411,6 +412,73 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         })?);
                 }
             }
+            "engine" => {
+                let bad = |what: &'static str, v: &str| ConfigError::BadValue {
+                    line: line.number,
+                    what,
+                    value: v.to_owned(),
+                };
+                for tok in &line.words[1..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "engine",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    match k {
+                        "max-concurrent" => {
+                            let n = v.parse::<usize>().map_err(|_| ConfigError::BadValue {
+                                line: line.number,
+                                what: "engine max-concurrent",
+                                value: v.to_owned(),
+                            })?;
+                            if n == 0 {
+                                return Err(bad("engine max-concurrent", "must be >= 1"));
+                            }
+                            engine.max_concurrent = n;
+                        }
+                        "session-timeout" => {
+                            let n = v.parse::<u64>().map_err(|_| ConfigError::BadValue {
+                                line: line.number,
+                                what: "engine session-timeout",
+                                value: v.to_owned(),
+                            })?;
+                            if n == 0 {
+                                return Err(bad(
+                                    "engine session-timeout",
+                                    "must be >= 1 (seconds)",
+                                ));
+                            }
+                            engine.session_timeout_secs = n;
+                        }
+                        "tproxy-port" => {
+                            let n = v.parse::<u16>().map_err(|_| ConfigError::BadValue {
+                                line: line.number,
+                                what: "engine tproxy-port",
+                                value: v.to_owned(),
+                            })?;
+                            if n == 0 {
+                                return Err(bad("engine tproxy-port", "must be 1..=65535"));
+                            }
+                            engine.tproxy_port = n;
+                        }
+                        "nfqueue" => {
+                            engine.nfqueue_num =
+                                v.parse::<u16>().map_err(|_| ConfigError::BadValue {
+                                    line: line.number,
+                                    what: "engine nfqueue",
+                                    value: v.to_owned(),
+                                })?;
+                        }
+                        other => {
+                            return Err(ConfigError::BadValue {
+                                line: line.number,
+                                what: "engine key",
+                                value: other.to_owned(),
+                            })
+                        }
+                    }
+                }
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -449,6 +517,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         rtbh,
         flowspec,
         metrics_listen,
+        engine,
     })
 }
 
@@ -1229,6 +1298,82 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
                 err,
                 ConfigError::BadValue {
                     what: "metrics key",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn engine_absent_uses_defaults() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert_eq!(p.engine, EngineConfig::default());
+    }
+
+    #[test]
+    fn parses_engine_directive() {
+        let p = parse_text(
+            "interface wan eth0\n\
+             engine max-concurrent=4096 session-timeout=120 tproxy-port=62000 nfqueue=3\n",
+        )
+        .unwrap();
+        assert_eq!(p.engine.max_concurrent, 4096);
+        assert_eq!(p.engine.session_timeout_secs, 120);
+        assert_eq!(p.engine.tproxy_port, 62000);
+        assert_eq!(p.engine.nfqueue_num, 3);
+    }
+
+    #[test]
+    fn engine_partial_overrides_only_named_keys() {
+        let p = parse_text("interface wan eth0\nengine tproxy-port=62000\n").unwrap();
+        assert_eq!(p.engine.tproxy_port, 62000);
+        // Untouched knobs keep their defaults.
+        assert_eq!(
+            p.engine.max_concurrent,
+            EngineConfig::default().max_concurrent
+        );
+        assert_eq!(p.engine.nfqueue_num, EngineConfig::default().nfqueue_num);
+    }
+
+    #[test]
+    fn rejects_zero_engine_max_concurrent() {
+        let err = parse_text("interface wan eth0\nengine max-concurrent=0\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "engine max-concurrent",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_engine_tproxy_port() {
+        let err = parse_text("interface wan eth0\nengine tproxy-port=0\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "engine tproxy-port",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_engine_unknown_key() {
+        let err = parse_text("interface wan eth0\nengine bogus=1\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "engine key",
                     ..
                 }
             ),

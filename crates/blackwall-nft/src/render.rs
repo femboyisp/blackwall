@@ -9,8 +9,8 @@
 //!   managed interface via an `iifname` match:
 //!   1. Real-service membership → accept (host/incus reach the backend directly;
 //!      `nat:` targets are DNAT'd in a separate `nat` chain).
-//!   2. Deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
-//!   3. Deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
+//!   2. Deception TCP on managed prefix → tproxy to the configured engine port.
+//!   3. Deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE.
 //!   4. If default_state == Closed → an interface-scoped terminal `drop` rule
 //!      (the chain runs for every interface, so the closed posture must be
 //!      enforced by a rule matched on `iifname`, not a chain-wide drop policy).
@@ -49,19 +49,6 @@ const FAMILY: NfFamily = NfFamily::INet;
 /// The table name Blackwall owns.
 const TABLE: &str = "blackwall";
 
-/// TCP port the deception engine's tproxy listener binds to.
-///
-/// Traffic classified as deception TCP is redirected here so the engine can
-/// respond with honeypot content. The engine itself is wired in Task 9.
-const ENGINE_TPROXY_PORT: u16 = 61000;
-
-/// NFQUEUE number used for deception ICMP/UDP packets.
-///
-/// The deception engine receives these packets via the kernel's userspace
-/// queue mechanism and generates appropriate honeypot responses. The engine
-/// is wired in Task 9.
-const DECEPTION_QUEUE: u16 = 0;
-
 /// Firewall mark set on deception-TCP packets by the tproxy rule.
 ///
 /// TPROXY only delivers a packet to the local transparent socket if the routing
@@ -86,8 +73,8 @@ pub(crate) const TPROXY_ROUTE_TABLE: u32 = 100;
 ///    (no device binding — device binding is rejected by nft for prerouting chains;
 ///    the managed interface is scoped per-rule via `iifname == policy.interface`)
 /// 6. Rule: `iifname` match + real-service membership → accept (nat: targets DNAT'd in the nat chain)
-/// 7. Rule: `iifname` match + deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT
-/// 8. Rule: `iifname` match + deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE
+/// 7. Rule: `iifname` match + deception TCP on managed prefix → tproxy to the configured engine port
+/// 8. Rule: `iifname` match + deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE
 ///
 /// The idiomatic nft atomic full-replace pattern is: `add table` (creates if
 /// absent), `flush table` (empties existing content), then re-add sets and
@@ -258,7 +245,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         ))));
     }
 
-    // 7. Rule: deception TCP on managed prefix → tproxy to ENGINE_TPROXY_PORT.
+    // 7. Rule: deception TCP on managed prefix → tproxy to the configured engine port.
     //
     //    nftables-0.6 provides a typed `Statement::TProxy` variant that
     //    serializes as `{"tproxy": {"family": "<f>", "port": <n>}}`.
@@ -299,11 +286,11 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
                     })),
                     op: Operator::EQ,
                 }),
-                // tproxy to ENGINE_TPROXY_PORT — typed variant, serializes as
-                // {"tproxy": {"family": "<f>", "port": <n>}}
+                // tproxy to the configured engine port — typed variant,
+                // serializes as {"tproxy": {"family": "<f>", "port": <n>}}
                 Statement::TProxy(TProxy {
                     family: Some(addr_family.into()),
-                    port: ENGINE_TPROXY_PORT,
+                    port: policy.engine.tproxy_port,
                     addr: None,
                 }),
                 // meta mark set TPROXY_MARK — so the policy route installed by
@@ -318,7 +305,11 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             handle: None,
             index: None,
             comment: Some(
-                format!("deception TCP: tproxy to engine port {ENGINE_TPROXY_PORT}").into(),
+                format!(
+                    "deception TCP: tproxy to engine port {}",
+                    policy.engine.tproxy_port
+                )
+                .into(),
             ),
         };
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
@@ -326,7 +317,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         ))));
     }
 
-    // 8. Rule: deception ICMP/UDP on managed prefix → queue to DECEPTION_QUEUE.
+    // 8. Rule: deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE.
     //
     //    `Statement::Queue` is a typed variant; it serializes as
     //    `{"queue": {"num": <n>}}`.
@@ -363,16 +354,22 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
                     })),
                     op: Operator::EQ,
                 }),
-                // queue num DECEPTION_QUEUE
+                // queue num — the configured NFQUEUE number
                 Statement::Queue(Queue {
-                    num: Expression::Number(u32::from(DECEPTION_QUEUE)),
+                    num: Expression::Number(u32::from(policy.engine.nfqueue_num)),
                     flags: None,
                 }),
             ]
             .into(),
             handle: None,
             index: None,
-            comment: Some(format!("deception ICMP/UDP: queue to nfqueue {DECEPTION_QUEUE}").into()),
+            comment: Some(
+                format!(
+                    "deception ICMP/UDP: queue to nfqueue {}",
+                    policy.engine.nfqueue_num
+                )
+                .into(),
+            ),
         };
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
             queue_rule,
@@ -549,6 +546,7 @@ mod tests {
             rtbh: None,
             flowspec: None,
             metrics_listen: None,
+            engine: blackwall_core::EngineConfig::default(),
         }
     }
 
@@ -572,6 +570,7 @@ mod tests {
             rtbh: None,
             flowspec: None,
             metrics_listen: None,
+            engine: blackwall_core::EngineConfig::default(),
         }
     }
 
@@ -850,6 +849,44 @@ mod tests {
     }
 
     #[test]
+    fn tproxy_and_queue_rules_follow_configured_engine_port_and_nfqueue() {
+        let mut policy = sample();
+        policy.engine.tproxy_port = 62000;
+        policy.engine.nfqueue_num = 7;
+        let ruleset = render(&policy).expect("render");
+
+        let tproxy_port = ruleset.objects.iter().find_map(|o| {
+            let NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) = o else {
+                return None;
+            };
+            r.expr.iter().find_map(|s| match s {
+                Statement::TProxy(t) => Some(t.port),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            tproxy_port,
+            Some(62000),
+            "tproxy rule must use configured port"
+        );
+
+        let queue_num = ruleset.objects.iter().find_map(|o| {
+            let NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) = o else {
+                return None;
+            };
+            r.expr.iter().find_map(|s| match s {
+                Statement::Queue(q) => Some(q.num.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            queue_num,
+            Some(Expression::Number(7)),
+            "queue rule must use configured nfqueue number"
+        );
+    }
+
+    #[test]
     fn empty_tenant_list_produces_empty_sets() {
         let policy = Policy {
             interface: "eth0".to_owned(),
@@ -862,6 +899,7 @@ mod tests {
             rtbh: None,
             flowspec: None,
             metrics_listen: None,
+            engine: blackwall_core::EngineConfig::default(),
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.

@@ -1,6 +1,7 @@
 //! Shared domain types and the policy model for Blackwall.
 
 mod dns;
+mod engine;
 mod flowspec;
 mod flux;
 mod md5secret;
@@ -13,6 +14,10 @@ mod shape;
 mod target;
 
 pub use dns::DnsFluxConfig;
+pub use engine::{
+    EngineConfig, DEFAULT_MAX_CONCURRENT, DEFAULT_NFQUEUE_NUM, DEFAULT_SESSION_TIMEOUT_SECS,
+    DEFAULT_TPROXY_PORT,
+};
 pub use flowspec::FlowSpecPolicy;
 pub use flux::BannerFluxConfig;
 pub use md5secret::Md5Secret;
