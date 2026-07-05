@@ -189,6 +189,48 @@ impl Store {
         Ok(out)
     }
 
+    /// Append an operator-intent row to `xdp_requests` and return its new id.
+    ///
+    /// The row is created with the default `status = 'pending'`; a running
+    /// `blackwalld flow` daemon (with an `xdp` config block) is the sole
+    /// applier, draining pending rows and applying each to the data plane.
+    ///
+    /// `prefixlen` carries a block's mask (`None` for a rate limit), and
+    /// `rate_pps`/`burst` carry a rate limit's cap (`None` for a block).
+    pub async fn xdp_enqueue_request(
+        &self,
+        action: &str,
+        target: IpAddr,
+        prefixlen: Option<u8>,
+        rate_pps: Option<u64>,
+        burst: Option<u64>,
+        created_by: &str,
+    ) -> Result<i64, StateError> {
+        let target_net = ipnetwork_addr(target);
+        let prefixlen_i32 = prefixlen.map(i32::from);
+        let rate_pps_i64 = rate_pps
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
+        let burst_i64 = burst
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO xdp_requests (action, target, prefixlen, rate_pps, burst, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(action)
+        .bind(target_net)
+        .bind(prefixlen_i32)
+        .bind(rate_pps_i64)
+        .bind(burst_i64)
+        .bind(created_by)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row.0)
+    }
+
     /// Fetch all `xdp_requests` rows with `status = 'pending'`, ordered by id.
     pub async fn xdp_pending_requests(&self) -> Result<Vec<XdpRequestRow>, StateError> {
         let rows: Vec<XdpRequestTuple> = sqlx::query_as(
@@ -385,6 +427,47 @@ mod tests {
             .unwrap()
             .iter()
             .any(|r| r.kind == "block" && r.target == net_addr));
+    }
+
+    #[tokio::test]
+    async fn xdp_enqueue_request_roundtrips_block_and_rate_limit() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+
+        let net: IpAddr = "198.51.100.0".parse().unwrap();
+        let block_id = store
+            .xdp_enqueue_request("block", net, Some(24), None, None, "op@host")
+            .await
+            .unwrap();
+        let src: IpAddr = "203.0.113.77".parse().unwrap();
+        let rl_id = store
+            .xdp_enqueue_request("rate_limit", src, None, Some(500), Some(1_000), "op@host")
+            .await
+            .unwrap();
+
+        let pending = store.xdp_pending_requests().await.unwrap();
+        let block = pending
+            .iter()
+            .find(|r| r.id == block_id)
+            .expect("block request present");
+        assert_eq!(block.action, "block");
+        assert_eq!(block.target, net);
+        assert_eq!(block.prefixlen, Some(24));
+
+        let rl = pending
+            .iter()
+            .find(|r| r.id == rl_id)
+            .expect("rate_limit request present");
+        assert_eq!(rl.action, "rate_limit");
+        assert_eq!(rl.rate_pps, Some(500));
+        assert_eq!(rl.burst, Some(1_000));
+
+        store.xdp_mark_request(block_id, "applied").await.unwrap();
+        store.xdp_mark_request(rl_id, "applied").await.unwrap();
     }
 
     #[tokio::test]

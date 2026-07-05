@@ -84,9 +84,87 @@ pub fn render_prometheus(metrics: &[Metric]) -> String {
     out
 }
 
+/// A snapshot of the XDP data plane's counters for Prometheus rendering.
+///
+/// Values are `f64` (already widened from the data plane's `u64` per-CPU
+/// counters and map occupancies by the caller) so this stays a pure,
+/// dependency-free renderer with no integer `as` casts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XdpMetrics {
+    /// Packets passed by the filter (`REASON_PASS`).
+    pub passed_packets: f64,
+    /// Packets dropped by the source blocklist (`REASON_BLOCKLIST`).
+    pub dropped_blocklist_packets: f64,
+    /// Packets dropped by the rate limiter (`REASON_RATELIMIT`).
+    pub dropped_ratelimit_packets: f64,
+    /// Number of active blocklist entries (`BLOCK_V4` + `BLOCK_V6`).
+    pub blocked_entries: f64,
+    /// Number of active rate-limit entries (`RATE`).
+    pub ratelimit_entries: f64,
+}
+
+/// Render the XDP data-plane metrics block as Prometheus text exposition 0.0.4.
+///
+/// Unlike [`render_prometheus`], this emits a single labelled counter
+/// (`blackwall_xdp_packets_dropped_total{reason="blocklist"|"ratelimit"}`)
+/// whose two series share one `# HELP`/`# TYPE` header, alongside the passed
+/// counter and the two occupancy gauges. Blocks are separated by a blank line
+/// and there is no trailing blank line, matching [`render_prometheus`] so the
+/// two outputs concatenate cleanly.
+#[must_use]
+pub fn render_xdp_metrics(m: &XdpMetrics) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_xdp_packets_dropped_total Packets dropped by the XDP data plane, by reason"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_xdp_packets_dropped_total counter");
+    let _ = writeln!(
+        out,
+        "blackwall_xdp_packets_dropped_total{{reason=\"blocklist\"}} {}",
+        format_value(m.dropped_blocklist_packets)
+    );
+    let _ = writeln!(
+        out,
+        "blackwall_xdp_packets_dropped_total{{reason=\"ratelimit\"}} {}",
+        format_value(m.dropped_ratelimit_packets)
+    );
+    let _ = writeln!(
+        out,
+        "\n# HELP blackwall_xdp_packets_passed_total Packets passed by the XDP data plane"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_xdp_packets_passed_total counter");
+    let _ = writeln!(
+        out,
+        "blackwall_xdp_packets_passed_total {}",
+        format_value(m.passed_packets)
+    );
+    let _ = writeln!(
+        out,
+        "\n# HELP blackwall_xdp_blocked_entries Active XDP source-blocklist entries"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_xdp_blocked_entries gauge");
+    let _ = writeln!(
+        out,
+        "blackwall_xdp_blocked_entries {}",
+        format_value(m.blocked_entries)
+    );
+    let _ = writeln!(
+        out,
+        "\n# HELP blackwall_xdp_ratelimit_entries Active XDP rate-limit entries"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_xdp_ratelimit_entries gauge");
+    let _ = writeln!(
+        out,
+        "blackwall_xdp_ratelimit_entries {}",
+        format_value(m.ratelimit_entries)
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render_prometheus, Metric, MetricKind};
+    use super::{render_prometheus, render_xdp_metrics, Metric, MetricKind, XdpMetrics};
 
     #[test]
     fn renders_golden_multi_metric() {
@@ -184,5 +262,60 @@ blackwall_bgp_reconnects_total 0
     fn metric_kind_type_tokens() {
         assert_eq!(MetricKind::Gauge.as_type_str(), "gauge");
         assert_eq!(MetricKind::Counter.as_type_str(), "counter");
+    }
+
+    #[test]
+    fn renders_golden_xdp_block() {
+        let m = XdpMetrics {
+            passed_packets: 1000.0,
+            dropped_blocklist_packets: 42.0,
+            dropped_ratelimit_packets: 7.0,
+            blocked_entries: 3.0,
+            ratelimit_entries: 5.0,
+        };
+        let expected = "\
+# HELP blackwall_xdp_packets_dropped_total Packets dropped by the XDP data plane, by reason
+# TYPE blackwall_xdp_packets_dropped_total counter
+blackwall_xdp_packets_dropped_total{reason=\"blocklist\"} 42
+blackwall_xdp_packets_dropped_total{reason=\"ratelimit\"} 7
+
+# HELP blackwall_xdp_packets_passed_total Packets passed by the XDP data plane
+# TYPE blackwall_xdp_packets_passed_total counter
+blackwall_xdp_packets_passed_total 1000
+
+# HELP blackwall_xdp_blocked_entries Active XDP source-blocklist entries
+# TYPE blackwall_xdp_blocked_entries gauge
+blackwall_xdp_blocked_entries 3
+
+# HELP blackwall_xdp_ratelimit_entries Active XDP rate-limit entries
+# TYPE blackwall_xdp_ratelimit_entries gauge
+blackwall_xdp_ratelimit_entries 5
+";
+        assert_eq!(render_xdp_metrics(&m), expected);
+    }
+
+    #[test]
+    fn xdp_block_concatenates_cleanly_after_render_prometheus() {
+        // No trailing blank line on either block, so a single '\n' joins them.
+        let head = render_prometheus(&[Metric {
+            name: "blackwall_rtbh_active",
+            help: "Active RTBH blackholes",
+            kind: MetricKind::Gauge,
+            value: 1.0,
+        }]);
+        let xdp = render_xdp_metrics(&XdpMetrics {
+            passed_packets: 0.0,
+            dropped_blocklist_packets: 0.0,
+            dropped_ratelimit_packets: 0.0,
+            blocked_entries: 0.0,
+            ratelimit_entries: 0.0,
+        });
+        let combined = format!("{head}\n{xdp}");
+        assert!(combined
+            .contains("blackwall_rtbh_active 1\n\n# HELP blackwall_xdp_packets_dropped_total"));
+        assert!(
+            !combined.contains("\n\n\n"),
+            "no triple newline between blocks"
+        );
     }
 }

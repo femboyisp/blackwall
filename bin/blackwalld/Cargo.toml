@@ -19,6 +19,7 @@ blackwall-metrics = { path = "../../crates/blackwall-metrics" }
 blackwall-speedtest = { path = "../../crates/blackwall-speedtest" }
 blackwall-bgp = { path = "../../crates/blackwall-bgp" }
 blackwall-rtbh = { path = "../../crates/blackwall-rtbh" }
+blackwall-xdp = { path = "../../crates/blackwall-xdp" }
 clap = { workspace = true }
 ipnet = { workspace = true }
 serde_json = { workspace = true }

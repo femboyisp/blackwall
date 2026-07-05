@@ -359,6 +359,17 @@ fn map_err(e: aya::maps::MapError) -> XdpError {
     XdpError::Map(e.to_string())
 }
 
+/// Forwarding [`XdpExecutor`] impl for a shared handle, so the same attached
+/// data plane can be moved into the [`crate::manager::XdpManager`] (as its
+/// executor) while a clone is retained by the daemon for `stats()` reads
+/// (`/metrics`). Delegates straight to the inner [`XdpDataplane`].
+#[async_trait]
+impl XdpExecutor for std::sync::Arc<XdpDataplane> {
+    async fn apply(&self, action: XdpAction) -> Result<(), XdpExecError> {
+        (**self).apply(action).await
+    }
+}
+
 #[async_trait]
 impl XdpExecutor for XdpDataplane {
     async fn apply(&self, action: XdpAction) -> Result<(), XdpExecError> {

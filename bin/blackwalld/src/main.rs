@@ -139,6 +139,65 @@ enum Command {
         #[command(subcommand)]
         action: FlowspecCmd,
     },
+    /// Queue XDP fast-path operator intent, or inspect the active map mirror.
+    ///
+    /// Like `rtbh`/`flowspec`, the CLI never touches the eBPF maps directly: it
+    /// only appends to (or reads) the `xdp_requests`/`xdp_entries` tables. A
+    /// running `blackwalld flow` daemon (with an `xdp` config block) is the sole
+    /// applier of intent — it drains pending requests and programs the maps.
+    Xdp {
+        /// Which XDP action to perform.
+        #[command(subcommand)]
+        action: XdpCmd,
+    },
+}
+
+/// Operator actions for the `xdp` subcommand.
+#[derive(Subcommand)]
+enum XdpCmd {
+    /// Queue a source-blocklist add for the network `target` (drop all traffic).
+    ///
+    /// Warns (but still queues) if `target` overlaps an own prefix — blocking
+    /// your own space is a self-inflicted denial of service; the daemon will
+    /// reject such a request when it drains it.
+    Block {
+        /// The network to drop (e.g. `198.51.100.0/24` or a bare host address).
+        target: ipnet::IpNet,
+        /// Path to the Blackwall config file (must contain an `xdp` block).
+        #[arg(long)]
+        config: PathBuf,
+        /// Attribution for the request; defaults to `$USER@<hostname>`.
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Queue a source-blocklist remove for the network `target`.
+    Unblock {
+        /// The network to stop dropping.
+        target: ipnet::IpNet,
+    },
+    /// Queue a per-source rate limit for attacker source `ip`.
+    RateLimit {
+        /// The attacker source address to rate-limit.
+        ip: IpAddr,
+        /// Sustained packets-per-second cap.
+        pps: u64,
+        /// Burst bucket size in packets; defaults to `pps` when omitted.
+        burst: Option<u64>,
+        /// Path to the Blackwall config file (must contain an `xdp` block).
+        #[arg(long)]
+        config: PathBuf,
+        /// Attribution for the request; defaults to `$USER@<hostname>`.
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// List the active `xdp_entries` map mirror.
+    List,
+    /// Print active-entry counts from the DB mirror.
+    ///
+    /// Live per-CPU packet counters (dropped/passed) are exported by the running
+    /// daemon's Prometheus `/metrics` endpoint, not here — the CLI has no handle
+    /// to the attached maps.
+    Stats,
 }
 
 /// Operator actions for the `rtbh` subcommand.
@@ -866,6 +925,185 @@ async fn apply_flowspec_request(
     }
 }
 
+/// Combined cap on active XDP entries (blocks + rate limits) the controller
+/// will install. Kept at or below the smallest binding eBPF map (`BLOCK_V4`/
+/// `BLOCK_V6` are 65 536-entry tries; `RATE` is far larger) so a full
+/// controller can never overflow a map.
+const XDP_MAX_ENTRIES: usize = 65_536;
+
+/// The concrete [`blackwall_xdp::manager::XdpManager`] the daemon runs: a
+/// shared attached data plane as executor and the Postgres journal as mirror.
+type DaemonXdpManager = blackwall_xdp::manager::XdpManager<
+    std::sync::Arc<blackwall_xdp::XdpDataplane>,
+    blackwall_state::PgXdpJournal,
+>;
+
+/// Build an [`ipnet::IpNet`] from a stored address + optional prefix length,
+/// falling back to a host route (`/32`/`/128`) when the length is absent.
+fn xdp_net_from(target: IpAddr, prefixlen: Option<u8>) -> Option<ipnet::IpNet> {
+    match prefixlen {
+        Some(len) => ipnet::IpNet::new(target, len).ok(),
+        None => Some(host_prefix(target)),
+    }
+}
+
+/// Map an active `xdp_entries` mirror row back to a controller action + origin
+/// for [`blackwall_xdp::manager::XdpManager::reapply_active`] on restart.
+fn xdp_entry_to_action(
+    row: &blackwall_state::XdpEntryRow,
+) -> Option<(blackwall_xdp::XdpAction, blackwall_xdp::XdpOrigin)> {
+    let origin = match row.origin.as_str() {
+        "manual" => blackwall_xdp::XdpOrigin::Manual,
+        _ => blackwall_xdp::XdpOrigin::Auto,
+    };
+    let action = match row.kind.as_str() {
+        "block" => blackwall_xdp::XdpAction::Block {
+            net: xdp_net_from(row.target, row.prefixlen)?,
+        },
+        "rate_limit" => {
+            let pps = row.rate_pps?;
+            blackwall_xdp::XdpAction::RateLimit {
+                src: row.target,
+                pps,
+                burst: row.burst.unwrap_or(pps),
+            }
+        }
+        other => {
+            tracing::warn!(
+                kind = other,
+                "XDP: unknown xdp_entries kind; skipping rehydrate row"
+            );
+            return None;
+        }
+    };
+    Some((action, origin))
+}
+
+/// Single-owner XDP reconcile loop: the XDP analogue of [`rtbh_manager_task`].
+///
+/// Applies auto detection events as they arrive on `rx` (fed by the
+/// [`blackwall_xdp::XdpMitigationSink`] in the collector's fanout) when
+/// `auto_enabled`, and on a 1 s tick calls
+/// [`blackwall_xdp::manager::XdpManager::tick`] (draining any journal
+/// mirror-retries) then drains every `status = 'pending'` row from
+/// `xdp_requests` via [`apply_xdp_request`].
+///
+/// When `auto_enabled` is false (no `default-rate-limit` configured) detection
+/// events are still drained off the channel but ignored — only operator CLI
+/// requests populate the maps. Runs until `rx` is closed.
+async fn xdp_manager_task(
+    mut manager: DaemonXdpManager,
+    mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
+    request_store: std::sync::Arc<blackwall_state::Store>,
+    auto_enabled: bool,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            maybe_ev = rx.recv() => {
+                match maybe_ev {
+                    Some(ev) => {
+                        if auto_enabled {
+                            manager.on_detection(&ev, wall_now()).await;
+                        }
+                    }
+                    None => {
+                        tracing::warn!("XDP: detection-event channel closed; manager task exiting");
+                        return;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                // Drains any journal mirror-writes queued by a transient DB blip.
+                manager.tick().await;
+
+                match request_store.xdp_pending_requests().await {
+                    Ok(reqs) => {
+                        for req in reqs {
+                            apply_xdp_request(&mut manager, &request_store, req).await;
+                        }
+                    }
+                    Err(err) => tracing::warn!(%err, "XDP: failed to read pending xdp_requests"),
+                }
+            }
+        }
+    }
+}
+
+/// Apply one pending `xdp_requests` row and record its outcome — the XDP
+/// analogue of [`apply_request`].
+///
+/// `block`/`rate_limit`: `Applied` marks the row `applied`; `Deferred` leaves
+/// it `pending` (retried on the next tick); `Rejected` marks it `rejected`.
+/// `unblock`: always applies, then marks `applied`. Unknown actions (e.g.
+/// `clear_rate`, which no CLI emits) are logged and left untouched.
+async fn apply_xdp_request(
+    manager: &mut DaemonXdpManager,
+    request_store: &blackwall_state::Store,
+    req: blackwall_state::XdpRequestRow,
+) {
+    use blackwall_xdp::manager::ApplyOutcome;
+
+    let mark = |id: i64, status: &'static str| async move {
+        if let Err(err) = request_store.xdp_mark_request(id, status).await {
+            tracing::warn!(%err, id, status, "XDP: failed to set request status");
+        }
+    };
+
+    match req.action.as_str() {
+        "block" => {
+            let Some(net) = xdp_net_from(req.target, req.prefixlen) else {
+                tracing::warn!(target = %req.target, "XDP: bad block prefix; rejecting request");
+                mark(req.id, "rejected").await;
+                return;
+            };
+            match manager.apply_add(net, wall_now()).await {
+                ApplyOutcome::Applied => mark(req.id, "applied").await,
+                ApplyOutcome::Deferred => { /* leave pending; retried next tick */ }
+                ApplyOutcome::Rejected(reason) => {
+                    tracing::warn!(%reason, %net, "XDP: block request rejected");
+                    mark(req.id, "rejected").await;
+                }
+            }
+        }
+        "unblock" => {
+            let Some(net) = xdp_net_from(req.target, req.prefixlen) else {
+                tracing::warn!(target = %req.target, "XDP: bad unblock prefix; rejecting request");
+                mark(req.id, "rejected").await;
+                return;
+            };
+            manager.apply_remove(net, wall_now()).await;
+            mark(req.id, "applied").await;
+        }
+        "rate_limit" => {
+            let Some(pps) = req.rate_pps else {
+                tracing::warn!(target = %req.target, "XDP: rate_limit request has no pps; rejecting");
+                mark(req.id, "rejected").await;
+                return;
+            };
+            let burst = req.burst.unwrap_or(pps);
+            match manager
+                .apply_rate_limit(req.target, pps, burst, wall_now())
+                .await
+            {
+                ApplyOutcome::Applied => mark(req.id, "applied").await,
+                ApplyOutcome::Deferred => { /* leave pending; retried next tick */ }
+                ApplyOutcome::Rejected(reason) => {
+                    tracing::warn!(%reason, target = %req.target, "XDP: rate_limit request rejected");
+                    mark(req.id, "rejected").await;
+                }
+            }
+        }
+        other => {
+            tracing::warn!(
+                action = other,
+                id = req.id,
+                "XDP: unknown request action; ignoring"
+            );
+        }
+    }
+}
+
 /// Core dispatch logic; returns `Err` on any failure.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -1058,6 +1296,80 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // XDP fast path: when configured, attach the eBPF program and spawn
+            // the single-owner manager, then fan the detection stream into it
+            // (alongside the existing sink). NON-FATAL: a failed attach logs a
+            // warning and continues with XDP disabled — the box still runs.
+            let mut xdp_for_metrics: Option<Arc<blackwall_xdp::XdpDataplane>> = None;
+            let mut xdp_shutdown: Option<(
+                tokio::task::JoinHandle<()>,
+                Arc<blackwall_xdp::XdpDataplane>,
+            )> = None;
+            let sink = if let Some(xdp_cfg) = policy.xdp.clone() {
+                let iface = xdp_cfg
+                    .interface
+                    .clone()
+                    .unwrap_or_else(|| policy.interface.clone());
+                match blackwall_xdp::XdpDataplane::attach(&iface, xdp_cfg.mode) {
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            interface = %iface,
+                            "XDP: attach failed; continuing with XDP disabled"
+                        );
+                        sink
+                    }
+                    Ok(dataplane) => {
+                        let dataplane = Arc::new(dataplane);
+                        xdp_for_metrics = Some(dataplane.clone());
+                        // `None` default-rate-limit means "no auto mitigation":
+                        // detections are drained but ignored; only operator CLI
+                        // requests populate the maps.
+                        let auto_enabled = xdp_cfg.default_rate_limit_pps.is_some();
+                        let default_pps = xdp_cfg.default_rate_limit_pps.unwrap_or(1);
+                        let controller = blackwall_xdp::XdpController::new(
+                            policy.prefixes.clone(),
+                            XDP_MAX_ENTRIES,
+                            default_pps,
+                        );
+                        let journal = blackwall_state::PgXdpJournal::new(store.clone());
+                        let mut manager = blackwall_xdp::manager::XdpManager::new(
+                            controller,
+                            dataplane.clone(),
+                            journal,
+                        );
+
+                        // Rehydrate the controller + maps from the active mirror
+                        // (blocks and rate limits, burst included) before this
+                        // session accepts new detections/requests.
+                        let rows: Vec<_> = store
+                            .xdp_active()
+                            .await?
+                            .iter()
+                            .filter_map(xdp_entry_to_action)
+                            .collect();
+                        manager.reapply_active(rows).await;
+
+                        let (xdp_tx, xdp_rx) =
+                            mpsc::channel::<blackwall_flow::DetectionEvent>(4096);
+                        let handle = tokio::spawn(xdp_manager_task(
+                            manager,
+                            xdp_rx,
+                            store.clone(),
+                            auto_enabled,
+                        ));
+                        xdp_shutdown = Some((handle, dataplane));
+
+                        tracing::info!(interface = %iface, auto = auto_enabled, "XDP data plane attached");
+                        let xdp_sink: Arc<dyn blackwall_flow::MitigationSink> =
+                            Arc::new(blackwall_xdp::XdpMitigationSink::new(xdp_tx));
+                        Arc::new(blackwall_flow::FanoutSink(vec![sink, xdp_sink]))
+                    }
+                }
+            } else {
+                sink
+            };
+
             // Optional Prometheus metrics endpoint.
             if let Some(metrics_listen) = policy.metrics_listen {
                 let sources = metrics::MetricsSources {
@@ -1065,19 +1377,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     bgp: bgp_for_metrics,
                     collector: Some(collector_metrics.clone()),
                     inflight: None,
+                    xdp: xdp_for_metrics.clone(),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
 
             tracing::info!(%listen, "sflow collector starting");
-            blackwall_flow::run_collector(
+            let collector = blackwall_flow::run_collector(
                 listen,
                 Box::new(detector),
                 sink,
                 1000,
                 Some(collector_metrics),
-            )
-            .await?;
+            );
+            match xdp_shutdown {
+                // With XDP attached, race the collector against a shutdown signal
+                // so we can best-effort detach the data plane (drop the handle,
+                // which releases the eBPF link) instead of leaving it attached.
+                Some((handle, dataplane)) => {
+                    tokio::select! {
+                        r = collector => { r?; }
+                        () = wait_for_shutdown() => {
+                            tracing::info!("shutdown signal received; detaching XDP data plane (best-effort)");
+                            handle.abort();
+                            drop(dataplane);
+                        }
+                    }
+                }
+                None => collector.await?,
+            }
             Ok(())
         }
         Command::Apply {
@@ -1103,6 +1431,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Rtbh { action } => run_rtbh(action).await,
         Command::Flowspec { action } => run_flowspec(action).await,
+        Command::Xdp { action } => run_xdp(action).await,
         Command::Run {
             config,
             database_url,
@@ -1258,6 +1587,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     bgp: None,
                     collector: None,
                     inflight: Some(inflight.clone()),
+                    xdp: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1646,5 +1976,179 @@ async fn flowspec_list(requests: bool) -> Result<(), Box<dyn std::error::Error>>
             );
         }
     }
+    Ok(())
+}
+
+/// Dispatch one `xdp` subcommand.
+async fn run_xdp(action: XdpCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        XdpCmd::Block {
+            target,
+            config,
+            operator,
+        } => xdp_block(target, &config, operator).await,
+        XdpCmd::Unblock { target } => xdp_unblock(target).await,
+        XdpCmd::RateLimit {
+            ip,
+            pps,
+            burst,
+            config,
+            operator,
+        } => xdp_rate_limit(ip, pps, burst, &config, operator).await,
+        XdpCmd::List => xdp_list().await,
+        XdpCmd::Stats => xdp_stats().await,
+    }
+}
+
+/// Require an `xdp` block in `config`, returning the parsed policy so a CLI
+/// pre-check can consult `policy.prefixes` before touching the database.
+fn require_xdp(
+    config: &std::path::Path,
+) -> Result<blackwall_core::Policy, Box<dyn std::error::Error>> {
+    let policy = blackwall_config::parse_file(config)?;
+    if policy.xdp.is_none() {
+        return Err("config has no `xdp` block; XDP is not enabled".into());
+    }
+    Ok(policy)
+}
+
+/// `xdp block`: queue a `"block"` intent row for the network `target`. Warns
+/// (but still queues) if `target` overlaps an own prefix — the daemon rejects
+/// such a self-DoS when it drains the request.
+async fn xdp_block(
+    target: ipnet::IpNet,
+    config: &std::path::Path,
+    operator: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = require_xdp(config)?;
+    if policy
+        .prefixes
+        .iter()
+        .any(|p| p.contains(&target) || target.contains(p))
+    {
+        tracing::warn!(
+            %target,
+            "xdp block: target overlaps an own prefix — this is a self-inflicted \
+             denial of service; the daemon will reject it"
+        );
+    }
+
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue an xdp request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let created_by = operator.unwrap_or_else(default_operator);
+    let id = store
+        .xdp_enqueue_request(
+            "block",
+            target.addr(),
+            Some(target.prefix_len()),
+            None,
+            None,
+            &created_by,
+        )
+        .await?;
+    println!("queued (request {id}); the running daemon will program the map.");
+    Ok(())
+}
+
+/// `xdp unblock`: queue an `"unblock"` intent row for the network `target`.
+async fn xdp_unblock(target: ipnet::IpNet) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue an xdp request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let id = store
+        .xdp_enqueue_request(
+            "unblock",
+            target.addr(),
+            Some(target.prefix_len()),
+            None,
+            None,
+            &default_operator(),
+        )
+        .await?;
+    println!("queued (request {id}); the running daemon will remove the map entry.");
+    Ok(())
+}
+
+/// `xdp rate-limit`: queue a `"rate_limit"` intent row for source `ip`. `burst`
+/// defaults to `pps` when omitted.
+async fn xdp_rate_limit(
+    ip: IpAddr,
+    pps: u64,
+    burst: Option<u64>,
+    config: &std::path::Path,
+    operator: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_xdp(config)?;
+    if pps == 0 {
+        return Err("rate-limit pps must be >= 1".into());
+    }
+
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue an xdp request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let created_by = operator.unwrap_or_else(default_operator);
+    let id = store
+        .xdp_enqueue_request(
+            "rate_limit",
+            ip,
+            None,
+            Some(pps),
+            Some(burst.unwrap_or(pps)),
+            &created_by,
+        )
+        .await?;
+    println!("queued (request {id}); the running daemon will program the map.");
+    Ok(())
+}
+
+/// `xdp list`: print the active `xdp_entries` map mirror.
+async fn xdp_list() -> Result<(), Box<dyn std::error::Error>> {
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set to list xdp state")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+
+    println!(
+        "{:<12} {:<40} {:<10} {:<10} {:<8}",
+        "KIND", "TARGET", "PPS", "BURST", "ORIGIN"
+    );
+    for row in store.xdp_active().await? {
+        let target = match row.prefixlen {
+            Some(len) => format!("{}/{len}", row.target),
+            None => row.target.to_string(),
+        };
+        let pps = row
+            .rate_pps
+            .map_or_else(|| "-".to_owned(), |v| v.to_string());
+        let burst = row.burst.map_or_else(|| "-".to_owned(), |v| v.to_string());
+        println!(
+            "{:<12} {target:<40} {pps:<10} {burst:<10} {:<8}",
+            row.kind, row.origin
+        );
+    }
+    Ok(())
+}
+
+/// `xdp stats`: print active-entry counts from the DB mirror. Live per-CPU
+/// packet counters live in the running daemon's `/metrics` endpoint.
+async fn xdp_stats() -> Result<(), Box<dyn std::error::Error>> {
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set to read xdp stats")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+
+    let active = store.xdp_active().await?;
+    let blocks = active.iter().filter(|r| r.kind == "block").count();
+    let rate_limits = active.iter().filter(|r| r.kind == "rate_limit").count();
+    println!("blocked_entries    {blocks}");
+    println!("ratelimit_entries  {rate_limits}");
+    println!(
+        "(live per-CPU packet counters — dropped/passed — are exported by the \
+         running daemon's /metrics endpoint)"
+    );
     Ok(())
 }

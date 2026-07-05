@@ -387,6 +387,7 @@ dependencies = [
  "blackwall-shaper",
  "blackwall-speedtest",
  "blackwall-state",
+ "blackwall-xdp",
  "clap",
  "ipnet",
  "notify",
