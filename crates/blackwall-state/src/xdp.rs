@@ -16,22 +16,24 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 /// Raw column tuple decoded from an `xdp_entries` row:
-/// `(kind, target, prefixlen, rate_pps, origin)`.
+/// `(kind, target, prefixlen, rate_pps, burst, origin)`.
 type XdpEntryTuple = (
     String,
     sqlx::types::ipnetwork::IpNetwork,
     Option<i32>,
     Option<i64>,
+    Option<i64>,
     String,
 );
 
 /// Raw column tuple decoded from an `xdp_requests` row:
-/// `(id, action, target, prefixlen, rate_pps, created_by, status)`.
+/// `(id, action, target, prefixlen, rate_pps, burst, created_by, status)`.
 type XdpRequestTuple = (
     i64,
     String,
     sqlx::types::ipnetwork::IpNetwork,
     Option<i32>,
+    Option<i64>,
     Option<i64>,
     String,
     String,
@@ -50,6 +52,9 @@ pub struct XdpEntryRow {
     /// The rate-limit cap in packets/second. `Some` for `kind = "rate_limit"`,
     /// `None` for `"block"`.
     pub rate_pps: Option<u64>,
+    /// The rate-limit's burst allowance in packets. `Some` for
+    /// `kind = "rate_limit"`, `None` for `"block"`.
+    pub burst: Option<u64>,
     /// `"auto"` or `"manual"`.
     pub origin: String,
 }
@@ -68,6 +73,9 @@ pub struct XdpRequestRow {
     /// The requested rate-limit cap in packets/second, when `action` concerns
     /// a rate limit.
     pub rate_pps: Option<u64>,
+    /// The requested rate-limit's burst allowance in packets, when `action`
+    /// concerns a rate limit.
+    pub burst: Option<u64>,
     /// Attribution for the request (`$USER@host` or `--operator`).
     pub created_by: String,
     /// `"pending"`, `"applied"`, or `"rejected"`.
@@ -85,11 +93,16 @@ impl Store {
         target: IpAddr,
         prefixlen: Option<u8>,
         rate_pps: Option<u64>,
+        burst: Option<u64>,
         origin: &str,
     ) -> Result<(), StateError> {
         let target_net = ipnetwork_addr(target);
         let prefixlen_i32 = prefixlen.map(i32::from);
         let rate_pps_i64 = rate_pps
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
+        let burst_i64 = burst
             .map(i64::try_from)
             .transpose()
             .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
@@ -105,13 +118,14 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO xdp_entries (kind, target, prefixlen, rate_pps, origin) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO xdp_entries (kind, target, prefixlen, rate_pps, burst, origin) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(kind)
         .bind(target_net)
         .bind(prefixlen_i32)
         .bind(rate_pps_i64)
+        .bind(burst_i64)
         .bind(origin)
         .execute(&mut *tx)
         .await?;
@@ -144,13 +158,13 @@ impl Store {
     /// List all active `xdp_entries` rows.
     pub async fn xdp_active(&self) -> Result<Vec<XdpEntryRow>, StateError> {
         let rows: Vec<XdpEntryTuple> = sqlx::query_as(
-            "SELECT kind, target, prefixlen, rate_pps, origin FROM xdp_entries ORDER BY id",
+            "SELECT kind, target, prefixlen, rate_pps, burst, origin FROM xdp_entries ORDER BY id",
         )
         .fetch_all(self.pool())
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (kind, target, prefixlen, rate_pps, origin) in rows {
+        for (kind, target, prefixlen, rate_pps, burst, origin) in rows {
             let prefixlen = prefixlen
                 .map(u8::try_from)
                 .transpose()
@@ -159,11 +173,16 @@ impl Store {
                 .map(u64::try_from)
                 .transpose()
                 .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
+            let burst = burst
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
             out.push(XdpEntryRow {
                 kind,
                 target: target.ip(),
                 prefixlen,
                 rate_pps,
+                burst,
                 origin,
             });
         }
@@ -173,19 +192,23 @@ impl Store {
     /// Fetch all `xdp_requests` rows with `status = 'pending'`, ordered by id.
     pub async fn xdp_pending_requests(&self) -> Result<Vec<XdpRequestRow>, StateError> {
         let rows: Vec<XdpRequestTuple> = sqlx::query_as(
-            "SELECT id, action, target, prefixlen, rate_pps, created_by, status \
+            "SELECT id, action, target, prefixlen, rate_pps, burst, created_by, status \
              FROM xdp_requests WHERE status = 'pending' ORDER BY id",
         )
         .fetch_all(self.pool())
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, action, target, prefixlen, rate_pps, created_by, status) in rows {
+        for (id, action, target, prefixlen, rate_pps, burst, created_by, status) in rows {
             let prefixlen = prefixlen
                 .map(u8::try_from)
                 .transpose()
                 .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
             let rate_pps = rate_pps
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
+            let burst = burst
                 .map(u64::try_from)
                 .transpose()
                 .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
@@ -195,6 +218,7 @@ impl Store {
                 target: target.ip(),
                 prefixlen,
                 rate_pps,
+                burst,
                 created_by,
                 status,
             });
@@ -255,12 +279,12 @@ impl XdpJournal for PgXdpJournal {
         let result = match *action {
             XdpAction::Block { net } => {
                 self.store
-                    .xdp_record_apply("block", net.addr(), Some(net.prefix_len()), None, o)
+                    .xdp_record_apply("block", net.addr(), Some(net.prefix_len()), None, None, o)
                     .await
             }
-            XdpAction::RateLimit { src, pps, burst: _ } => {
+            XdpAction::RateLimit { src, pps, burst } => {
                 self.store
-                    .xdp_record_apply("rate_limit", src, None, Some(pps), o)
+                    .xdp_record_apply("rate_limit", src, None, Some(pps), Some(burst), o)
                     .await
             }
             XdpAction::Unblock { net } => {
@@ -297,12 +321,12 @@ mod tests {
 
         let net_addr: IpAddr = "198.51.100.0".parse().unwrap();
         store
-            .xdp_record_apply("block", net_addr, Some(24), None, "auto")
+            .xdp_record_apply("block", net_addr, Some(24), None, None, "auto")
             .await
             .unwrap();
         let src: IpAddr = "203.0.113.9".parse().unwrap();
         store
-            .xdp_record_apply("rate_limit", src, None, Some(1_000), "auto")
+            .xdp_record_apply("rate_limit", src, None, Some(1_000), Some(2_000), "auto")
             .await
             .unwrap();
 
@@ -313,6 +337,7 @@ mod tests {
             .expect("block row present");
         assert_eq!(block_row.prefixlen, Some(24));
         assert_eq!(block_row.rate_pps, None);
+        assert_eq!(block_row.burst, None);
         assert_eq!(block_row.origin, "auto");
 
         let rl_row = active
@@ -321,10 +346,12 @@ mod tests {
             .expect("rate_limit row present");
         assert_eq!(rl_row.prefixlen, None);
         assert_eq!(rl_row.rate_pps, Some(1_000));
+        assert_eq!(rl_row.burst, Some(2_000));
 
         // Re-applying replaces (not duplicates) the row for the same identity.
+        // A custom (non-default) burst independent of pps must round-trip too.
         store
-            .xdp_record_apply("rate_limit", src, None, Some(500), "manual")
+            .xdp_record_apply("rate_limit", src, None, Some(500), Some(1_000), "manual")
             .await
             .unwrap();
         let active = store.xdp_active().await.unwrap();
@@ -334,6 +361,7 @@ mod tests {
             .collect();
         assert_eq!(matches.len(), 1, "re-apply must replace, not duplicate");
         assert_eq!(matches[0].rate_pps, Some(500));
+        assert_eq!(matches[0].burst, Some(1_000));
         assert_eq!(matches[0].origin, "manual");
 
         store
@@ -370,8 +398,8 @@ mod tests {
 
         let target: IpAddr = "203.0.113.44".parse().unwrap();
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO xdp_requests (action, target, prefixlen, rate_pps, created_by) \
-             VALUES ('block', $1, 32, NULL, 'op@host') RETURNING id",
+            "INSERT INTO xdp_requests (action, target, prefixlen, rate_pps, burst, created_by) \
+             VALUES ('block', $1, 32, NULL, NULL, 'op@host') RETURNING id",
         )
         .bind(ipnetwork_addr(target))
         .fetch_one(store.pool())
@@ -381,6 +409,26 @@ mod tests {
 
         let pending = store.xdp_pending_requests().await.unwrap();
         assert!(pending.iter().any(|r| r.id == id && r.action == "block"));
+
+        // A rate-limit request with a custom (pps != burst) burst must
+        // round-trip through xdp_pending_requests unchanged.
+        let rl_src: IpAddr = "203.0.113.45".parse().unwrap();
+        let rl_row: (i64,) = sqlx::query_as(
+            "INSERT INTO xdp_requests (action, target, prefixlen, rate_pps, burst, created_by) \
+             VALUES ('rate_limit', $1, NULL, 500, 1000, 'op@host') RETURNING id",
+        )
+        .bind(ipnetwork_addr(rl_src))
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let pending = store.xdp_pending_requests().await.unwrap();
+        let rl_pending = pending
+            .iter()
+            .find(|r| r.id == rl_row.0)
+            .expect("rate_limit request present");
+        assert_eq!(rl_pending.rate_pps, Some(500));
+        assert_eq!(rl_pending.burst, Some(1_000));
+        store.xdp_mark_request(rl_row.0, "applied").await.unwrap();
 
         store.xdp_mark_request(id, "applied").await.unwrap();
         assert!(

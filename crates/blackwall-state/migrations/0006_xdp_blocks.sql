@@ -4,6 +4,7 @@ CREATE TABLE xdp_entries (
     target INET NOT NULL,
     prefixlen INT,
     rate_pps BIGINT,
+    burst BIGINT,
     origin TEXT NOT NULL CHECK (origin IN ('auto','manual')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -14,6 +15,7 @@ CREATE TABLE xdp_requests (
     target INET NOT NULL,
     prefixlen INT,
     rate_pps BIGINT,
+    burst BIGINT,
     created_by TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','applied','rejected')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
