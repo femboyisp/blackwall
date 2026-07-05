@@ -171,4 +171,12 @@ impl SpeedtestProvider for LibreSpeedProvider {
             latency_ms,
         })
     }
+
+    /// Idle RTT: time the `empty.php` ping with no download running.
+    async fn measure_latency(&self, _cfg: &SpeedtestConfig) -> Option<f64> {
+        let ping = ping_url(&self.server);
+        let start = Instant::now();
+        self.client.get(&ping).send().await.ok()?;
+        Some(start.elapsed().as_secs_f64() * 1000.0)
+    }
 }

@@ -210,4 +210,13 @@ impl SpeedtestProvider for FastProvider {
             latency_ms,
         })
     }
+
+    /// Idle RTT proxy: TTFB of a request to fast.com, with no download running.
+    /// (fast.com's own latency figure is the API-query RTT; the landing-page
+    /// round-trip is a cheap unloaded stand-in for the idle phase.)
+    async fn measure_latency(&self, _cfg: &SpeedtestConfig) -> Option<f64> {
+        let start = Instant::now();
+        self.client.get("https://fast.com/").send().await.ok()?;
+        Some(start.elapsed().as_secs_f64() * 1000.0)
+    }
 }
