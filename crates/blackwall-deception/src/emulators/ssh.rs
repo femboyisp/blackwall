@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_banner_and_captures_client_version() {
+    async fn sends_banner_then_kexinit_on_the_wire_and_captures_client_version() {
         let emu = SshEmulator::new("SSH-2.0-OpenSSH_9.6");
         let (client, server) = tokio::io::duplex(2048);
         let meta = DeceptionMeta {
@@ -141,13 +141,19 @@ mod tests {
             peer: "198.51.100.9:40000".parse().unwrap(),
             proto: L4Proto::Tcp,
         };
+        let expected_kex = SshEmulator::kexinit_packet();
+        let kex_len = expected_kex.len();
         let mut client = client;
         let driver = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // 1. Version banner.
             let mut head = [0u8; 21]; // "SSH-2.0-OpenSSH_9.6\r\n"
             client.read_exact(&mut head).await.unwrap();
+            // 2. The binary KEXINIT that a real SSH server sends right after.
+            let mut kex = vec![0u8; kex_len];
+            client.read_exact(&mut kex).await.unwrap();
             client.write_all(b"SSH-2.0-libssh_0.10\r\n").await.unwrap();
-            head
+            (head, kex)
         });
         let outcome = emu
             .handle(DeceptionConn {
@@ -156,8 +162,15 @@ mod tests {
             })
             .await
             .expect("handled");
-        let head = driver.await.unwrap();
+        let (head, kex) = driver.await.unwrap();
         assert!(head.starts_with(b"SSH-2.0-OpenSSH_9.6"));
+        // Assert the KEXINIT is really on the wire and well-formed (not just
+        // that the builder can produce one): the packet_length field matches the
+        // trailing bytes and the first payload byte is SSH_MSG_KEXINIT (20).
+        assert_eq!(kex, expected_kex, "server must send its KEXINIT verbatim");
+        let plen = u32::from_be_bytes([kex[0], kex[1], kex[2], kex[3]]);
+        assert_eq!(usize::try_from(plen).unwrap(), kex.len() - 4);
+        assert_eq!(kex[5], 20u8, "first payload byte is SSH_MSG_KEXINIT");
         assert_eq!(outcome.note.as_deref(), Some("SSH-2.0-libssh_0.10"));
     }
 }
