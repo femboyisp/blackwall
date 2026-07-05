@@ -24,7 +24,7 @@ const COMMON_SRC: &str = "../blackwall-xdp-common/src";
 const COMMON_MANIFEST: &str = "../blackwall-xdp-common/Cargo.toml";
 const BIN_NAME: &str = "blackwall-xdp";
 const BPF_TARGET: &str = "bpfel-unknown-none";
-const TOOLCHAIN: &str = "nightly";
+const TOOLCHAIN: &str = "nightly-2026-06-29";
 
 fn main() {
     println!("cargo:rerun-if-changed={EBPF_SRC}");
