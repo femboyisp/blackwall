@@ -1,5 +1,12 @@
 //! Userspace control plane for the Blackwall XDP data plane.
+pub mod control;
 pub mod keys;
+pub mod manager;
+
+pub use control::{XdpAction, XdpController, XdpOrigin};
+pub use manager::{
+    ApplyOutcome, XdpExecError, XdpExecutor, XdpJournal, XdpJournalError, XdpManager,
+};
 
 /// The compiled `bpfel-unknown-none` object for the `xdp_filter` program,
 /// embedded at build time from the `blackwall-xdp-ebpf` crate.
