@@ -1676,6 +1676,7 @@ mod tests {
             rtbh: None,
             flowspec: None,
             metrics_listen: None,
+            engine: blackwall_core::EngineConfig::default(),
         }
     }
 }

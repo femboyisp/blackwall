@@ -129,6 +129,7 @@ mod tests {
             rtbh: None,
             flowspec: None,
             metrics_listen: None,
+            engine: crate::EngineConfig::default(),
         }
     }
 
@@ -266,6 +267,7 @@ mod tests {
             rtbh: None,
             flowspec: None,
             metrics_listen: None,
+            engine: crate::EngineConfig::default(),
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
