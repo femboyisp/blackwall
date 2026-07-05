@@ -65,6 +65,11 @@ pub struct PeerConfig {
     /// installs the key via `setsockopt(TCP_MD5SIG)` before connecting, so the
     /// TCP connection itself is authenticated. `None` connects in the clear.
     pub md5: Option<String>,
+    /// Optional GTSM (RFC 5082) TTL-security hop count. When `Some(n)`, the
+    /// session sends with IP TTL 255 and rejects received packets whose TTL is
+    /// below `256 - n` (so `1` = a directly-connected peer must arrive with TTL
+    /// 255). Cheaply defeats off-link spoofed BGP packets. `None` disables it.
+    pub gtsm_hops: Option<u8>,
 }
 
 /// A `PeerConfig` that cannot form a valid iBGP session.
@@ -81,6 +86,9 @@ pub enum PeerConfigError {
     /// RFC 4271: a non-zero hold time below 3 seconds is unacceptable.
     #[error("hold time {0} is invalid (must be 0 or >= 3)")]
     BadHoldTime(u16),
+    /// GTSM (RFC 5082) requires a hop count of at least 1.
+    #[error("gtsm hops must be >= 1")]
+    BadGtsmHops,
 }
 
 /// A route command could not be delivered to the session task.
@@ -104,6 +112,9 @@ impl PeerConfig {
         }
         if self.hold_time == 1 || self.hold_time == 2 {
             return Err(PeerConfigError::BadHoldTime(self.hold_time));
+        }
+        if self.gtsm_hops == Some(0) {
+            return Err(PeerConfigError::BadGtsmHops);
         }
         Ok(())
     }
@@ -377,7 +388,7 @@ async fn session_once(
     consecutive_failures: &mut u32,
 ) -> SessionOutcome {
     // ── 1. TCP connect ──────────────────────────────────────────────────────
-    let mut stream = match connect_peer(cfg.peer_addr, cfg.md5.as_deref()).await {
+    let mut stream = match connect_peer(cfg.peer_addr, cfg.md5.as_deref(), cfg.gtsm_hops).await {
         Ok(s) => {
             info!(peer = %cfg.peer_addr, "TCP connected");
             s
@@ -911,12 +922,23 @@ struct TcpMd5Sig {
 ///
 /// Returns any TCP connect error, or an error from installing the MD5 key (e.g.
 /// a key longer than [`libc::TCP_MD5SIG_MAXKEYLEN`] bytes).
-async fn connect_peer(addr: SocketAddr, md5: Option<&str>) -> io::Result<TcpStream> {
-    let Some(key) = md5 else {
+async fn connect_peer(
+    addr: SocketAddr,
+    md5: Option<&str>,
+    gtsm_hops: Option<u8>,
+) -> io::Result<TcpStream> {
+    // The plain path is only valid with neither socket option set; otherwise
+    // build the socket ourselves so we can apply them before connect.
+    if md5.is_none() && gtsm_hops.is_none() {
         return TcpStream::connect(addr).await;
-    };
+    }
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-    set_tcp_md5sig(&sock, addr, key)?;
+    if let Some(key) = md5 {
+        set_tcp_md5sig(&sock, addr, key)?;
+    }
+    if let Some(hops) = gtsm_hops {
+        set_gtsm(&sock, addr, hops)?;
+    }
     sock.set_nonblocking(true)?;
     // A nonblocking connect returns EINPROGRESS; hand the fd to tokio, which
     // drives the connect to completion.
@@ -992,6 +1014,67 @@ fn set_tcp_md5sig(sock: &Socket, addr: SocketAddr, key: &str) -> io::Result<()> 
     Ok(())
 }
 
+/// Install GTSM (RFC 5082) TTL-security on `sock` for a peer `hops` away.
+///
+/// Sends with the maximum IP TTL (255) and refuses received packets whose TTL
+/// dropped below `256 - hops` — so a directly-connected peer (`hops == 1`) must
+/// arrive with TTL 255, which an off-link attacker cannot forge. Sets the IPv4
+/// (`IP_TTL`/`IP_MINTTL`) or IPv6 (`IPV6_UNICAST_HOPS`/`IPV6_MINHOPCOUNT`)
+/// options according to the peer's address family.
+///
+/// # Errors
+///
+/// Returns the last OS error if any `setsockopt` fails. `hops` must be ≥ 1
+/// (validated by [`PeerConfig::validate`]); the minimum TTL is clamped to 1.
+fn set_gtsm(sock: &Socket, addr: SocketAddr, hops: u8) -> io::Result<()> {
+    // Directly-connected peer (hops == 1) → min TTL 255; each extra hop lowers
+    // the floor by one. Clamp to 1 so a pathological hop count stays valid.
+    let min_ttl: libc::c_int = (256 - i32::from(hops)).max(1);
+    let max_ttl: libc::c_int = 255;
+
+    let (level, ttl_opt, min_opt) = if addr.is_ipv4() {
+        (libc::IPPROTO_IP, libc::IP_TTL, libc::IP_MINTTL)
+    } else {
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_UNICAST_HOPS,
+            libc::IPV6_MINHOPCOUNT,
+        )
+    };
+    set_sockopt_int(sock, level, ttl_opt, max_ttl)?;
+    set_sockopt_int(sock, level, min_opt, min_ttl)?;
+    Ok(())
+}
+
+/// `setsockopt` for a single `c_int`-valued option.
+///
+/// # Errors
+///
+/// Returns the last OS error if `setsockopt` fails.
+fn set_sockopt_int(
+    sock: &Socket,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> io::Result<()> {
+    let optlen = u32::try_from(std::mem::size_of::<libc::c_int>()).unwrap_or(0);
+    // SAFETY: `setsockopt` reads `optlen` bytes from `&value`, which points to a
+    // live `c_int` of exactly that size; `sock` owns a valid fd for the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            name,
+            std::ptr::addr_of!(value).cast(),
+            optlen,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1087,7 @@ mod tests {
             router_id: "10.0.0.1".parse().unwrap(),
             hold_time: hold,
             md5: None,
+            gtsm_hops: None,
         }
     }
 
@@ -1040,5 +1124,80 @@ mod tests {
             cfg(65001, 65001, 2).validate(),
             Err(PeerConfigError::BadHoldTime(2))
         ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_gtsm_hops() {
+        let mut c = cfg(65001, 65001, 90);
+        c.gtsm_hops = Some(0);
+        assert!(matches!(c.validate(), Err(PeerConfigError::BadGtsmHops)));
+    }
+
+    #[test]
+    fn validate_accepts_gtsm_hops() {
+        let mut c = cfg(65001, 65001, 90);
+        c.gtsm_hops = Some(1);
+        assert!(c.validate().is_ok());
+    }
+
+    /// Read back a `c_int` socket option to confirm `set_gtsm` actually applied.
+    fn getsockopt_int(sock: &Socket, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut val: libc::c_int = 0;
+        let mut len = u32::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+        // SAFETY: `getsockopt` writes up to `len` bytes into `&val`, a live
+        // `c_int`; `sock` owns a valid fd for the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                level,
+                name,
+                std::ptr::addr_of_mut!(val).cast(),
+                std::ptr::addr_of_mut!(len),
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed");
+        val
+    }
+
+    #[test]
+    fn set_gtsm_sets_ipv4_ttl_and_minttl() {
+        let addr: SocketAddr = "10.0.0.2:179".parse().unwrap();
+        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+            .expect("socket");
+        set_gtsm(&sock, addr, 1).expect("set_gtsm v4");
+        assert_eq!(getsockopt_int(&sock, libc::IPPROTO_IP, libc::IP_TTL), 255);
+        assert_eq!(
+            getsockopt_int(&sock, libc::IPPROTO_IP, libc::IP_MINTTL),
+            255
+        );
+    }
+
+    #[test]
+    fn set_gtsm_multihop_lowers_min_ttl() {
+        let addr: SocketAddr = "10.0.0.2:179".parse().unwrap();
+        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+            .expect("socket");
+        // 3 hops → min accepted TTL 256 - 3 = 253.
+        set_gtsm(&sock, addr, 3).expect("set_gtsm v4");
+        assert_eq!(
+            getsockopt_int(&sock, libc::IPPROTO_IP, libc::IP_MINTTL),
+            253
+        );
+    }
+
+    #[test]
+    fn set_gtsm_sets_ipv6_hops_and_minhops() {
+        let addr: SocketAddr = "[2001:db8::2]:179".parse().unwrap();
+        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+            .expect("socket");
+        set_gtsm(&sock, addr, 1).expect("set_gtsm v6");
+        assert_eq!(
+            getsockopt_int(&sock, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS),
+            255
+        );
+        assert_eq!(
+            getsockopt_int(&sock, libc::IPPROTO_IPV6, libc::IPV6_MINHOPCOUNT),
+            255
+        );
     }
 }

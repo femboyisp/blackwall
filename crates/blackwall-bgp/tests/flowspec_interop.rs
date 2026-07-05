@@ -29,6 +29,7 @@ async fn flowspec_rule_reaches_bird() {
         router_id: "10.222.255.99".parse().unwrap(),
         hold_time: 90,
         md5: None,
+        gtsm_hops: None,
     })
     .expect("valid iBGP config");
     tokio::time::sleep(Duration::from_secs(3)).await; // let the session establish

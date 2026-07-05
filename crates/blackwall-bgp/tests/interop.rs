@@ -24,6 +24,7 @@ async fn announces_a_host_route() {
         // Optional TCP-MD5: the bgp-bird-md5 gate sets BW_BGP_MD5 so the
         // authenticated session must be accepted by BIRD's `password` clause.
         md5: std::env::var("BW_BGP_MD5").ok().filter(|s| !s.is_empty()),
+        gtsm_hops: None,
     };
     let (handle, _join) = blackwall_bgp::spawn(cfg).expect("valid iBGP config");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await; // let it establish
