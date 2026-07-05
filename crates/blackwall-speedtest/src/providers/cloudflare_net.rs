@@ -196,4 +196,12 @@ impl SpeedtestProvider for CloudflareProvider {
             latency_ms,
         })
     }
+
+    /// Idle RTT: TTFB of a 1-byte `__down` request, with no download running.
+    async fn measure_latency(&self, _cfg: &SpeedtestConfig) -> Option<f64> {
+        let probe_url = download_url(1);
+        let start = Instant::now();
+        self.client.get(&probe_url).send().await.ok()?;
+        Some(start.elapsed().as_secs_f64() * 1000.0)
+    }
 }

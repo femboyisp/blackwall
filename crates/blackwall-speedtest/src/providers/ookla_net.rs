@@ -272,6 +272,25 @@ impl SpeedtestProvider for OoklaProvider {
             latency_ms,
         })
     }
+
+    /// Idle RTT: the `HI`→`HELLO` handshake round-trip, with no download running.
+    async fn measure_latency(&self, _cfg: &SpeedtestConfig) -> Option<f64> {
+        let json = self
+            .client
+            .get(SERVER_LIST_URL)
+            .send()
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        let server = parse_servers(&json).ok()?.into_iter().next()?;
+        let mut stream = connect_bound(&server.host, &self.source).await.ok()?;
+        let start = Instant::now();
+        stream.write_all(b"HI\n").await.ok()?;
+        let _hello = read_line(&mut stream).await.ok()?;
+        Some(start.elapsed().as_secs_f64() * 1000.0)
+    }
 }
 
 /// Read bytes from `stream` until a `\n` is encountered, returning the line
