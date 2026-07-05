@@ -7,6 +7,11 @@ use std::time::Duration;
 
 /// The first `count` host addresses of `prefix`. Errors if the prefix yields
 /// fewer than `count` hosts (the operator asked for more than it provides).
+///
+/// "Hosts" follows [`IpNet::hosts`]: for IPv4 the network and broadcast
+/// addresses are excluded (and `/31`, `/32` collapse to their address(es)), and
+/// IPv6 excludes the anycast/subnet-router address on prefixes shorter than
+/// `/127`. `count` must therefore fit the *usable* host count, not `2^hostbits`.
 pub fn flux_pool(prefix: &IpNet, count: usize) -> Result<Vec<IpAddr>, DnsError> {
     let pool: Vec<IpAddr> = prefix.hosts().take(count).collect();
     if pool.len() < count {
@@ -21,6 +26,11 @@ pub fn flux_pool(prefix: &IpNet, count: usize) -> Result<Vec<IpAddr>, DnsError> 
 /// The `set` addresses active at `now_unix`: a sliding window
 /// `pool[(bucket + i) % len]` for `i in 0..set`, `bucket = now / period`.
 /// Stable within a period, slides by one each period, restart-stable.
+///
+/// The `unwrap_or` fallbacks are defensive and unreachable in practice: `len`
+/// is non-zero (the empty pool returned above), `period_secs` is floored to 1,
+/// and both `u64::try_from(i)`/`usize::try_from(offset % len)` fit their targets
+/// on any supported platform. They keep the function total rather than panicking.
 pub fn flux_window(pool: &[IpAddr], set: usize, now_unix: u64, period_secs: u64) -> Vec<IpAddr> {
     if pool.is_empty() || set == 0 {
         return Vec::new();
