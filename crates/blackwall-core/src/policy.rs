@@ -51,4 +51,7 @@ pub struct Policy {
     pub flowspec: Option<crate::FlowSpecPolicy>,
     /// Address the Prometheus metrics endpoint listens on (`metrics listen=`); `None` disables it.
     pub metrics_listen: Option<std::net::SocketAddr>,
+    /// Deception-engine wiring (concurrency, timeout, TPROXY port, NFQUEUE number).
+    /// Defaults if no `engine` directive is present.
+    pub engine: crate::EngineConfig,
 }

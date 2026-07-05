@@ -75,6 +75,10 @@ rtbh peer=10.0.0.2:179 local-as=214806 peer-as=214806 router-id=10.222.255.1 \
 
 # Optional Prometheus metrics endpoint (bind to localhost or a trusted mgmt net — no auth/TLS).
 metrics listen=127.0.0.1:9100
+
+# Optional deception-engine tuning (all keys optional; shown with their defaults).
+# tproxy-port / nfqueue are a single source of truth — the nft rules follow them.
+engine max-concurrent=1024 session-timeout=60 tproxy-port=61000 nfqueue=0
 ```
 
 With a `metrics` block, `blackwalld flow` serves `GET /metrics` (Prometheus text) exposing BGP

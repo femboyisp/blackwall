@@ -28,6 +28,7 @@ fn sample() -> Policy {
         rtbh: None,
         flowspec: None,
         metrics_listen: None,
+        engine: blackwall_core::EngineConfig::default(),
     }
 }
 
@@ -79,6 +80,7 @@ fn stale_set_elements_removed_on_second_apply() {
         rtbh: None,
         flowspec: None,
         metrics_listen: None,
+        engine: blackwall_core::EngineConfig::default(),
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 
