@@ -8,12 +8,14 @@ mod rtbh;
 mod services;
 mod sessions;
 mod tenants;
+mod xdp;
 
 pub use error::StateError;
 pub use flowspec::{FlowSpecRequestRow, FlowSpecRuleRow};
 pub use rtbh::{RtbhBlackholeRow, RtbhRequestRow};
 pub use services::StoredService;
 pub use sessions::SessionRow;
+pub use xdp::{PgXdpJournal, XdpEntryRow, XdpRequestRow};
 
 use blackwall_core::{L4Proto, Policy, ServiceTarget};
 use blackwall_flow::{Detection, DetectionEvent, MitigationSink, Severity};

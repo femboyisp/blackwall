@@ -326,6 +326,7 @@ dependencies = [
  "blackwall-core",
  "blackwall-flow",
  "blackwall-rtbh",
+ "blackwall-xdp",
  "ipnet",
  "serde_json",
  "sqlx",

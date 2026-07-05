@@ -10,6 +10,7 @@ blackwall-bgp = { path = "../blackwall-bgp" }
 blackwall-core = { path = "../blackwall-core" }
 blackwall-flow = { path = "../blackwall-flow" }
 blackwall-rtbh = { path = "../blackwall-rtbh" }
+blackwall-xdp = { path = "../blackwall-xdp" }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
