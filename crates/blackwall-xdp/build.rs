@@ -38,6 +38,30 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let ebpf_target_dir = out_dir.join(EBPF_PACKAGE);
 
+    // Under coverage instrumentation (`cargo llvm-cov`), `-C instrument-coverage`
+    // propagates into the nested `-Z build-std` compile of the `bpfel-unknown-none`
+    // eBPF crate, which then fails: the bpf target has no `profiler_builtins`.
+    // The eBPF object is never *executed* under llvm-cov — the only code that
+    // loads it (`dataplane.rs`) is coverage-excluded, and the root
+    // `BPF_PROG_TEST_RUN` test is `#[ignore]` — so we skip the real eBPF build and
+    // stage an empty placeholder purely so `include_bytes_aligned!` resolves.
+    let rustflags_instrumented = ["CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"].iter().any(|k| {
+        env::var(k)
+            .map(|v| v.contains("instrument-coverage"))
+            .unwrap_or(false)
+    });
+    // `cargo llvm-cov` builds under `target/llvm-cov-target/...` and sets
+    // `LLVM_PROFILE_FILE`; either is a reliable signal even when the coverage
+    // rustflag reaches the child by a path we don't see here.
+    let instrumented = rustflags_instrumented
+        || env::var_os("LLVM_PROFILE_FILE").is_some()
+        || out_dir.to_string_lossy().contains("llvm-cov-target");
+    if instrumented {
+        fs::write(out_dir.join(BIN_NAME), [])
+            .expect("stage placeholder eBPF object under coverage");
+        return;
+    }
+
     let bpf_target_arch =
         env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is set by cargo");
 
