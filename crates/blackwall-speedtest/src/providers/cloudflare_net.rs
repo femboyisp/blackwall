@@ -146,6 +146,7 @@ impl SpeedtestProvider for CloudflareProvider {
                     .and_then(server_timing_latency);
                 first = false;
             }
+            let before = total;
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
@@ -156,6 +157,12 @@ impl SpeedtestProvider for CloudflareProvider {
                 if start.elapsed() >= cfg.measure_window {
                     break;
                 }
+            }
+            // No-progress guard: if a full request delivered no new bytes (a
+            // server returning instant empty 200s), stop instead of hot-spinning
+            // re-issuing requests until the window expires.
+            if total == before {
+                break;
             }
         }
         let elapsed = start.elapsed();
