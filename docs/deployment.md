@@ -19,7 +19,9 @@ to Postgres; the running `flow` daemon is the sole applier.
   / `flowspec_rules` row, so stale rows would immediately act on real IPs.
 - For deception: `net.ipv4.ip_forward=1` (and v6) and the managed prefix routed
   *through* the box.
-- For BGP: a local/trusted iBGP peer, or set `md5=` (TCP-MD5) on the `rtbh` block.
+- For BGP: a local/trusted iBGP peer. Harden the session with `md5=` (TCP-MD5)
+  and/or `gtsm-hops=` (RFC 5082 TTL-security; `1` for a directly-connected peer)
+  on the `rtbh` block.
 
 ## Install
 ```bash
@@ -88,4 +90,3 @@ Also: Postgres tables (`detections`, `rtbh_blackholes`, `flowspec_rules`, the
   path, but there is no XDP/AF_XDP kernel-bypass offload yet (sub-project B).
   Fine for moderate rates, not for line-rate volumetric attack traffic *on the
   box* (BGP mitigation pushes that to your router instead).
-- No GTSM/TTL-security on BGP (TCP-MD5 only).

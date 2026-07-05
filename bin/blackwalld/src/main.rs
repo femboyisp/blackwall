@@ -907,6 +907,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         router_id: rtbh.router_id,
                         hold_time: 90,
                         md5: rtbh.md5.as_ref().map(|s| s.reveal().to_owned()),
+                        gtsm_hops: rtbh.gtsm_hops,
                     };
                     // `BgpHandle` is a cloneable mpsc sender; both the RTBH and
                     // (optionally) FlowSpec managers share the one iBGP session.

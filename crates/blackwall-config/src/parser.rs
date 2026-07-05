@@ -208,6 +208,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             | "ttl"
                             | "community"
                             | "md5"
+                            | "gtsm-hops"
                     ) {
                         return Err(ConfigError::BadValue {
                             line: line.number,
@@ -291,6 +292,16 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     }
                     None => vec![(65535, 666)],
                 };
+                let gtsm_hops: Option<u8> = match kv.get("gtsm-hops") {
+                    Some(v) => {
+                        let hops: u8 = v.parse().map_err(|_| bad("rtbh gtsm-hops", v))?;
+                        if hops == 0 {
+                            return Err(bad("rtbh gtsm-hops", "must be >= 1"));
+                        }
+                        Some(hops)
+                    }
+                    None => None,
+                };
                 rtbh = Some(RtbhPolicy {
                     local_asn,
                     peer_asn,
@@ -305,6 +316,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     md5: kv
                         .get("md5")
                         .map(|s| blackwall_core::Md5Secret::new((*s).to_owned())),
+                    gtsm_hops,
                 });
             }
             "flowspec" => {
@@ -1170,6 +1182,34 @@ tenant t {
         assert_eq!(r.hold_down, std::time::Duration::from_secs(60));
         assert_eq!(r.max_ttl, Some(std::time::Duration::from_secs(7200)));
         assert_eq!(r.blackhole_communities, vec![(65535, 666)]); // default
+        assert_eq!(r.gtsm_hops, None); // absent by default
+    }
+
+    #[test]
+    fn parses_rtbh_gtsm_hops() {
+        let p = parse_text(
+            "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s gtsm-hops=1\n",
+        )
+        .unwrap();
+        assert_eq!(p.rtbh.unwrap().gtsm_hops, Some(1));
+    }
+
+    #[test]
+    fn rejects_rtbh_zero_gtsm_hops() {
+        let err = parse_text(
+            "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s gtsm-hops=0\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "rtbh gtsm-hops",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
