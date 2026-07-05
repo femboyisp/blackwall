@@ -34,9 +34,28 @@ sudo install -m0644 your-banners.txt    /etc/blackwall/banners.txt   # deception
 printf 'DATABASE_URL=postgres://bw_daemon:...@db/blackwall\n' | sudo tee /etc/blackwall/deception.env >/dev/null
 sudo cp /etc/blackwall/deception.env /etc/blackwall/flow.env
 sudo chmod 600 /etc/blackwall/*.env
+```
+
+Then install the service units for your init system.
+
+**systemd:**
+```bash
 sudo cp deploy/blackwalld-*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
+
+**runit** (Void, Artix, …):
+```bash
+sudo cp -r deploy/runit/blackwalld-deception deploy/runit/blackwalld-flow /etc/sv/
+# activate by symlinking into the supervision dir (/var/service on Void, /etc/service elsewhere)
+sudo ln -s /etc/sv/blackwalld-flow       /var/service/
+sudo ln -s /etc/sv/blackwalld-deception  /var/service/
+# `sv stop <svc>` sends SIGTERM = graceful shutdown; `sv status <svc>` to check.
+```
+The `run` scripts load DB creds from the same `/etc/blackwall/*.env` files, run
+as root (the daemons need `CAP_NET_ADMIN`/`CAP_NET_RAW`), and log via `svlogd`
+under `/var/log/blackwalld-*`. The deception service ships a `finish` backstop
+that clears the nft table + policy route if the process is ever SIGKILLed.
 
 ## Dress-rehearse first (do not skip)
 Both data paths have dress rehearsals that run the real daemon against real
@@ -48,10 +67,14 @@ sudo -E scripts/smoke-deception.sh   # routed deception → honeypot
 ```
 
 ## Enable (staged)
-Bring the services up **deliberately**, watching `/metrics` and Postgres:
+Bring the services up **deliberately**, watching `/metrics` and Postgres. Start
+`flow` in detection-only mode (no rtbh/flowspec blocks in the config) first:
 ```bash
-sudo systemctl enable --now blackwalld-flow        # start in detection-only mode (no rtbh/flowspec blocks)
+# systemd
+sudo systemctl enable --now blackwalld-flow
 sudo systemctl enable --now blackwalld-deception
+# runit — the symlink from the install step already starts it; to hold one down
+# until you're ready, `touch /etc/sv/<svc>/down` before symlinking, then `sv up <svc>`.
 ```
 Then follow the two runbooks for the hands-on first-run procedure:
 - `docs/runbook-flow-mitigation.md` — observe-only → tune → arm auto-mitigation.
@@ -67,14 +90,15 @@ Also: Postgres tables (`detections`, `rtbh_blackholes`, `flowspec_rules`, the
 `*_requests` intent logs) and `birdc`/your router.
 
 ## Stop / emergency
-- `systemctl stop blackwalld-deception` — graceful: removes the nft ruleset +
-  policy route, exits 0 (traffic stops being diverted). **Do not SIGKILL** — that
-  leaves the box black-holing deception traffic; if you must, clean up with
-  `nft delete table inet blackwall`, `ip rule del fwmark 0x1 lookup 100`,
-  `ip route flush table 100`.
-- `systemctl stop blackwalld-flow` — the BGP session drops, so your router
-  withdraws all Blackwall-announced routes: all mitigations clear. This is the
-  BGP kill switch.
+- `systemctl stop blackwalld-deception` (or `sv stop blackwalld-deception`) —
+  graceful: removes the nft ruleset + policy route, exits 0 (traffic stops being
+  diverted). **Do not SIGKILL** — that leaves the box black-holing deception
+  traffic; if you must, clean up with `nft delete table inet blackwall`,
+  `ip rule del fwmark 0x1 lookup 100`, `ip route flush table 100`. (The runit
+  service's `finish` script runs exactly this cleanup as a backstop.)
+- `systemctl stop blackwalld-flow` (or `sv stop blackwalld-flow`) — the BGP
+  session drops, so your router withdraws all Blackwall-announced routes: all
+  mitigations clear. This is the BGP kill switch.
 
 ## Security
 - Postgres is the authorization boundary — anyone who can write `rtbh_requests`

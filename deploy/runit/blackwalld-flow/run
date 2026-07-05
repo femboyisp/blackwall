@@ -1,0 +1,32 @@
+#!/bin/sh
+# runit service: Blackwall flow detector + BGP mitigation (blackwalld flow).
+#
+# Install:
+#   cp target/release/blackwalld /usr/local/bin/
+#   install -d /etc/blackwall
+#   cp your-blackwall.conf /etc/blackwall/blackwall.conf
+#   printf 'DATABASE_URL=postgres://bw_daemon:...@db/blackwall\n' \
+#       > /etc/blackwall/flow.env && chmod 600 /etc/blackwall/flow.env
+#   cp -r deploy/runit/blackwalld-flow /etc/sv/
+#   ln -s /etc/sv/blackwalld-flow /var/service/          # or /etc/service on some distros
+#
+# Active mitigations are persisted to Postgres and re-announced on restart, so a
+# restart never drops protection. `sv stop` (SIGTERM) drops the BGP session, so
+# the router withdraws all Blackwall-announced routes — the BGP kill switch.
+exec 2>&1
+
+# Load DB creds (KEY=VALUE). Keep flow.env 0600, owned by root.
+set -a
+[ -r /etc/blackwall/flow.env ] && . /etc/blackwall/flow.env
+set +a
+
+# Tune --pps-threshold / --bps-threshold to the net's real baseline. Start in
+# detection-only mode by omitting the rtbh/flowspec blocks from the config until
+# you trust the thresholds (see docs/runbook-flow-mitigation.md).
+# CAP_NET_ADMIN is needed for the optional TCP-MD5 setsockopt on the BGP session;
+# this runs as root (for least-privilege, wrap with setpriv --ambient-caps).
+exec /usr/local/bin/blackwalld flow \
+    --config /etc/blackwall/blackwall.conf \
+    --listen 0.0.0.0:6343 \
+    --pps-threshold 500000 \
+    --bps-threshold 5000000000

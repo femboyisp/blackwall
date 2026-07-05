@@ -1,0 +1,11 @@
+#!/bin/sh
+# Best-effort dataplane cleanup backstop. blackwalld normally tears the ruleset
+# down itself on SIGTERM; this only matters if it was SIGKILLed (or crashed)
+# and left the nft table + TPROXY policy route behind, which would black-hole
+# deception traffic to a dead engine. All commands are best-effort.
+nft delete table inet blackwall 2>/dev/null
+for fam in "" "-6"; do
+    ip $fam rule del fwmark 0x1 lookup 100 2>/dev/null
+    ip $fam route flush table 100 2>/dev/null
+done
+exit 0
