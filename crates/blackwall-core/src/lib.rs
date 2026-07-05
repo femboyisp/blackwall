@@ -3,6 +3,7 @@
 mod dns;
 mod engine;
 mod flowspec;
+mod flowtable;
 mod flux;
 mod md5secret;
 mod policy;
@@ -19,6 +20,7 @@ pub use engine::{
     DEFAULT_TPROXY_PORT,
 };
 pub use flowspec::FlowSpecPolicy;
+pub use flowtable::FlowTableConfig;
 pub use flux::BannerFluxConfig;
 pub use md5secret::Md5Secret;
 pub use policy::{AllowRule, Policy, Tenant};

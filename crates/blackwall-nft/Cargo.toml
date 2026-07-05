@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+blackwall-config = { path = "../blackwall-config" }
 
 [lints]
 workspace = true

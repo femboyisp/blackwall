@@ -117,6 +117,7 @@ mod tests {
             flowspec: None,
             metrics_listen: None,
             engine: blackwall_core::EngineConfig::default(),
+            flowtable: None,
         }
     }
 
