@@ -83,8 +83,9 @@ Also: Postgres tables (`detections`, `rtbh_blackholes`, `flowspec_rules`, the
   refuses to start if it doesn't exist).
 
 ## Not yet implemented (know before you rely on it)
-- **No flowtable / XDP fast path.** Traffic is handled on the nft slow path;
-  there is no kernel-bypass offload yet (sub-project B). Fine for moderate rates,
-  not for line-rate volumetric attack traffic *on the box* (BGP mitigation pushes
-  that to your router instead).
+- **No XDP fast path yet.** An optional nftables flowtable (`flowtable devices=…`)
+  offloads established forwarded real-service flows to the kernel conntrack fast
+  path, but there is no XDP/AF_XDP kernel-bypass offload yet (sub-project B).
+  Fine for moderate rates, not for line-rate volumetric attack traffic *on the
+  box* (BGP mitigation pushes that to your router instead).
 - No GTSM/TTL-security on BGP (TCP-MD5 only).

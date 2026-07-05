@@ -23,7 +23,7 @@ Every `(IP, protocol, port)` across your prefixes is in exactly one of three sta
 
 | State | Behaviour |
 |-------|-----------|
-| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. *(A flowtable/XDP fast path for near-line-rate forwarding is on the roadmap, not yet implemented.)* |
+| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. An optional nftables **flowtable** offloads established forwarded flows to the kernel conntrack fast path (`flowtable devices=…`); an XDP/AF_XDP fast path is on the roadmap. |
 | **Deception** *(default)* | Looks open and alive. Closed ports answer a real TCP handshake and carry on a believable, protocol-aware conversation (SSH, HTTP, SMTP, databases, …) like an interactive honeypot — but nothing real is ever reached, and every probe is logged. |
 | **Closed** | Silently dropped (e.g. management ports). |
 
@@ -38,9 +38,9 @@ deception) while real services stay stable.
   volume, plus per-protocol emulators that hold real multi-turn conversations and capture
   attacker activity.
 - **Declarative config DSL** — high-level, readable rules compiled down to nftables.
-- **nftables data plane** — real traffic accepted/DNAT'd (`nat:` targets), deception traffic handed
-  to userspace via TPROXY/NFQUEUE; designed so a flowtable + XDP/AF_XDP fast path slots in later
-  (not yet implemented).
+- **nftables data plane** — real traffic accepted/DNAT'd (`nat:` targets) with an optional flowtable
+  fast path for established forwarded flows; deception traffic handed to userspace via TPROXY/NFQUEUE;
+  designed so an XDP/AF_XDP fast path slots in later.
 - **Multi-tenant** — per-tenant IP/prefix ownership; tenants manage ports only on their own
   addresses, via config or API.
 - **PostgreSQL-backed state** with a full audit log of every policy change.
@@ -79,6 +79,11 @@ metrics listen=127.0.0.1:9100
 # Optional deception-engine tuning (all keys optional; shown with their defaults).
 # tproxy-port / nfqueue are a single source of truth — the nft rules follow them.
 engine max-concurrent=1024 session-timeout=60 tproxy-port=61000 nfqueue=0
+
+# Optional flowtable fast path for real-service traffic. List every device a
+# forwarded flow traverses (uplink + backend); offload engages only when both
+# directions' devices are present. Omit the directive to keep the nft slow path.
+flowtable devices=eth0,incusbr0
 ```
 
 With a `metrics` block, `blackwalld flow` serves `GET /metrics` (Prometheus text) exposing BGP

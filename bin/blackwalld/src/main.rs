@@ -528,6 +528,26 @@ fn ensure_interface_exists(iface: &str) -> Result<(), Box<dyn std::error::Error>
     }
 }
 
+/// Fail fast if any configured flowtable device is missing: nft rejects a
+/// flowtable that references a non-existent device, so the whole ruleset apply
+/// would fail (leaving nothing installed) with a less obvious error.
+fn ensure_flowtable_devices_exist(
+    policy: &blackwall_core::Policy,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ft) = &policy.flowtable {
+        for dev in &ft.devices {
+            if !std::path::Path::new(&format!("/sys/class/net/{dev}")).exists() {
+                return Err(format!(
+                    "flowtable device `{dev}` does not exist \
+                     (check the `flowtable devices=` directive)"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve when the process is asked to stop: SIGTERM (e.g. `systemctl stop`) or
 /// SIGINT (Ctrl-C). Used to trigger a graceful deception-engine shutdown.
 async fn wait_for_shutdown() {
@@ -1017,6 +1037,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let policy = blackwall_config::parse_file(&config)?;
             ensure_interface_exists(&policy.interface)?;
+            ensure_flowtable_devices_exist(&policy)?;
             let store = blackwall_state::Store::connect(&database_url).await?;
             store.migrate().await?;
             let n = store.apply_policy(&policy, "blackwalld").await?;
@@ -1052,6 +1073,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let policy = blackwall_config::parse_file(&config)?;
             ensure_interface_exists(&policy.interface)?;
+            ensure_flowtable_devices_exist(&policy)?;
 
             // Connect and migrate the store early so discovery can persist its results.
             let store = blackwall_state::Store::connect(&database_url).await?;

@@ -234,6 +234,7 @@ version = "0.1.0"
 name = "blackwall-nft"
 version = "0.1.0"
 dependencies = [
+ "blackwall-config",
  "blackwall-core",
  "insta",
  "nftables",

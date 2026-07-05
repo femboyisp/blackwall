@@ -20,12 +20,12 @@
 
 use blackwall_core::{Policy, PolicyError, PortState, ServiceTarget};
 use nftables::{
-    expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix},
+    expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, CT},
     schema::{
-        Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetType,
+        Chain, FlowTable, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetType,
         SetTypeValue, Table,
     },
-    stmt::{Mangle, Match, NATFamily, Operator, Queue, Statement, TProxy, NAT},
+    stmt::{Flow, Mangle, Match, NATFamily, Operator, Queue, SetOp, Statement, TProxy, NAT},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 
@@ -486,6 +486,84 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         ))));
     }
 
+    // 11. Optional flowtable fast path for real-service (forwarded) traffic.
+    //
+    //     A flowtable offloads *established forwarded* flows to the kernel's
+    //     conntrack fast path, bypassing the per-packet forwarding path.
+    //     Deception traffic is TPROXY-diverted to the local engine and is never
+    //     forwarded, so it is never offloaded. Emitted only when the operator
+    //     opts in with an explicit device list (`flowtable devices=...`); the
+    //     kernel engages offload only once both directions' devices are members.
+    if let Some(ft) = &policy.flowtable {
+        // Flowtable object bound to the operator's forwarding devices.
+        let devices: Vec<std::borrow::Cow<'static, str>> = ft
+            .devices
+            .iter()
+            .map(|d| std::borrow::Cow::Owned(d.clone()))
+            .collect();
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::FlowTable(
+            FlowTable {
+                family: FAMILY,
+                table: TABLE.into(),
+                name: "ft".into(),
+                handle: None,
+                hook: Some(NfHook::Ingress),
+                // `filter` priority == 0.
+                prio: Some(0),
+                dev: Some(devices.into()),
+            },
+        ))));
+
+        // Forward filter chain — policy accept, so it never changes the
+        // forwarding decision; it only tags established flows for offload.
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(
+            Chain {
+                family: FAMILY,
+                table: TABLE.into(),
+                name: "forward".into(),
+                newname: None,
+                handle: None,
+                _type: Some(NfChainType::Filter),
+                hook: Some(NfHook::Forward),
+                prio: Some(0),
+                dev: None,
+                policy: Some(NfChainPolicy::Accept),
+            },
+        ))));
+
+        // Offload rule: scope to traffic ingressing on the managed uplink (so
+        // unrelated transit flows on the box are not offloaded), match only
+        // established conntrack flows, then hand the flow to the flowtable.
+        let offload_rule = Rule {
+            family: FAMILY,
+            table: TABLE.into(),
+            chain: "forward".into(),
+            expr: vec![
+                iifname_match(&policy.interface),
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::CT(CT {
+                        key: "state".into(),
+                        family: None,
+                        dir: None,
+                    })),
+                    right: Expression::String("established".into()),
+                    op: Operator::IN,
+                }),
+                Statement::Flow(Flow {
+                    op: SetOp::Add,
+                    flowtable: "@ft".into(),
+                }),
+            ]
+            .into(),
+            handle: None,
+            index: None,
+            comment: Some("real-service fast path: offload established flows".into()),
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+            offload_rule,
+        ))));
+    }
+
     Ok(Nftables {
         objects: objects.into(),
     })
@@ -547,6 +625,7 @@ mod tests {
             flowspec: None,
             metrics_listen: None,
             engine: blackwall_core::EngineConfig::default(),
+            flowtable: None,
         }
     }
 
@@ -571,6 +650,7 @@ mod tests {
             flowspec: None,
             metrics_listen: None,
             engine: blackwall_core::EngineConfig::default(),
+            flowtable: None,
         }
     }
 
@@ -887,6 +967,73 @@ mod tests {
     }
 
     #[test]
+    fn no_flowtable_objects_without_directive() {
+        let ruleset = render(&sample()).expect("render");
+        let has_ft = ruleset.objects.iter().any(|o| {
+            matches!(
+                o,
+                NfObject::CmdObject(NfCmd::Add(NfListObject::FlowTable(_)))
+            )
+        });
+        let has_forward_chain = ruleset.objects.iter().any(|o| {
+            matches!(o, NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(c))) if c.name == "forward")
+        });
+        assert!(!has_ft, "no flowtable object without the directive");
+        assert!(!has_forward_chain, "no forward chain without the directive");
+    }
+
+    #[test]
+    fn renders_flowtable_object_forward_chain_and_offload_rule() {
+        let mut policy = sample();
+        policy.flowtable = Some(blackwall_core::FlowTableConfig {
+            devices: vec!["eth0".to_owned(), "incusbr0".to_owned()],
+        });
+        let ruleset = render(&policy).expect("render");
+
+        // Flowtable object with hook ingress and the configured devices.
+        let ft = ruleset
+            .objects
+            .iter()
+            .find_map(|o| match o {
+                NfObject::CmdObject(NfCmd::Add(NfListObject::FlowTable(ft))) => Some(ft),
+                _ => None,
+            })
+            .expect("flowtable object present");
+        assert_eq!(ft.name, "ft");
+        assert_eq!(ft.hook, Some(NfHook::Ingress));
+        let devs = ft.dev.as_ref().expect("devices set");
+        assert_eq!(devs.as_ref(), &["eth0", "incusbr0"]);
+
+        // Forward filter chain, accept policy.
+        let fwd = ruleset
+            .objects
+            .iter()
+            .find_map(|o| match o {
+                NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(c))) if c.name == "forward" => {
+                    Some(c)
+                }
+                _ => None,
+            })
+            .expect("forward chain present");
+        assert_eq!(fwd.hook, Some(NfHook::Forward));
+        assert_eq!(fwd.policy, Some(NfChainPolicy::Accept));
+
+        // Offload rule references the flowtable via `@ft`.
+        let flow = ruleset.objects.iter().find_map(|o| {
+            let NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) = o else {
+                return None;
+            };
+            r.expr.iter().find_map(|s| match s {
+                Statement::Flow(f) => Some(f.clone()),
+                _ => None,
+            })
+        });
+        let flow = flow.expect("offload rule present");
+        assert_eq!(flow.op, SetOp::Add);
+        assert_eq!(flow.flowtable, "@ft");
+    }
+
+    #[test]
     fn empty_tenant_list_produces_empty_sets() {
         let policy = Policy {
             interface: "eth0".to_owned(),
@@ -900,6 +1047,7 @@ mod tests {
             flowspec: None,
             metrics_listen: None,
             engine: blackwall_core::EngineConfig::default(),
+            flowtable: None,
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.
