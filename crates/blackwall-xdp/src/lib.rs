@@ -1,9 +1,11 @@
 //! Userspace control plane for the Blackwall XDP data plane.
 pub mod control;
+pub mod dataplane;
 pub mod keys;
 pub mod manager;
 
 pub use control::{XdpAction, XdpController, XdpOrigin};
+pub use dataplane::{XdpDataplane, XdpError, XdpStats};
 pub use manager::{
     ApplyOutcome, XdpExecError, XdpExecutor, XdpJournal, XdpJournalError, XdpManager,
 };
