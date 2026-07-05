@@ -47,8 +47,19 @@ impl Default for SpeedtestConfig {
 pub trait SpeedtestProvider: Send + Sync {
     /// Stable short name (e.g. `"cloudflare"`).
     fn name(&self) -> &str;
-    /// Run one measurement.
+    /// Run one measurement (throughput + a latency figure).
     async fn measure(&self, cfg: &SpeedtestConfig) -> Result<ProviderReading, SpeedtestError>;
+    /// Measure round-trip latency only, with **no throughput load**.
+    ///
+    /// The runner calls this in an unloaded phase *before* the (link-saturating)
+    /// throughput phase and substitutes the result for the latency reported by
+    /// [`measure`](Self::measure), which is otherwise measured on a saturated
+    /// link and inflated by bufferbloat. Returns `None` if the provider cannot
+    /// cheaply probe idle RTT; the runner then keeps the loaded figure.
+    async fn measure_latency(&self, cfg: &SpeedtestConfig) -> Option<f64> {
+        let _ = cfg;
+        None
+    }
 }
 
 #[cfg(test)]
