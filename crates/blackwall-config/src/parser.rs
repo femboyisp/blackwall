@@ -116,7 +116,13 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             value: k.to_owned(),
                         });
                     }
-                    kv.insert(k, v);
+                    if kv.insert(k, v).is_some() {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "dns-flux duplicate key",
+                            value: k.to_owned(),
+                        });
+                    }
                 }
                 let get = |k: &str| -> Result<&str, ConfigError> {
                     kv.get(k).copied().ok_or_else(|| ConfigError::BadValue {
@@ -216,7 +222,13 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             value: k.to_owned(),
                         });
                     }
-                    kv.insert(k, v);
+                    if kv.insert(k, v).is_some() {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "rtbh duplicate key",
+                            value: k.to_owned(),
+                        });
+                    }
                 }
                 let bad = |what: &'static str, v: &str| ConfigError::BadValue {
                     line: line.number,
@@ -345,7 +357,13 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             value: k.to_owned(),
                         });
                     }
-                    kv.insert(k, v);
+                    if kv.insert(k, v).is_some() {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "flowspec duplicate key",
+                            value: k.to_owned(),
+                        });
+                    }
                 }
                 let bad = |what: &'static str, v: &str| ConfigError::BadValue {
                     line: line.number,
@@ -1150,6 +1168,36 @@ tenant t {
     #[test]
     fn rejects_dns_flux_unknown_key() {
         assert!(parse_text("interface wan eth0\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=2 set=1 tsig=/k bogus=1\n").is_err());
+    }
+
+    #[test]
+    fn rejects_dns_flux_duplicate_key() {
+        let err = parse_text("interface wan eth0\ndns-flux server=192.0.2.53 zone=z name=n from=203.0.113.0/24 count=8 count=2 set=1 tsig=/k\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "dns-flux duplicate key",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_rtbh_duplicate_key() {
+        let err = parse_text("interface wan eth0\nrtbh peer=10.0.0.2 peer=10.0.0.3 local-as=1 peer-as=1 router-id=10.0.0.1 next-hop-v4=10.0.0.9 max=8 hold-down=30s\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "rtbh duplicate key",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
