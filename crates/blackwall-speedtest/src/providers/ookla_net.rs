@@ -120,7 +120,9 @@ impl SpeedtestProvider for OoklaProvider {
     /// Fetches the server list, connects to the first server, performs the
     /// `HI`/`DOWNLOAD` handshake, and times the transfer. A 2 GiB byte
     /// ceiling is requested so the measurement window — not the byte count —
-    /// bounds the download. The TCP connection is bound to the provider's
+    /// bounds the download; if a server does not honor that and ends the
+    /// transfer early, bounded DOWNLOAD requests are looped to fill the rest of
+    /// the window. The TCP connection is bound to the provider's
     /// configured [`SpeedtestSource`].
     async fn measure(&self, cfg: &SpeedtestConfig) -> Result<ProviderReading, SpeedtestError> {
         // Fetch and parse the server list.
@@ -178,6 +180,41 @@ impl SpeedtestProvider for OoklaProvider {
             }
             received = received.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
             if !keep_downloading(received, bytes, start.elapsed(), cfg.measure_window) {
+                break;
+            }
+        }
+
+        // Fallback for a server that did not honor the huge byte count and ended
+        // the transfer before the window (a truncated, degraded reading). While
+        // time remains, keep issuing *bounded* DOWNLOAD requests on the same
+        // connection (as Cloudflare does) so the measurement still fills its
+        // window. Best-effort: stop on the first write/read failure or if a
+        // request yields nothing (the connection is closed or stalled).
+        let per_req = cfg.max_bytes.clamp(1, MAX_OOKLA_BYTES);
+        while start.elapsed() < cfg.measure_window {
+            if stream
+                .write_all(download_command(per_req).as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let mut this_req: u64 = 0;
+            let mut progressed = false;
+            while this_req < per_req {
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                progressed = true;
+                let take = u64::try_from(n).unwrap_or(u64::MAX).min(per_req - this_req);
+                this_req = this_req.saturating_add(take);
+                received = received.saturating_add(take);
+                if start.elapsed() >= cfg.measure_window {
+                    break;
+                }
+            }
+            if !progressed {
                 break;
             }
         }
