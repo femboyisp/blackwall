@@ -1,0 +1,30 @@
+#!/bin/sh
+# runit service: Blackwall deception firewall (blackwalld run).
+#
+# Install:
+#   cp target/release/blackwalld /usr/local/bin/
+#   install -d /etc/blackwall
+#   cp your-blackwall.conf /etc/blackwall/blackwall.conf
+#   cp your-banners.txt    /etc/blackwall/banners.txt
+#   printf 'DATABASE_URL=postgres://bw_daemon:...@db/blackwall\n' \
+#       > /etc/blackwall/deception.env && chmod 600 /etc/blackwall/deception.env
+#   cp -r deploy/runit/blackwalld-deception /etc/sv/
+#   ln -s /etc/sv/blackwalld-deception /var/service/     # or /etc/service on some distros
+#
+# runit sends SIGTERM on `sv stop`, which blackwalld handles as a graceful
+# shutdown (removes the nft ruleset + policy route, exits 0). `finish` is a
+# best-effort backstop in case the process was SIGKILLed.
+exec 2>&1
+
+# Load DB creds (KEY=VALUE). Keep deception.env 0600, owned by root.
+set -a
+[ -r /etc/blackwall/deception.env ] && . /etc/blackwall/deception.env
+set +a
+
+# blackwalld run installs nft rules, binds an IP_TRANSPARENT TPROXY socket,
+# opens NFQUEUE, and raw sockets: it needs CAP_NET_ADMIN + CAP_NET_RAW. This
+# runs as root; for least-privilege, wrap the exec with
+#   setpriv --ambient-caps +net_admin,+net_raw --inh-caps +net_admin,+net_raw ...
+exec /usr/local/bin/blackwalld run \
+    --config /etc/blackwall/blackwall.conf \
+    --banners /etc/blackwall/banners.txt

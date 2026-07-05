@@ -1,0 +1,5 @@
+#!/bin/sh
+# Timestamped, size-rotated logs via svlogd.
+exec 2>&1
+mkdir -p /var/log/blackwalld-deception
+exec svlogd -tt /var/log/blackwalld-deception
