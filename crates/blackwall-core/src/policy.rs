@@ -54,4 +54,7 @@ pub struct Policy {
     /// Deception-engine wiring (concurrency, timeout, TPROXY port, NFQUEUE number).
     /// Defaults if no `engine` directive is present.
     pub engine: crate::EngineConfig,
+    /// nftables flowtable fast path for real-service traffic (`flowtable` directive);
+    /// `None` keeps all real traffic on the nft slow path.
+    pub flowtable: Option<crate::FlowTableConfig>,
 }

@@ -4,8 +4,8 @@
 use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
-    AllowRule, BannerFluxConfig, DnsFluxConfig, EngineConfig, FlowSpecPolicy, L4Proto, Policy,
-    PortState, RtbhPolicy, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
+    AllowRule, BannerFluxConfig, DnsFluxConfig, EngineConfig, FlowSpecPolicy, FlowTableConfig,
+    L4Proto, Policy, PortState, RtbhPolicy, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -22,6 +22,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut flowspec: Option<FlowSpecPolicy> = None;
     let mut metrics_listen: Option<SocketAddr> = None;
     let mut engine = EngineConfig::default();
+    let mut flowtable: Option<FlowTableConfig> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -479,6 +480,44 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     }
                 }
             }
+            "flowtable" => {
+                if flowtable.is_some() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "flowtable",
+                        value: "duplicate".to_owned(),
+                    });
+                }
+                let mut devices: Vec<String> = Vec::new();
+                for tok in &line.words[1..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "flowtable",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    if k != "devices" {
+                        return Err(ConfigError::BadValue {
+                            line: line.number,
+                            what: "flowtable key",
+                            value: k.to_owned(),
+                        });
+                    }
+                    for dev in v.split(',') {
+                        let dev = dev.trim();
+                        if !dev.is_empty() {
+                            devices.push(dev.to_owned());
+                        }
+                    }
+                }
+                if devices.is_empty() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "flowtable devices",
+                        value: "must list at least one interface".to_owned(),
+                    });
+                }
+                flowtable = Some(FlowTableConfig { devices });
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -518,6 +557,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         flowspec,
         metrics_listen,
         engine,
+        flowtable,
     })
 }
 
@@ -1374,6 +1414,66 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
                 err,
                 ConfigError::BadValue {
                     what: "engine key",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn flowtable_absent_is_none() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert!(p.flowtable.is_none());
+    }
+
+    #[test]
+    fn parses_flowtable_devices() {
+        let p = parse_text("interface wan eth0\nflowtable devices=eth0,incusbr0\n").unwrap();
+        let ft = p.flowtable.expect("flowtable set");
+        assert_eq!(ft.devices, vec!["eth0".to_owned(), "incusbr0".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_empty_flowtable_devices() {
+        let err = parse_text("interface wan eth0\nflowtable devices=\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "flowtable devices",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_flowtable_unknown_key() {
+        let err = parse_text("interface wan eth0\nflowtable bogus=eth0\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "flowtable key",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_flowtable() {
+        let err =
+            parse_text("interface wan eth0\nflowtable devices=eth0\nflowtable devices=eth1\n")
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "flowtable",
                     ..
                 }
             ),

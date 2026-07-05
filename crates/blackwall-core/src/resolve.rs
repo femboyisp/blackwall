@@ -130,6 +130,7 @@ mod tests {
             flowspec: None,
             metrics_listen: None,
             engine: crate::EngineConfig::default(),
+            flowtable: None,
         }
     }
 
@@ -268,6 +269,7 @@ mod tests {
             flowspec: None,
             metrics_listen: None,
             engine: crate::EngineConfig::default(),
+            flowtable: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
