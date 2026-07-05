@@ -313,6 +313,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-xdp-common"
+version = "0.1.0"
+
+[[package]]
 name = "blackwalld"
 version = "0.1.0"
 dependencies = [

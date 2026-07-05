@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "bin/*"]
+members = ["crates/*", "bin/*", "crates/blackwall-xdp-common"]
 
 [workspace.package]
 edition = "2021"
