@@ -13,6 +13,7 @@ mod resolve;
 mod rtbh;
 mod shape;
 mod target;
+mod xdp;
 
 pub use dns::DnsFluxConfig;
 pub use engine::{
@@ -30,3 +31,4 @@ pub use resolve::{PolicyError, ResolvedService};
 pub use rtbh::RtbhPolicy;
 pub use shape::{ShapeBandwidth, ShapeRule};
 pub use target::ServiceTarget;
+pub use xdp::{XdpConfig, XdpMode};
