@@ -17,6 +17,11 @@
 # When a milestone adds a new thin I/O adapter, extend EXCLUDE here only — CI
 # picks it up automatically.
 #
+# blackwall-xdp-ebpf is not listed above: it's excluded from the workspace
+# entirely (targets bpfel-unknown-none), so it never participates in
+# `--workspace` llvm-cov, and it's exempt from the no-`as`-casts guideline
+# (verifier idioms require `as` for register-width/pointer casts).
+#
 # Extra args are forwarded to cargo llvm-cov (e.g. --html, --summary-only).
 set -euo pipefail
 

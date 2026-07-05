@@ -20,6 +20,8 @@ use std::process::Command;
 const EBPF_PACKAGE: &str = "blackwall-xdp-ebpf";
 const EBPF_MANIFEST: &str = "../blackwall-xdp-ebpf/Cargo.toml";
 const EBPF_SRC: &str = "../blackwall-xdp-ebpf/src";
+const COMMON_SRC: &str = "../blackwall-xdp-common/src";
+const COMMON_MANIFEST: &str = "../blackwall-xdp-common/Cargo.toml";
 const BIN_NAME: &str = "blackwall-xdp";
 const BPF_TARGET: &str = "bpfel-unknown-none";
 const TOOLCHAIN: &str = "nightly";
@@ -27,6 +29,11 @@ const TOOLCHAIN: &str = "nightly";
 fn main() {
     println!("cargo:rerun-if-changed={EBPF_SRC}");
     println!("cargo:rerun-if-changed={EBPF_MANIFEST}");
+    // The eBPF program depends on blackwall-xdp-common for the shared map POD
+    // types; without this, editing those types wouldn't re-run this build
+    // script and would silently embed a stale object with a mismatched map ABI.
+    println!("cargo:rerun-if-changed={COMMON_SRC}");
+    println!("cargo:rerun-if-changed={COMMON_MANIFEST}");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let ebpf_target_dir = out_dir.join(EBPF_PACKAGE);
