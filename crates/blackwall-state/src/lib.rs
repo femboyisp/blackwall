@@ -1662,11 +1662,13 @@ mod tests {
                         proto: L4Proto::Tcp,
                         port: 443,
                         target: ServiceTarget::Host,
+                        scope: None,
                     },
                     AllowRule {
                         proto: L4Proto::Udp,
                         port: 53,
                         target: ServiceTarget::Host,
+                        scope: None,
                     },
                 ],
             }],

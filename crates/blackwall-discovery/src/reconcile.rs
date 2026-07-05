@@ -37,11 +37,10 @@ const DISCOVERED_TENANT: &str = "discovered";
 /// `"discovered"` tenant when no configured tenant owns it. Services outside all
 /// managed prefixes, and duplicates already present, are skipped.
 ///
-/// Because [`AllowRule`] is not address-scoped, a discovered service attached to
-/// a tenant opens that port on **all** addresses that tenant owns — consistent
-/// with config-file allow semantics. Operators reading the audit log should
-/// therefore expect to see a port opened on an address that was not itself
-/// observed listening, if another address in the same tenant triggered the rule.
+/// The added rule is **address-scoped** ([`AllowRule::scope`] = the observed
+/// address), so a service seen on one address opens that port only on that
+/// address — not on the tenant's other addresses. Config-file `allow` rules
+/// stay unscoped (whole-tenant), so this only tightens discovered services.
 pub fn reconcile(base: &Policy, discovered: &[DiscoveredService]) -> Policy {
     let mut effective = base.clone();
 
@@ -56,6 +55,9 @@ pub fn reconcile(base: &Policy, discovered: &[DiscoveredService]) -> Policy {
             proto: svc.proto,
             port: svc.port,
             target: svc.target.clone(),
+            // Scope the rule to the observed address only: a service seen on one
+            // address must not open that port on the tenant's other addresses.
+            scope: Some(svc.addr),
         };
         match owning_tenant_index(&effective, svc.addr) {
             Some(idx) => effective.tenants[idx].allows.push(rule),
@@ -67,7 +69,14 @@ pub fn reconcile(base: &Policy, discovered: &[DiscoveredService]) -> Policy {
 
 fn service_exists(policy: &Policy, addr: IpAddr, proto: L4Proto, port: u16) -> bool {
     policy.tenants.iter().any(|t| {
-        t.owned.contains(&addr) && t.allows.iter().any(|a| a.proto == proto && a.port == port)
+        t.owned.contains(&addr)
+            && t.allows.iter().any(|a| {
+                a.proto == proto
+                    && a.port == port
+                    // A rule already covers `addr` if it is tenant-wide (no
+                    // scope) or scoped to exactly this address.
+                    && a.scope.is_none_or(|s| s == addr)
+            })
     })
 }
 
@@ -153,6 +162,50 @@ mod tests {
     }
 
     #[test]
+    fn discovered_service_scopes_to_the_observed_address_only() {
+        // Tenant owns two addresses; a service is observed on only one of them.
+        let base = base_policy(vec![Tenant {
+            name: "acme".to_owned(),
+            owned: vec![ip("203.0.113.5"), ip("203.0.113.6")],
+            allows: vec![],
+        }]);
+        let eff = reconcile(&base, &[svc("203.0.113.5", 443, ServiceTarget::Host)]);
+        let resolved = eff.resolve().expect("valid");
+        // Exactly one resolved service, on the observed address — not both.
+        let on_443: Vec<_> = resolved.iter().filter(|s| s.port == 443).collect();
+        assert_eq!(on_443.len(), 1);
+        assert_eq!(on_443[0].addr, ip("203.0.113.5"));
+    }
+
+    #[test]
+    fn two_discovered_addresses_do_not_cross_open_in_synthetic_tenant() {
+        // Two services on different unowned addresses land in the synthetic
+        // tenant; each must open only on its own address.
+        let base = base_policy(vec![]);
+        let eff = reconcile(
+            &base,
+            &[
+                svc("203.0.113.8", 22, ServiceTarget::Host),
+                svc("203.0.113.9", 80, ServiceTarget::Host),
+            ],
+        );
+        let resolved = eff.resolve().expect("valid");
+        assert!(resolved
+            .iter()
+            .any(|s| s.addr == ip("203.0.113.8") && s.port == 22));
+        assert!(resolved
+            .iter()
+            .any(|s| s.addr == ip("203.0.113.9") && s.port == 80));
+        // No cross-opening: 22 is not exposed on .9, nor 80 on .8.
+        assert!(!resolved
+            .iter()
+            .any(|s| s.addr == ip("203.0.113.9") && s.port == 22));
+        assert!(!resolved
+            .iter()
+            .any(|s| s.addr == ip("203.0.113.8") && s.port == 80));
+    }
+
+    #[test]
     fn synthetic_tenant_for_unowned_in_prefix() {
         let base = base_policy(vec![]);
         let eff = reconcile(&base, &[svc("203.0.113.9", 80, ServiceTarget::Host)]);
@@ -178,6 +231,7 @@ mod tests {
                 proto: L4Proto::Tcp,
                 port: 443,
                 target: ServiceTarget::Host,
+                scope: None,
             }],
         }]);
         let eff = reconcile(

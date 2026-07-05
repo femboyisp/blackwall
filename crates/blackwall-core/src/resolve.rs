@@ -79,6 +79,10 @@ impl Policy {
         for tenant in &self.tenants {
             for &addr in &tenant.owned {
                 for allow in &tenant.allows {
+                    // An address-scoped allow only applies to its own address.
+                    if allow.scope.is_some_and(|scoped| scoped != addr) {
+                        continue;
+                    }
                     let dup = out
                         .iter()
                         .any(|s| s.addr == addr && s.proto == allow.proto && s.port == allow.port);
@@ -143,6 +147,7 @@ mod tests {
                 proto: L4Proto::Tcp,
                 port: 443,
                 target: ServiceTarget::Incus("web01".to_owned()),
+                scope: None,
             }],
         }]);
 
@@ -150,6 +155,25 @@ mod tests {
 
         assert_eq!(resolved.len(), 2);
         assert!(resolved.iter().all(|s| s.port == 443 && s.tenant == "acme"));
+    }
+
+    #[test]
+    fn address_scoped_allow_resolves_only_for_its_address() {
+        let policy = base_policy(vec![Tenant {
+            name: "acme".to_owned(),
+            owned: vec![ip("203.0.113.5"), ip("203.0.113.6")],
+            allows: vec![AllowRule {
+                proto: L4Proto::Tcp,
+                port: 443,
+                target: ServiceTarget::Host,
+                scope: Some(ip("203.0.113.5")),
+            }],
+        }]);
+
+        let resolved = policy.resolve().expect("valid policy");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].addr, ip("203.0.113.5"));
     }
 
     #[test]
@@ -197,11 +221,13 @@ mod tests {
                     proto: L4Proto::Tcp,
                     port: 443,
                     target: ServiceTarget::Incus("a".to_owned()),
+                    scope: None,
                 },
                 AllowRule {
                     proto: L4Proto::Tcp,
                     port: 443,
                     target: ServiceTarget::Incus("b".to_owned()),
+                    scope: None,
                 },
             ],
         }]);

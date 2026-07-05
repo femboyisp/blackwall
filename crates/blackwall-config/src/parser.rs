@@ -661,6 +661,8 @@ fn parse_allow(line: &Line) -> Result<AllowRule, ConfigError> {
         proto,
         port,
         target,
+        // Config-file allows apply to all of the tenant's owned addresses.
+        scope: None,
     })
 }
 
