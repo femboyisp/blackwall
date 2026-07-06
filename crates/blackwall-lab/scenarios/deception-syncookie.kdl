@@ -1,0 +1,38 @@
+// Stateless SYN-cookie tier end-to-end gate (Component 4): a real client's
+// TCP handshake to a stateless-tier port gets a SipHash-cookie SYN-ACK and
+// receives the banner, proving the full mint -> validate -> banner+FIN cycle
+// works over real nft + raw sockets; a concurrent spoofed-source SYN flood at
+// the same port is absorbed by the responder without creating any kernel
+// connection state. IPv4 only here — the v6 send path is broken (#128).
+topology "deception-syncookie" {
+    node "victim" {
+        run "engine" \
+            cmd="target/debug/lab-tests/blackwall-deception-interop serves_stateless_syn_cookie --ignored --nocapture"
+    }
+    node "attacker"
+    link "victim" "attacker" subnet="10.0.0.0/30"
+}
+
+scenario "stateless-cookie-serves-under-flood" {
+    // The stateless tier has no listening socket (no `port-open:` probe is
+    // possible), so wait on the file-present sentinel the interop test writes
+    // right before it starts the (forever-blocking) NFQUEUE responder.
+    step wait   node="victim" \
+         until="file-present:/run/blackwall-lab/syncookie-ready" timeout="20s"
+    // Spoofed-source SYN flood at the stateless port: absorbed statelessly by
+    // the cookie responder (dropped after a cookie SYN-ACK, no backlog, no
+    // conntrack entry) — the responder must survive it (trafficgen's `send`
+    // self-asserts generator fidelity, so this only fails if sending itself
+    // breaks).
+    step assert node="attacker" \
+         cmd="cargo run --offline -p blackwall-trafficgen -- send --dst 10.0.0.1 --spec full-set --duration 10 --dst-port 8080" \
+         exit="0" timeout="30s"
+    // The key assertion: a legit TCP connect from the attacker to the
+    // stateless port, after the flood, receives the marker banner — proving
+    // the full cookie handshake (client SYN -> cookie SYN-ACK -> client ACK
+    // -> cookie validated -> banner+FIN) worked end to end and the responder
+    // survived the flood without keeping state.
+    step assert node="attacker" \
+         cmd="timeout 5 bash -c 'exec 3<>/dev/tcp/10.0.0.1/8080; head -c 40 <&3'" \
+         contains="STATELESS-COOKIE-OK" timeout="20s"
+}

@@ -28,6 +28,10 @@ enum Command {
         /// Duration in seconds.
         #[arg(long, default_value_t = 5)]
         duration: u64,
+        /// Destination L4 port for the spec's patterns (default 80; e.g. a
+        /// stateless-tier port under test).
+        #[arg(long, default_value_t = 80)]
+        dst_port: u16,
     },
     /// Receive + classify for a duration, writing a readiness file + a report.
     Recv {
@@ -85,12 +89,14 @@ fn run(cli: Cli) -> Result<(), String> {
             dst,
             spec,
             duration,
+            dst_port,
         } => {
             let iface = first_non_loopback_iface().map_err(|e| e.to_string())?;
             let gen = parse_spec(&spec).map_err(|e| e.to_string())?;
             let report = run_send(
                 &iface,
                 dst,
+                dst_port,
                 &gen,
                 Bound::Duration(Duration::from_secs(duration)),
             )
