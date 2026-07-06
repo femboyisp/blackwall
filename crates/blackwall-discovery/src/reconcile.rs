@@ -128,6 +128,7 @@ mod tests {
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
             xdp: None,
+            stateless_tcp_ports: Vec::new(),
         }
     }
 

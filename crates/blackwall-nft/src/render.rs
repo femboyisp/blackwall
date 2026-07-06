@@ -9,9 +9,15 @@
 //!   managed interface via an `iifname` match:
 //!   1. Real-service membership → accept (host/incus reach the backend directly;
 //!      `nat:` targets are DNAT'd in a separate `nat` chain).
-//!   2. Deception TCP on managed prefix → tproxy to the configured engine port.
-//!   3. Deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE.
-//!   4. If default_state == Closed → an interface-scoped terminal `drop` rule
+//!   2. Deception TCP on a configured stateless port (`stateless-tcp ports=`)
+//!      on a managed prefix → queue to the configured NFQUEUE (the same queue
+//!      the ICMP/UDP responder uses; the stateless SYN-cookie responder
+//!      handles TCP on that queue). Emitted before rule 3 so a stateless-tier
+//!      port is queued and never falls through to tproxy.
+//!   3. Deception TCP on managed prefix (all other ports) → tproxy to the
+//!      configured engine port.
+//!   4. Deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE.
+//!   5. If default_state == Closed → an interface-scoped terminal `drop` rule
 //!      (the chain runs for every interface, so the closed posture must be
 //!      enforced by a rule matched on `iifname`, not a chain-wide drop policy).
 //!
@@ -20,7 +26,9 @@
 
 use blackwall_core::{Policy, PolicyError, PortState, ServiceTarget};
 use nftables::{
-    expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, CT},
+    expr::{
+        Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, SetItem, CT,
+    },
     schema::{
         Chain, FlowTable, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetType,
         SetTypeValue, Table,
@@ -73,8 +81,12 @@ pub(crate) const TPROXY_ROUTE_TABLE: u32 = 100;
 ///    (no device binding — device binding is rejected by nft for prerouting chains;
 ///    the managed interface is scoped per-rule via `iifname == policy.interface`)
 /// 6. Rule: `iifname` match + real-service membership → accept (nat: targets DNAT'd in the nat chain)
-/// 7. Rule: `iifname` match + deception TCP on managed prefix → tproxy to the configured engine port
-/// 8. Rule: `iifname` match + deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE
+/// 7. Rule: `iifname` match + deception TCP on a configured stateless port → queue to the
+///    configured NFQUEUE (only when `policy.stateless_tcp_ports` is non-empty; emitted before
+///    rule 8 so these ports never fall through to tproxy)
+/// 8. Rule: `iifname` match + deception TCP on managed prefix (all other ports) → tproxy to the
+///    configured engine port
+/// 9. Rule: `iifname` match + deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE
 ///
 /// The idiomatic nft atomic full-replace pattern is: `add table` (creates if
 /// absent), `flush table` (empties existing content), then re-add sets and
@@ -245,7 +257,87 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         ))));
     }
 
-    // 7. Rule: deception TCP on managed prefix → tproxy to the configured engine port.
+    // 7. Rule: deception TCP on a configured stateless port → queue to the
+    //    configured NFQUEUE — the SAME NFQUEUE the ICMP/UDP responder uses
+    //    (rule 9 below); the stateless SYN-cookie responder handles TCP on
+    //    that queue. Only emitted when `policy.stateless_tcp_ports` is
+    //    non-empty. This rule MUST precede the tproxy rule (rule 8) so that
+    //    deception TCP on these ports is queued and never falls through to
+    //    the interactive tier.
+    if !policy.stateless_tcp_ports.is_empty() {
+        let port_set: Vec<SetItem<'static>> = policy
+            .stateless_tcp_ports
+            .iter()
+            .map(|&port| SetItem::Element(Expression::Number(u32::from(port))))
+            .collect();
+        for prefix in &policy.prefixes {
+            let proto_name: &'static str = if prefix.addr().is_ipv4() { "ip" } else { "ip6" };
+            let prefix_str = prefix.addr().to_string();
+            let prefix_len = prefix.prefix_len();
+            let stateless_tcp_rule = Rule {
+                family: FAMILY,
+                table: TABLE.into(),
+                chain: "prerouting".into(),
+                expr: vec![
+                    // iifname == managed interface — scope rule to policy interface
+                    iifname_match(&policy.interface),
+                    // meta l4proto tcp
+                    Statement::Match(Match {
+                        left: Expression::Named(NamedExpression::Meta(Meta {
+                            key: MetaKey::L4proto,
+                        })),
+                        right: Expression::String("tcp".into()),
+                        op: Operator::EQ,
+                    }),
+                    // daddr in managed prefix
+                    Statement::Match(Match {
+                        left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                            PayloadField {
+                                protocol: proto_name.into(),
+                                field: "daddr".into(),
+                            },
+                        ))),
+                        right: Expression::Named(NamedExpression::Prefix(Prefix {
+                            addr: Box::new(Expression::String(prefix_str.into())),
+                            len: u32::from(prefix_len),
+                        })),
+                        op: Operator::EQ,
+                    }),
+                    // th dport in { the configured stateless ports }
+                    Statement::Match(Match {
+                        left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                            PayloadField {
+                                protocol: "th".into(),
+                                field: "dport".into(),
+                            },
+                        ))),
+                        right: Expression::Named(NamedExpression::Set(port_set.clone())),
+                        op: Operator::IN,
+                    }),
+                    // queue num — the configured NFQUEUE number (same as ICMP/UDP)
+                    Statement::Queue(Queue {
+                        num: Expression::Number(u32::from(policy.engine.nfqueue_num)),
+                        flags: None,
+                    }),
+                ]
+                .into(),
+                handle: None,
+                index: None,
+                comment: Some(
+                    format!(
+                        "deception TCP (stateless ports): queue to nfqueue {}",
+                        policy.engine.nfqueue_num
+                    )
+                    .into(),
+                ),
+            };
+            objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+                stateless_tcp_rule,
+            ))));
+        }
+    }
+
+    // 8. Rule: deception TCP on managed prefix → tproxy to the configured engine port.
     //
     //    nftables-0.6 provides a typed `Statement::TProxy` variant that
     //    serializes as `{"tproxy": {"family": "<f>", "port": <n>}}`.
@@ -317,7 +409,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         ))));
     }
 
-    // 8. Rule: deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE.
+    // 9. Rule: deception ICMP/UDP on managed prefix → queue to the configured NFQUEUE.
     //
     //    `Statement::Queue` is a typed variant; it serializes as
     //    `{"queue": {"num": <n>}}`.
@@ -376,7 +468,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         ))));
     }
 
-    // 9. Closed posture: drop unmatched traffic on the managed interface.
+    // 10. Closed posture: drop unmatched traffic on the managed interface.
     //
     //    The chain is unbound (rule 5) and its policy is Accept, so the Closed
     //    default_state is enforced with this interface-scoped terminal drop
@@ -628,6 +720,7 @@ mod tests {
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
             xdp: None,
+            stateless_tcp_ports: Vec::new(),
         }
     }
 
@@ -655,6 +748,7 @@ mod tests {
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
             xdp: None,
+            stateless_tcp_ports: Vec::new(),
         }
     }
 
@@ -971,6 +1065,111 @@ mod tests {
     }
 
     #[test]
+    fn renders_stateless_tcp_queue_rule_before_tproxy() {
+        let mut policy = sample();
+        policy.stateless_tcp_ports = vec![22];
+        let ruleset = render(&policy).expect("render");
+
+        // Find the stateless-tcp queue rule: a rule with both a Queue
+        // statement and a `th dport` set-membership match (distinguishes it
+        // from the ICMP/UDP queue rule, which matches `meta l4proto != tcp`
+        // and has no dport match).
+        let stateless_idx = ruleset.objects.iter().position(|o| {
+            let NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) = o else {
+                return false;
+            };
+            let has_queue = r.expr.iter().any(|s| matches!(s, Statement::Queue(_)));
+            let has_dport_set = r.expr.iter().any(|s| {
+                matches!(
+                    s,
+                    Statement::Match(Match {
+                        left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                            PayloadField { field, .. }
+                        ))),
+                        right: Expression::Named(NamedExpression::Set(_)),
+                        ..
+                    }) if field == "dport"
+                )
+            });
+            has_queue && has_dport_set
+        });
+        let stateless_idx = stateless_idx.expect("stateless-tcp queue rule present");
+
+        // Confirm the dport set contains port 22, and the rule queues to the
+        // configured NFQUEUE number.
+        let stateless_rule = match &ruleset.objects[stateless_idx] {
+            NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) => r,
+            _ => unreachable!(),
+        };
+        let queue_num = stateless_rule.expr.iter().find_map(|s| match s {
+            Statement::Queue(q) => Some(q.num.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            queue_num,
+            Some(Expression::Number(u32::from(
+                blackwall_core::EngineConfig::default().nfqueue_num
+            ))),
+            "stateless-tcp rule must queue to the configured NFQUEUE"
+        );
+        let has_port_22 = stateless_rule.expr.iter().any(|s| {
+            matches!(
+                s,
+                Statement::Match(Match {
+                    right: Expression::Named(NamedExpression::Set(items)),
+                    ..
+                }) if items.iter().any(|i| matches!(i, SetItem::Element(Expression::Number(22))))
+            )
+        });
+        assert!(has_port_22, "dport set must contain port 22");
+
+        // The tproxy rule must appear AFTER the stateless-tcp rule (lower
+        // object index), so stateless-port TCP is queued and never falls
+        // through to tproxy.
+        let tproxy_idx = ruleset
+            .objects
+            .iter()
+            .position(|o| {
+                let NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) = o else {
+                    return false;
+                };
+                r.expr.iter().any(|s| matches!(s, Statement::TProxy(_)))
+            })
+            .expect("tproxy rule present");
+        assert!(
+            stateless_idx < tproxy_idx,
+            "stateless-tcp queue rule (index {stateless_idx}) must precede the tproxy rule (index {tproxy_idx})"
+        );
+    }
+
+    #[test]
+    fn no_stateless_rule_when_empty() {
+        // sample() has stateless_tcp_ports empty (the default).
+        let ruleset = render(&sample()).expect("render");
+        let has_dport_set_match = ruleset.objects.iter().any(|o| {
+            let NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r))) = o else {
+                return false;
+            };
+            r.expr.iter().any(|s| {
+                matches!(
+                    s,
+                    Statement::Match(Match {
+                        right: Expression::Named(NamedExpression::Set(_)),
+                        ..
+                    })
+                )
+            })
+        });
+        assert!(
+            !has_dport_set_match,
+            "no stateless-tcp queue rule must be emitted when stateless_tcp_ports is empty"
+        );
+        // Unchanged object count vs. the pre-existing baseline (table, flush,
+        // real_v4, real_v6, chain, 2 accept, 1 tproxy, 1 queue, dnat chain).
+        assert_eq!(ruleset.objects.len(), 10);
+    }
+
+    #[test]
     fn no_flowtable_objects_without_directive() {
         let ruleset = render(&sample()).expect("render");
         let has_ft = ruleset.objects.iter().any(|o| {
@@ -1053,6 +1252,7 @@ mod tests {
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
             xdp: None,
+            stateless_tcp_ports: Vec::new(),
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.

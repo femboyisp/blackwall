@@ -64,4 +64,9 @@ pub struct Policy {
     pub flowtable: Option<crate::FlowTableConfig>,
     /// XDP fast-path config (`xdp` directive); `None` disables it.
     pub xdp: Option<crate::XdpConfig>,
+    /// Deception TCP ports served by the stateless SYN-cookie tier (NFQUEUE)
+    /// instead of the interactive tier (TPROXY → `ServiceEmulator`s).
+    /// Set via the `stateless-tcp ports=` directive; empty (the default)
+    /// preserves today's behaviour where all deception TCP is interactive.
+    pub stateless_tcp_ports: Vec<u16>,
 }
