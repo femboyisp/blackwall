@@ -7,8 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use blackwall_deception::transport::{run_nfqueue, serve, TproxyListener};
-use blackwall_deception::{default_registry, EngineLimits, SharedBanners};
+use blackwall_deception::transport::{run_nfqueue, serve, BannerLookup, TproxyListener};
+use blackwall_deception::{default_registry, CookieKey, EngineLimits, SharedBanners};
 use blackwall_discovery::IncusClient;
 use blackwall_speedtest::providers::{
     CloudflareProvider, FastProvider, LibreSpeedProvider, OoklaProvider,
@@ -1114,6 +1114,20 @@ async fn apply_xdp_request(
     }
 }
 
+/// Generate a fresh, process-local 128-bit SYN-cookie secret from the
+/// kernel's CSPRNG (`/dev/urandom`), avoiding a new `rand`/`getrandom`
+/// dependency for a single 16-byte read.
+///
+/// The key is never persisted: a restart rotates it, which invalidates any
+/// cookies in flight (acceptable — clients retransmit) exactly as described
+/// in the stateless SYN-cookie design's key-rotation note.
+fn random_cookie_key() -> std::io::Result<CookieKey> {
+    use std::io::Read;
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(CookieKey::new(bytes))
+}
+
 /// Core dispatch logic; returns `Err` on any failure.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -1536,6 +1550,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let registry = std::sync::Arc::new(default_registry(shared.clone()));
 
+            // Stateless SYN-cookie tier wiring: a fresh per-process cookie
+            // secret, and a banner lookup that serves the same banner store
+            // the interactive tier uses, keyed by destination port. Inert
+            // until the nft classifier routes deception TCP here (C2c
+            // follow-on); built eagerly so the responder is ready when it is.
+            let cookie_key = random_cookie_key()?;
+            let banners_for_nfqueue = shared.clone();
+            let banner_lookup: BannerLookup =
+                Box::new(move |port: u16| banners_for_nfqueue.current().banner_for(port).to_vec());
+
             // Engine wiring (port/queue/limits) is a single source of truth in the
             // policy: the nft rules point at exactly these values.
             let tproxy_port = policy.engine.tproxy_port;
@@ -1604,7 +1628,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             transports.spawn(async move {
                 // run_nfqueue is blocking/sync; run it on a blocking thread.
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(err) = run_nfqueue(nfqueue_num) {
+                    if let Err(err) = run_nfqueue(nfqueue_num, cookie_key, banner_lookup) {
                         tracing::error!(%err, "nfqueue loop exited");
                     }
                 })
