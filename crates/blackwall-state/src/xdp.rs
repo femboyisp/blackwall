@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 /// Raw column tuple decoded from an `xdp_entries` row:
-/// `(kind, target, prefixlen, rate_pps, burst, origin)`.
+/// `(kind, target, prefixlen, rate_pps, burst, origin, victim)`.
 type XdpEntryTuple = (
     String,
     sqlx::types::ipnetwork::IpNetwork,
@@ -24,6 +24,7 @@ type XdpEntryTuple = (
     Option<i64>,
     Option<i64>,
     String,
+    Option<sqlx::types::ipnetwork::IpNetwork>,
 );
 
 /// Raw column tuple decoded from an `xdp_requests` row:
@@ -57,6 +58,11 @@ pub struct XdpEntryRow {
     pub burst: Option<u64>,
     /// `"auto"` or `"manual"`.
     pub origin: String,
+    /// The owning victim for a `kind = "rate_limit"` row, when the rate
+    /// limit was auto-installed from a detection against that victim.
+    /// `None` for a `kind = "block"` row (blocks have no victim) and for a
+    /// manually-installed rate limit.
+    pub victim: Option<IpAddr>,
 }
 
 /// One row of the `xdp_requests` append-only operator intent queue.
@@ -87,6 +93,15 @@ impl Store {
     /// `kind` + `target` (+ `prefixlen` for a block). Any existing row for
     /// the same identity is deleted first (delete-then-insert), so at most
     /// one active row ever exists per identity.
+    ///
+    /// `victim` is the owning victim for a `kind = "rate_limit"` row
+    /// auto-installed from a detection against that victim; pass `None` for
+    /// a `"block"` row (blocks have no victim) or a manually-installed rate
+    /// limit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the xdp_entries row shape 1:1; a params struct would just move the same fields around"
+    )]
     pub async fn xdp_record_apply(
         &self,
         kind: &str,
@@ -95,6 +110,7 @@ impl Store {
         rate_pps: Option<u64>,
         burst: Option<u64>,
         origin: &str,
+        victim: Option<IpAddr>,
     ) -> Result<(), StateError> {
         let target_net = ipnetwork_addr(target);
         let prefixlen_i32 = prefixlen.map(i32::from);
@@ -106,6 +122,7 @@ impl Store {
             .map(i64::try_from)
             .transpose()
             .map_err(|e| StateError::Db(sqlx::Error::Decode(Box::new(e))))?;
+        let victim_net = victim.map(ipnetwork_addr);
 
         let mut tx = self.pool().begin().await?;
         sqlx::query(
@@ -118,8 +135,8 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO xdp_entries (kind, target, prefixlen, rate_pps, burst, origin) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO xdp_entries (kind, target, prefixlen, rate_pps, burst, origin, victim) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(kind)
         .bind(target_net)
@@ -127,6 +144,7 @@ impl Store {
         .bind(rate_pps_i64)
         .bind(burst_i64)
         .bind(origin)
+        .bind(victim_net)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -158,13 +176,14 @@ impl Store {
     /// List all active `xdp_entries` rows.
     pub async fn xdp_active(&self) -> Result<Vec<XdpEntryRow>, StateError> {
         let rows: Vec<XdpEntryTuple> = sqlx::query_as(
-            "SELECT kind, target, prefixlen, rate_pps, burst, origin FROM xdp_entries ORDER BY id",
+            "SELECT kind, target, prefixlen, rate_pps, burst, origin, victim \
+             FROM xdp_entries ORDER BY id",
         )
         .fetch_all(self.pool())
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (kind, target, prefixlen, rate_pps, burst, origin) in rows {
+        for (kind, target, prefixlen, rate_pps, burst, origin, victim) in rows {
             let prefixlen = prefixlen
                 .map(u8::try_from)
                 .transpose()
@@ -184,6 +203,7 @@ impl Store {
                 rate_pps,
                 burst,
                 origin,
+                victim: victim.map(|v| v.ip()),
             });
         }
         Ok(out)
@@ -321,12 +341,25 @@ impl XdpJournal for PgXdpJournal {
         let result = match *action {
             XdpAction::Block { net } => {
                 self.store
-                    .xdp_record_apply("block", net.addr(), Some(net.prefix_len()), None, None, o)
+                    .xdp_record_apply(
+                        "block",
+                        net.addr(),
+                        Some(net.prefix_len()),
+                        None,
+                        None,
+                        o,
+                        None,
+                    )
                     .await
             }
-            XdpAction::RateLimit { src, pps, burst } => {
+            XdpAction::RateLimit {
+                src,
+                pps,
+                burst,
+                victim,
+            } => {
                 self.store
-                    .xdp_record_apply("rate_limit", src, None, Some(pps), Some(burst), o)
+                    .xdp_record_apply("rate_limit", src, None, Some(pps), Some(burst), o, victim)
                     .await
             }
             XdpAction::Unblock { net } => {
@@ -363,12 +396,21 @@ mod tests {
 
         let net_addr: IpAddr = "198.51.100.0".parse().unwrap();
         store
-            .xdp_record_apply("block", net_addr, Some(24), None, None, "auto")
+            .xdp_record_apply("block", net_addr, Some(24), None, None, "auto", None)
             .await
             .unwrap();
         let src: IpAddr = "203.0.113.9".parse().unwrap();
+        let victim: IpAddr = "203.0.113.7".parse().unwrap();
         store
-            .xdp_record_apply("rate_limit", src, None, Some(1_000), Some(2_000), "auto")
+            .xdp_record_apply(
+                "rate_limit",
+                src,
+                None,
+                Some(1_000),
+                Some(2_000),
+                "auto",
+                Some(victim),
+            )
             .await
             .unwrap();
 
@@ -381,6 +423,7 @@ mod tests {
         assert_eq!(block_row.rate_pps, None);
         assert_eq!(block_row.burst, None);
         assert_eq!(block_row.origin, "auto");
+        assert_eq!(block_row.victim, None, "a block row has no victim");
 
         let rl_row = active
             .iter()
@@ -389,11 +432,25 @@ mod tests {
         assert_eq!(rl_row.prefixlen, None);
         assert_eq!(rl_row.rate_pps, Some(1_000));
         assert_eq!(rl_row.burst, Some(2_000));
+        assert_eq!(
+            rl_row.victim,
+            Some(victim),
+            "an auto rate-limit's victim must round-trip"
+        );
 
         // Re-applying replaces (not duplicates) the row for the same identity.
         // A custom (non-default) burst independent of pps must round-trip too.
+        // A manual rate-limit (no victim) must round-trip victim = None.
         store
-            .xdp_record_apply("rate_limit", src, None, Some(500), Some(1_000), "manual")
+            .xdp_record_apply(
+                "rate_limit",
+                src,
+                None,
+                Some(500),
+                Some(1_000),
+                "manual",
+                None,
+            )
             .await
             .unwrap();
         let active = store.xdp_active().await.unwrap();
@@ -405,6 +462,10 @@ mod tests {
         assert_eq!(matches[0].rate_pps, Some(500));
         assert_eq!(matches[0].burst, Some(1_000));
         assert_eq!(matches[0].origin, "manual");
+        assert_eq!(
+            matches[0].victim, None,
+            "a manual rate-limit must round-trip victim = None"
+        );
 
         store
             .xdp_record_remove("rate_limit", src, None)
@@ -573,6 +634,7 @@ mod tests {
                     src,
                     pps: 2_000,
                     burst: 2_000,
+                    victim: None,
                 },
                 XdpOrigin::Manual,
                 3_000,
@@ -588,6 +650,7 @@ mod tests {
             .expect("rate_limit row present");
         assert_eq!(row.rate_pps, Some(2_000));
         assert_eq!(row.origin, "manual");
+        assert_eq!(row.victim, None, "a manual rate-limit has no victim");
 
         journal
             .record(&XdpAction::ClearRate { src }, XdpOrigin::Manual, 4_000)
@@ -599,5 +662,35 @@ mod tests {
             .unwrap()
             .iter()
             .any(|r| r.kind == "rate_limit" && r.target == src));
+
+        // An auto rate-limit's victim must round-trip through the journal
+        // path too (not just the direct Store::xdp_record_apply call).
+        let victim: IpAddr = "203.0.113.7".parse().unwrap();
+        journal
+            .record(
+                &XdpAction::RateLimit {
+                    src,
+                    pps: 2_000,
+                    burst: 2_000,
+                    victim: Some(victim),
+                },
+                XdpOrigin::Auto,
+                5_000,
+            )
+            .await
+            .unwrap();
+        let row = store
+            .xdp_active()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "rate_limit" && r.target == src)
+            .expect("rate_limit row present");
+        assert_eq!(row.origin, "auto");
+        assert_eq!(
+            row.victim,
+            Some(victim),
+            "an auto rate-limit's victim must round-trip through the journal"
+        );
     }
 }

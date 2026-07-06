@@ -971,6 +971,7 @@ fn xdp_entry_to_action(
                 src: row.target,
                 pps,
                 burst: row.burst.unwrap_or(pps),
+                victim: row.victim,
             }
         }
         other => {

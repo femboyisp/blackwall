@@ -378,7 +378,9 @@ impl XdpExecutor for XdpDataplane {
             match action {
                 XdpAction::Block { net } => maps.block(net),
                 XdpAction::Unblock { net } => maps.unblock(net),
-                XdpAction::RateLimit { src, pps, burst } => maps.rate_limit(src, pps, burst),
+                XdpAction::RateLimit {
+                    src, pps, burst, ..
+                } => maps.rate_limit(src, pps, burst),
                 XdpAction::ClearRate { src } => maps.clear_rate_limit(src),
             }
         };
