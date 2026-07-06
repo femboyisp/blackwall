@@ -138,6 +138,14 @@ jobs:
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/deception-resilience.kdl lab-junit-deception-resilience.xml
+      - name: Run the lab gate (deception-syncookie)
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/deception-syncookie.kdl lab-junit-syncookie.xml
       - name: Run the lab gate (rtbh)
         timeout-minutes: 6
         run: |
@@ -188,6 +196,7 @@ jobs:
             lab-junit-trafficgen.xml
             lab-junit-flow-live.xml
             lab-junit-deception-resilience.xml
+            lab-junit-syncookie.xml
             lab-junit-rtbh.xml
             lab-junit-flowspec.xml
             lab-junit-flowspec-auto.xml

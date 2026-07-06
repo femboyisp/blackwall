@@ -18,12 +18,19 @@ const SRC_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 const DST_MAC: [u8; 6] = [0xff; 6];
 const ETH_P_ALL: u16 = 0x0003;
 
-/// Send `spec`'s patterns concurrently to `dst` over `iface` until `bound`.
+/// Send `spec`'s patterns concurrently to `dst`:`dst_port` over `iface` until
+/// `bound`.
 ///
 /// # Errors
 /// [`TrafficGenError::Io`] on socket failure, [`TrafficGenError::Build`] on a
 /// frame build failure.
-pub fn run_send(iface: &str, dst: Ipv4Addr, spec: &GenSpec, bound: Bound) -> Result<SendReport> {
+pub fn run_send(
+    iface: &str,
+    dst: Ipv4Addr,
+    dst_port: u16,
+    spec: &GenSpec,
+    bound: Bound,
+) -> Result<SendReport> {
     let ifindex = iface_index(iface)?;
     // AF_PACKET wants the protocol in network byte order (htons(ETH_P_ALL)).
     let sock = Socket::new(
@@ -73,7 +80,7 @@ pub fn run_send(iface: &str, dst: Ipv4Addr, spec: &GenSpec, bound: Bound) -> Res
                     dst_mac: DST_MAC,
                     src_ip: std::net::IpAddr::V4(src_ip),
                     dst_ip: std::net::IpAddr::V4(dst),
-                    dst_port: 80,
+                    dst_port,
                     payload_len: 64,
                 };
                 let frame = build_frame(&ps.pattern, &params, *sent)?;

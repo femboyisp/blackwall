@@ -6,8 +6,8 @@
 //!   cargo test -p blackwall-deception --test interop -- serves_deception_banner --ignored --nocapture
 
 use blackwall_core::{AllowRule, L4Proto, Policy, PortState, ServiceTarget, Tenant};
-use blackwall_deception::transport::{serve, SessionRecord, TproxyListener};
-use blackwall_deception::{default_registry, BannerStore, EngineLimits};
+use blackwall_deception::transport::{run_nfqueue, serve, SessionRecord, TproxyListener};
+use blackwall_deception::{default_registry, BannerStore, CookieKey, EngineLimits};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -183,4 +183,86 @@ async fn serves_deception_under_load() {
         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     )
     .await; // runs until the lab kills it
+}
+
+/// The lab's file-present sentinel for this test: written just before the
+/// (blocking, forever-running) NFQUEUE responder starts, so the
+/// `deception-syncookie` scenario's `wait` step knows the responder is up
+/// (the stateless tier has no listening socket, so `port-open:` cannot be
+/// used here — see `blackwall-flow`'s `detects_live_sflow_attack` for the
+/// same file-present pattern).
+const SYNCOOKIE_READY_SENTINEL: &str = "/run/blackwall-lab/syncookie-ready";
+
+/// Marker banner the stateless SYN-cookie responder serves on the stateless
+/// port under test; the scenario's key assertion greps for this exact string
+/// after a real client TCP handshake completes through the cookie tier.
+const SYNCOOKIE_BANNER: &[u8] = b"STATELESS-COOKIE-OK\r\n";
+
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + a netns (nft + raw sockets); run in the lab"]
+fn serves_stateless_syn_cookie() {
+    let iface = first_non_loopback_iface();
+    let addr = first_ipv4_of(&iface);
+
+    // Same shape as `serves_deception_under_load`: this iface is managed, the
+    // prefix is the victim's own /32, default Deception. Unlike that test,
+    // port 8080 must NOT be a tenant-allowed ("real") port here — a real port
+    // is accepted straight to the host stack (rule 6) before the
+    // stateless-tcp queue rule (rule 7) is ever reached, which would bypass
+    // the cookie tier entirely. So the one benign declared service (needed
+    // only so nft's `real_v4`/`real_v6` sets are non-empty) uses a different
+    // port (9000), leaving 8080 unmatched -> deception -> routed by
+    // `stateless_tcp_ports` to the NFQUEUE instead of tproxy.
+    let policy = Policy {
+        interface: iface,
+        prefixes: vec![
+            format!("{addr}/32").parse().expect("v4 prefix"),
+            "fd00::/64".parse().expect("v6 prefix"),
+        ],
+        default_state: PortState::Deception,
+        tenants: vec![Tenant {
+            name: "lab".to_owned(),
+            owned: vec![IpAddr::V4(addr), IpAddr::V6("fd00::1".parse().expect("v6"))],
+            allows: vec![AllowRule {
+                proto: L4Proto::Tcp,
+                port: 9000,
+                target: ServiceTarget::Host,
+                scope: None,
+            }],
+        }],
+        shaping: Vec::new(),
+        banner_flux: None,
+        dns_flux: None,
+        rtbh: None,
+        flowspec: None,
+        metrics_listen: None,
+        engine: blackwall_core::EngineConfig::default(),
+        flowtable: None,
+        xdp: None,
+        // The stateless-tier port under test (Component 2c wiring): deception
+        // TCP on 8080 is routed to the engine's NFQUEUE instead of tproxy.
+        stateless_tcp_ports: vec![8080],
+    };
+
+    // Apply the REAL nft ruleset: stateless-tcp TCP on 8080 -> nfqueue
+    // (before the tproxy rule; see the render.rs Component 2c ordering test).
+    blackwall_nft::apply(&policy).expect("nft apply");
+
+    let cookie_key = CookieKey::new([
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10,
+    ]);
+    // Any destination port reaching the queue gets the same recognizable
+    // marker; only 8080 (the stateless port) and ICMP/UDP on the managed
+    // prefix are ever queued here, so a distinct per-port table isn't needed.
+    let banners: blackwall_deception::transport::BannerLookup =
+        Box::new(|_port: u16| SYNCOOKIE_BANNER.to_vec());
+
+    let _ = std::fs::remove_file(SYNCOOKIE_READY_SENTINEL); // fresh for the scenario's file-present probe
+    std::fs::write(SYNCOOKIE_READY_SENTINEL, b"ok").expect("write sentinel");
+
+    // Real end-to-end responder: opens the NFQUEUE + raw sockets and handles
+    // SYN-cookie mint/validate + banner+FIN forever (the lab kills it at
+    // teardown). This call blocks; it is not a stub.
+    run_nfqueue(policy.engine.nfqueue_num, cookie_key, banners).expect("nfqueue responder");
 }
