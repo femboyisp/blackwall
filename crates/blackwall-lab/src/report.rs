@@ -86,23 +86,40 @@ pub fn to_junit(report: &RunReport) -> String {
     out
 }
 
+/// Build the TAP version/plan header for a run with `total` steps.
+///
+/// Split out of [`to_tap`] so `lab test` can print the header up front and
+/// stream each step's result as it completes (blackwall#88 diagnostics): a
+/// hang mid-run then shows every step up to the stall instead of emitting
+/// nothing until the run finishes or the job cap kills it.
+#[must_use]
+pub fn tap_header(total: usize) -> String {
+    format!("TAP version 13\n1..{total}\n")
+}
+
+/// Build one TAP result line (plus, on failure, its `# <reason>` comment) for
+/// step number `n` (1-based) of a run.
+///
+/// Companion to [`tap_header`] for incremental TAP streaming; see that
+/// function's docs.
+#[must_use]
+pub fn tap_step_line(n: usize, step: &StepResult) -> String {
+    match &step.outcome {
+        StepOutcome::Pass => format!("ok {n} - {}\n", step.name),
+        StepOutcome::Fail(reason) => format!("not ok {n} - {}\n# {reason}\n", step.name),
+    }
+}
+
 /// Serialize a [`RunReport`] as TAP version 13.
 #[must_use]
 pub fn to_tap(report: &RunReport) -> String {
-    let mut out = String::from("TAP version 13\n");
     let total: usize = report.scenarios.iter().map(|s| s.steps.len()).sum();
-    out.push_str(&format!("1..{total}\n"));
+    let mut out = tap_header(total);
     let mut n = 0_usize;
     for sc in &report.scenarios {
         for step in &sc.steps {
             n += 1;
-            match &step.outcome {
-                StepOutcome::Pass => out.push_str(&format!("ok {n} - {}\n", step.name)),
-                StepOutcome::Fail(reason) => {
-                    out.push_str(&format!("not ok {n} - {}\n", step.name));
-                    out.push_str(&format!("# {reason}\n"));
-                }
-            }
+            out.push_str(&tap_step_line(n, step));
         }
     }
     out
@@ -155,5 +172,47 @@ ok 1 - wait bgp-established\n\
 not ok 2 - assert route <present>\n\
 # stdout does not contain `x`\n";
         assert_eq!(to_tap(&sample()), expected);
+    }
+
+    #[test]
+    fn tap_header_reports_the_plan_line() {
+        assert_eq!(tap_header(0), "TAP version 13\n1..0\n");
+        assert_eq!(tap_header(3), "TAP version 13\n1..3\n");
+    }
+
+    #[test]
+    fn tap_step_line_pass() {
+        let step = StepResult {
+            name: "wait bgp-established".to_owned(),
+            outcome: StepOutcome::Pass,
+        };
+        assert_eq!(tap_step_line(1, &step), "ok 1 - wait bgp-established\n");
+    }
+
+    #[test]
+    fn tap_step_line_fail_includes_reason() {
+        let step = StepResult {
+            name: "assert route <present>".to_owned(),
+            outcome: StepOutcome::Fail("stdout does not contain `x`".to_owned()),
+        };
+        assert_eq!(
+            tap_step_line(2, &step),
+            "not ok 2 - assert route <present>\n# stdout does not contain `x`\n"
+        );
+    }
+
+    #[test]
+    fn header_plus_step_lines_equals_to_tap() {
+        let report = sample();
+        let total: usize = report.scenarios.iter().map(|s| s.steps.len()).sum();
+        let mut streamed = tap_header(total);
+        let mut n = 0_usize;
+        for sc in &report.scenarios {
+            for step in &sc.steps {
+                n += 1;
+                streamed.push_str(&tap_step_line(n, step));
+            }
+        }
+        assert_eq!(streamed, to_tap(&report));
     }
 }
