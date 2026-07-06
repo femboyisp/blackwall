@@ -25,6 +25,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
+      - name: Install pinned nightly (blackwall-xdp-ebpf build.rs)
+        run: rustup toolchain install nightly-2026-06-29 --component rust-src --profile minimal
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked --version 0.10.3
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -48,6 +52,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install pinned nightly (blackwall-xdp-ebpf build.rs)
+        run: rustup toolchain install nightly-2026-06-29 --component rust-src --profile minimal
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked --version 0.10.3
       - name: Install BIRD2 + Knot + nftables + iproute2 + build hsflowd
         run: |
           sudo apt-get update && sudo apt-get install -y bird2 knot knot-dnsutils nftables iproute2 libpcap-dev
@@ -154,6 +162,17 @@ jobs:
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-auto-bird.kdl lab-junit-flowspec-auto.xml
+      - name: Run the lab gate (xdp prog-test-run)
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Build the test binary as the normal user (needs nightly+bpf-linker for the eBPF build.rs).
+          # `sudo cargo test` fails on GH runners: root has no default rustup toolchain.
+          BIN=$(cargo test -p blackwall-xdp --test prog_test_run --no-run --message-format=json \
+            | grep -o '"executable":"[^"]*prog_test_run[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
+          echo "test binary: $BIN"
+          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture
       - name: Upload JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

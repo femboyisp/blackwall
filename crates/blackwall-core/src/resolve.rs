@@ -135,6 +135,7 @@ mod tests {
             metrics_listen: None,
             engine: crate::EngineConfig::default(),
             flowtable: None,
+            xdp: None,
         }
     }
 
@@ -296,6 +297,7 @@ mod tests {
             metrics_listen: None,
             engine: crate::EngineConfig::default(),
             flowtable: None,
+            xdp: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());

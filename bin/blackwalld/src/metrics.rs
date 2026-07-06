@@ -3,7 +3,7 @@
 //! everything else is `405`. Bind to localhost or a trusted management net —
 //! there is no auth or TLS. Enabled by the `metrics listen=<ip:port>` directive.
 
-use blackwall_metrics::{render_prometheus, Metric, MetricKind};
+use blackwall_metrics::{render_prometheus, render_xdp_metrics, Metric, MetricKind, XdpMetrics};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,6 +20,9 @@ pub(crate) struct MetricsSources {
     pub collector: Option<Arc<blackwall_flow::CollectorMetrics>>,
     /// Live in-flight deception sessions; `None` outside the deception engine.
     pub inflight: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// A shared handle to the attached XDP data plane, for per-CPU counter and
+    /// map-occupancy gauges; `None` when XDP is disabled or failed to attach.
+    pub xdp: Option<Arc<blackwall_xdp::XdpDataplane>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -151,6 +154,21 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
     m
 }
 
+/// Render the labelled XDP data-plane block from a live `stats()` snapshot, or
+/// `None` when XDP is not attached. Per-CPU counters expose the *packet*
+/// dimension of each [`blackwall_xdp::XdpStats`] `Stat`.
+fn xdp_block(sources: &MetricsSources) -> Option<String> {
+    let dp = sources.xdp.as_ref()?;
+    let s = dp.stats();
+    Some(render_xdp_metrics(&XdpMetrics {
+        passed_packets: u64_to_f64(s.passed.packets),
+        dropped_blocklist_packets: u64_to_f64(s.dropped_blocklist.packets),
+        dropped_ratelimit_packets: u64_to_f64(s.dropped_ratelimit.packets),
+        blocked_entries: u64_to_f64(s.blocked_entries),
+        ratelimit_entries: u64_to_f64(s.ratelimit_entries),
+    }))
+}
+
 /// Serve `/metrics` forever. Each connection is handled on its own task so a
 /// slow client cannot block scrapes; a bind failure disables the endpoint (and
 /// is logged) without taking down the daemon.
@@ -183,7 +201,15 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
     let mut buf = [0u8; 1024];
     let _ = sock.read(&mut buf).await;
     let response = if buf.starts_with(b"GET ") {
-        let body = render_prometheus(&gather(sources).await);
+        let mut body = render_prometheus(&gather(sources).await);
+        if let Some(xdp) = xdp_block(sources) {
+            // Both blocks are trailing-newline-terminated with no blank tail, so
+            // a single '\n' separates them exactly like adjacent metric blocks.
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&xdp);
+        }
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

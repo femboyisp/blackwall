@@ -627,6 +627,7 @@ mod tests {
             metrics_listen: None,
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
+            xdp: None,
         }
     }
 
@@ -653,6 +654,7 @@ mod tests {
             metrics_listen: None,
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
+            xdp: None,
         }
     }
 
@@ -1050,6 +1052,7 @@ mod tests {
             metrics_listen: None,
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
+            xdp: None,
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.

@@ -7,15 +7,17 @@ service — scanners and attackers can't tell which ports are real. A port only 
 forwarded service when you explicitly open it (via a declarative config file, the API, or Incus
 auto-discovery); everything else is answered by an interactive honeypot engine that behaves like
 the real thing. Blackwall is built for high packet rates and multi-tenant hosting, with a fast
-nftables data plane today and an XDP/eBPF fast path, BGP scrubbing, and DNS fast-flux on the
-roadmap.
+nftables data plane and an on-box XDP/eBPF fast-drop path today, BGP scrubbing, and DNS fast-flux,
+with SYN-cookie/AF_XDP acceleration on the roadmap.
 
 > ⚠️ **Status:** active development. Sub-project **A** (deception firewall) is feature-complete
 > through M3 — the nftables data plane enforces deception (TPROXY/NFQUEUE → honeypot engine) and
 > real-service forwarding, with protocol emulators, Incus discovery, CAKE shaping, and DNS/banner
 > fast-flux. Sub-project **D** ships volumetric detection (D1), and **C** (BGP control plane) ships
-> RTBH end to end plus FlowSpec auto-mitigation. The remaining layers — A·M4 (API/ops) and B (the
-> XDP/eBPF DDoS data plane) — are not yet built. See the [Roadmap](#roadmap).
+> RTBH end to end plus FlowSpec auto-mitigation. Sub-project **B** (the XDP/eBPF DDoS data plane)
+> ships its first increment — an on-box XDP source-drop + per-source rate-limiter driven by the
+> detection loop (B1); SYN cookies, AF_XDP, and the DDoS-lab XDP gate (B2–B4) are next. A·M4
+> (API/ops) remains. See the [Roadmap](#roadmap).
 
 ## How it works
 
@@ -23,7 +25,7 @@ Every `(IP, protocol, port)` across your prefixes is in exactly one of three sta
 
 | State | Behaviour |
 |-------|-----------|
-| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. An optional nftables **flowtable** offloads established forwarded flows to the kernel conntrack fast path (`flowtable devices=…`); an XDP/AF_XDP fast path is on the roadmap. |
+| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. An optional nftables **flowtable** offloads established forwarded flows to the kernel conntrack fast path (`flowtable devices=…`), and an optional **XDP** fast path (`xdp` directive) drops/rate-limits attack sources at the driver level; an AF_XDP path is on the roadmap. |
 | **Deception** *(default)* | Looks open and alive. Closed ports answer a real TCP handshake and carry on a believable, protocol-aware conversation (SSH, HTTP, SMTP, databases, …) like an interactive honeypot — but nothing real is ever reached, and every probe is logged. |
 | **Closed** | Silently dropped (e.g. management ports). |
 
@@ -48,8 +50,9 @@ deception) while real services stay stable.
   them automatically.
 - **Moving-target & DNS fast-flux, automatic CAKE traffic shaping, REST API + Prometheus
   metrics** *(later milestones)*.
-- **DDoS mitigation** *(sub-projects)* — XDP/eBPF fast drop, SYNPROXY, and ISP-level BGP scrubbing
-  (RTBH, FlowSpec) for operators announcing their own ASN.
+- **DDoS mitigation** — on-box **XDP/eBPF fast drop + per-source rate-limit** (source-keyed, driven
+  by the detection loop; `xdp` directive) and ISP-level BGP scrubbing (RTBH, FlowSpec) for operators
+  announcing their own ASN. SYNPROXY/SYN-cookies and AF_XDP are on the roadmap.
 
 ## Configuration
 
@@ -85,6 +88,12 @@ engine max-concurrent=1024 session-timeout=60 tproxy-port=61000 nfqueue=0
 # forwarded flow traverses (uplink + backend); offload engages only when both
 # directions' devices are present. Omit the directive to keep the nft slow path.
 flowtable devices=eth0,incusbr0
+
+# Optional on-box XDP fast drop / per-source rate-limit (source-keyed: drops the
+# attacker, not the victim). Driven by the detection loop on `blackwalld flow`;
+# operator control via `blackwalld xdp block|unblock|rate-limit|list|stats`.
+# mode auto = native XDP with a generic (skb) fallback. Omit to disable XDP.
+xdp interface=eth0 mode=auto default-rate-limit=1000
 ```
 
 With a `metrics` block, `blackwalld flow` serves `GET /metrics` (Prometheus text) exposing BGP

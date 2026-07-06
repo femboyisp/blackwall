@@ -1,0 +1,25 @@
+[package]
+name = "blackwall-xdp-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/femboyisp/blackwall"
+publish = false
+
+[[bin]]
+name = "blackwall-xdp"
+path = "src/main.rs"
+
+[dependencies]
+blackwall-xdp-common = { path = "../blackwall-xdp-common" }
+aya-ebpf = "0.1.1"
+network-types = "0.0.7"
+
+[profile.dev]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = true
+
+[workspace]

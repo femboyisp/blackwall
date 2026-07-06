@@ -1,25 +1,25 @@
 [package]
-name = "blackwall-state"
+name = "blackwall-xdp"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-blackwall-bgp = { path = "../blackwall-bgp" }
+blackwall-xdp-common = { path = "../blackwall-xdp-common" }
 blackwall-core = { path = "../blackwall-core" }
 blackwall-flow = { path = "../blackwall-flow" }
-blackwall-rtbh = { path = "../blackwall-rtbh" }
-blackwall-xdp = { path = "../blackwall-xdp" }
-async-trait = { workspace = true }
-sqlx = { workspace = true }
-thiserror = { workspace = true }
 ipnet = { workspace = true }
-serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+# aya added in Task 4 (dataplane):
+aya = "0.13.1"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+libc = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "bin/*"]
+# The eBPF crate targets `bpfel-unknown-none` and is built out-of-band by
+# `blackwall-xdp`'s custom `build.rs` (which invokes the pinned nightly
+# toolchain directly); it must never be built as a normal workspace member,
+# so exclude it from the `crates/*` glob.
+exclude = ["crates/blackwall-xdp-ebpf"]
 
 [workspace.package]
 edition = "2021"
