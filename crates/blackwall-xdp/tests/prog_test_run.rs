@@ -22,8 +22,29 @@ const BPF_PROG_TEST_RUN: core::ffi::c_long = 10;
 const XDP_DROP: u32 = 1;
 /// `XDP_PASS` action code.
 const XDP_PASS: u32 = 2;
+/// `XDP_TX` action code (bounce the (rewritten) frame back out the ingress
+/// interface).
+const XDP_TX: u32 = 3;
+
+/// The fixed B2.2 SYN-cookie secret key baked into the eBPF program
+/// (`COOKIE_KEY` in `blackwall-xdp-ebpf`): bytes `0x00..=0x0f`.
+const COOKIE_KEY: [u8; 16] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+];
+/// The fixed B2.2 cookie time base baked into the eBPF program
+/// (`COOKIE_NOW_SECS`), in Unix seconds. Pinning this makes the emitted cookie
+/// deterministic so this test can predict it exactly.
+const COOKIE_NOW_SECS: u64 = 1_000_000;
 
 /// The `BPF_PROG_TEST_RUN` slice of `union bpf_attr`, matching the kernel layout.
+///
+/// The trailing [`BpfProgTestRun::_pad`] is **load-bearing**: the struct's 8-byte
+/// alignment (it holds `u64` fields) would otherwise leave 4 uninitialised
+/// padding bytes after `batch_size`. The kernel's `CHECK_ATTR(BPF_PROG_TEST_RUN)`
+/// requires every byte of the passed attr *after* the last recognised field
+/// (`batch_size`) to be zero, so stale stack bytes in that padding make the
+/// `bpf(2)` call fail with `EINVAL`. Declaring the pad as an explicit zeroed
+/// field guarantees it is cleared.
 #[repr(C)]
 #[derive(Default)]
 struct BpfProgTestRun {
@@ -42,6 +63,7 @@ struct BpfProgTestRun {
     flags: u32,
     cpu: u32,
     batch_size: u32,
+    _pad: u32,
 }
 
 /// Address of a byte slice as a `u64`, without an `as` cast.
@@ -50,8 +72,9 @@ fn slice_addr(bytes: &[u8]) -> u64 {
 }
 
 /// Run `xdp_filter` (identified by `prog_fd`) over `frame` and return its
-/// `XDP_*` action.
-fn run_xdp(prog_fd: i32, frame: &[u8]) -> u32 {
+/// `XDP_*` action together with the (possibly rewritten) output frame the
+/// kernel produced.
+fn run_xdp_out(prog_fd: i32, frame: &[u8]) -> (u32, Vec<u8>) {
     let mut data_out = vec![0u8; 4096];
     let data_out_addr = u64::try_from(data_out.as_mut_ptr().addr()).expect("pointer fits in u64");
     let mut attr = BpfProgTestRun {
@@ -83,9 +106,14 @@ fn run_xdp(prog_fd: i32, frame: &[u8]) -> u32 {
         "BPF_PROG_TEST_RUN failed: {}",
         std::io::Error::last_os_error()
     );
-    // Keep the output buffer alive across the syscall above.
-    drop(data_out);
-    attr.retval
+    let out_len = usize::try_from(attr.data_size_out).expect("out len fits in usize");
+    data_out.truncate(out_len);
+    (attr.retval, data_out)
+}
+
+/// Run `xdp_filter` over `frame` and return only its `XDP_*` action.
+fn run_xdp(prog_fd: i32, frame: &[u8]) -> u32 {
+    run_xdp_out(prog_fd, frame).0
 }
 
 /// Minimal Ethernet + IPv4 frame carrying the given source address.
@@ -129,4 +157,263 @@ fn blocked_source_is_dropped_others_pass() {
 
     let allowed = run_xdp(prog_fd, &eth_ipv4([203, 0, 113, 5]));
     assert_eq!(allowed, XDP_PASS, "non-blocked source should pass");
+}
+
+// --- B2.2: in-kernel SipHash-cookie SYN-ACK via XDP_TX ---
+
+/// Client MAC used in the crafted SYN (becomes the reply's *destination* MAC).
+const CLIENT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+/// Server MAC used in the crafted SYN (becomes the reply's *source* MAC).
+const SERVER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+/// Byte offsets into an `Ethernet + IPv4(IHL5) + TCP` frame (mirrors the eBPF).
+const IP: usize = 14;
+const TCP: usize = 34;
+
+/// Build an `Ethernet + IPv4 + TCP SYN` frame carrying a single 4-byte MSS
+/// option (TCP data-offset 6). Input header checksums are left zero: the eBPF
+/// program never validates them, it only *recomputes* the reply's checksums.
+fn eth_ipv4_tcp_syn(
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    mss: u16,
+) -> Vec<u8> {
+    let mut p = vec![0u8; 14 + 20 + 24];
+    // Ethernet: dst = server, src = client, EtherType IPv4.
+    p[0..6].copy_from_slice(&SERVER_MAC);
+    p[6..12].copy_from_slice(&CLIENT_MAC);
+    p[12] = 0x08;
+    p[13] = 0x00;
+    // IPv4 header (IHL 5).
+    p[IP] = 0x45;
+    let tot_len = u16::try_from(20 + 24).expect("tot_len fits in u16");
+    p[IP + 2..IP + 4].copy_from_slice(&tot_len.to_be_bytes());
+    p[IP + 8] = 64; // TTL
+    p[IP + 9] = 6; // protocol = TCP
+    p[IP + 12..IP + 16].copy_from_slice(&src_ip);
+    p[IP + 16..IP + 20].copy_from_slice(&dst_ip);
+    // TCP header.
+    p[TCP..TCP + 2].copy_from_slice(&src_port.to_be_bytes());
+    p[TCP + 2..TCP + 4].copy_from_slice(&dst_port.to_be_bytes());
+    p[TCP + 4..TCP + 8].copy_from_slice(&seq.to_be_bytes());
+    p[TCP + 12] = 6 << 4; // data offset = 6 words (24 bytes), reserved 0
+    p[TCP + 13] = 0x02; // SYN
+    p[TCP + 14..TCP + 16].copy_from_slice(&64_240u16.to_be_bytes()); // window
+                                                                     // Options: MSS (kind 2, len 4).
+    p[TCP + 20] = 2;
+    p[TCP + 21] = 4;
+    p[TCP + 22..TCP + 24].copy_from_slice(&mss.to_be_bytes());
+    p
+}
+
+/// Build an `Ethernet + IPv4 + TCP ACK` frame (no SYN, one MSS option) — the
+/// eBPF SYN-cookie fast path must ignore it and `XDP_PASS` it unchanged.
+fn eth_ipv4_tcp_ack(src_ip: [u8; 4], dst_ip: [u8; 4]) -> Vec<u8> {
+    let mut p = eth_ipv4_tcp_syn(src_ip, dst_ip, 54_321, 443, 0x1122_3344, 1460);
+    p[TCP + 13] = 0x10; // ACK only, SYN clear
+    p
+}
+
+/// Read a big-endian `u16` at `off`.
+fn be16(p: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([p[off], p[off + 1]])
+}
+
+/// Read a big-endian `u32` at `off`.
+fn be32(p: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]])
+}
+
+/// Fold a ones-complement accumulator to 16 bits.
+fn fold(mut sum: u32) -> u16 {
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    u16::try_from(sum & 0xffff).expect("folded sum is 16-bit")
+}
+
+/// Ones-complement sum of the `len` bytes of `p` starting at `off`
+/// (big-endian 16-bit words, trailing odd byte padded low).
+fn ones_sum(p: &[u8], off: usize, len: usize) -> u32 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i + 2 <= len {
+        sum += u32::from(be16(p, off + i));
+        i += 2;
+    }
+    if i < len {
+        sum += u32::from(p[off + i]) << 8;
+    }
+    sum
+}
+
+/// Split the 128-bit key into the SipHash `(k0, k1)` little-endian pair the way
+/// both the eBPF program and `blackwall_deception::CookieKey` do.
+fn cookie_keys(key: [u8; 16]) -> (u64, u64) {
+    let mut k0 = [0u8; 8];
+    let mut k1 = [0u8; 8];
+    k0.copy_from_slice(&key[0..8]);
+    k1.copy_from_slice(&key[8..16]);
+    (u64::from_le_bytes(k0), u64::from_le_bytes(k1))
+}
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn syn_is_answered_with_a_golden_cookie_syn_ack_via_xdp_tx() {
+    // 4-tuple + MSS chosen so the emitted cookie equals the crate's golden
+    // vector (0x09D7DE6F): the cross-check that the in-kernel cookie is
+    // byte-identical to the userspace one.
+    let client_ip = [203, 0, 113, 7];
+    let server_ip = [198, 51, 100, 1];
+    let client_port = 54_321u16;
+    let server_port = 443u16;
+    let client_seq = 0x1122_3344u32;
+    let client_mss = 1460u16;
+
+    // Expected cookie computed with the SAME shared no_std core the eBPF calls.
+    let (k0, k1) = cookie_keys(COOKIE_KEY);
+    let (expected_cookie, expected_mss) = blackwall_cookie::make_cookie_raw(
+        k0,
+        k1,
+        &client_ip,
+        client_port,
+        &server_ip,
+        server_port,
+        client_mss,
+        COOKIE_NOW_SECS,
+    );
+    assert_eq!(
+        expected_cookie, 0x09D7_DE6F,
+        "test tuple must reproduce the crate's golden cookie"
+    );
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    // Build the input frame *after* loading the program: `BPF_PROG_TEST_RUN`'s
+    // input-buffer handling is sensitive to the process heap layout, and the
+    // existing B1 test loads first for the same reason.
+    let syn = eth_ipv4_tcp_syn(
+        client_ip,
+        server_ip,
+        client_port,
+        server_port,
+        client_seq,
+        client_mss,
+    );
+    let (action, out) = run_xdp_out(prog_fd, &syn);
+
+    assert_eq!(action, XDP_TX, "a SYN must be answered via XDP_TX");
+    assert_eq!(
+        out.len(),
+        syn.len(),
+        "the reply must be the same byte length"
+    );
+
+    // Ethernet: MACs swapped.
+    assert_eq!(
+        &out[0..6],
+        &CLIENT_MAC,
+        "reply dst MAC = original src (client)"
+    );
+    assert_eq!(
+        &out[6..12],
+        &SERVER_MAC,
+        "reply src MAC = original dst (server)"
+    );
+
+    // IPv4: addresses swapped, still TCP.
+    assert_eq!(
+        &out[IP + 12..IP + 16],
+        &server_ip,
+        "reply src IP = original dst"
+    );
+    assert_eq!(
+        &out[IP + 16..IP + 20],
+        &client_ip,
+        "reply dst IP = original src"
+    );
+    assert_eq!(out[IP + 9], 6, "still protocol TCP");
+
+    // TCP: ports swapped, seq = cookie, ack = client_seq + 1, SYN|ACK only.
+    assert_eq!(
+        be16(&out, TCP),
+        server_port,
+        "reply src port = original dst"
+    );
+    assert_eq!(
+        be16(&out, TCP + 2),
+        client_port,
+        "reply dst port = original src"
+    );
+    assert_eq!(
+        be32(&out, TCP + 4),
+        expected_cookie,
+        "reply seq must be the golden SYN-cookie"
+    );
+    assert_eq!(
+        be32(&out, TCP + 8),
+        client_seq.wrapping_add(1),
+        "reply ack must be client_seq + 1"
+    );
+    assert_eq!(out[TCP + 13], 0x12, "flags must be SYN|ACK only");
+    assert_eq!(
+        be16(&out, TCP + 14),
+        65535,
+        "window must be the fixed value"
+    );
+
+    // MSS option echoed back in the reply.
+    assert_eq!(out[TCP + 20], 2, "first option is MSS (kind 2)");
+    assert_eq!(out[TCP + 21], 4, "MSS option length 4");
+    assert_eq!(
+        be16(&out, TCP + 22),
+        expected_mss,
+        "MSS echoes the cookie's MSS"
+    );
+
+    // IPv4 header checksum valid: summing all 20 header bytes folds to 0xFFFF.
+    assert_eq!(
+        fold(ones_sum(&out, IP, 20)),
+        0xFFFF,
+        "IPv4 header checksum must be valid"
+    );
+
+    // TCP checksum valid: pseudo-header + segment folds to 0xFFFF.
+    let seg_len = out.len() - TCP;
+    let mut tcp_sum = 0u32;
+    tcp_sum += ones_sum(&out, IP + 12, 4); // source addr
+    tcp_sum += ones_sum(&out, IP + 16, 4); // dest addr
+    tcp_sum += u32::from(6u16); // protocol
+    tcp_sum += u32::from(u16::try_from(seg_len).expect("seg len fits in u16")); // TCP length
+    tcp_sum += ones_sum(&out, TCP, seg_len);
+    assert_eq!(fold(tcp_sum), 0xFFFF, "TCP checksum must be valid");
+}
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn non_syn_tcp_passes_through_unchanged() {
+    let ack = eth_ipv4_tcp_ack([203, 0, 113, 7], [198, 51, 100, 1]);
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    let (action, out) = run_xdp_out(prog_fd, &ack);
+    assert_eq!(action, XDP_PASS, "a non-SYN TCP segment must pass through");
+    assert_eq!(out, ack, "a passed packet must be byte-for-byte unchanged");
 }
