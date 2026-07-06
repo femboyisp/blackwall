@@ -5,6 +5,7 @@ mod banner;
 mod banner_reload;
 mod banner_source;
 mod conn;
+mod cookie;
 mod emulator;
 mod error;
 mod flux;
@@ -17,6 +18,10 @@ pub use banner::BannerStore;
 pub use banner_reload::SharedBanners;
 pub use banner_source::BannerSource;
 pub use conn::{AsyncStream, DeceptionConn, DeceptionMeta};
+pub use cookie::{
+    check_cookie, check_cookie_raw, make_cookie, make_cookie_raw, mss_index_for, ConnTuple,
+    CookieKey, COUNTER_SHIFT, MSS_TABLE,
+};
 pub use emulator::{EmulatorOutcome, EmulatorRegistry, ServiceEmulator};
 pub use emulators::{
     GenericBannerEmulator, HttpEmulator, MysqlEmulator, PostgresEmulator, RedisEmulator,
