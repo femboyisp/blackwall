@@ -1,11 +1,14 @@
 //! NFQUEUE transport: intercepts packets from the kernel via NetFilter queues
-//! and synthesises ICMP/ICMPv6 echo replies in userspace.
+//! and synthesises ICMP/ICMPv6 echo replies and stateless TCP SYN-cookie
+//! replies in userspace.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nfq::{Queue, Verdict};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+use crate::cookie::{check_cookie, make_cookie, ConnTuple, CookieKey};
 use crate::error::DeceptionError;
 
 use super::packet;
@@ -19,6 +22,15 @@ const IPPROTO_RAW: i32 = 255;
 /// opened with this protocol; the kernel builds the IPv6 header itself.
 const IPPROTO_ICMPV6: i32 = 58;
 
+/// A lookup from a destination port to the banner bytes the stateless tier's
+/// SYN-cookie ACK handler serves for that port.
+///
+/// A `Box<dyn Fn>` rather than a trait: the daemon composes this from
+/// whatever banner store it already holds (e.g. `SharedBanners::current`),
+/// and a closure is the smallest thing that lets it do so without a new
+/// abstraction.
+pub type BannerLookup = Box<dyn Fn(u16) -> Vec<u8> + Send>;
+
 /// Open NFQUEUE number `queue_num` and handle packets in a blocking loop.
 ///
 /// For each packet received:
@@ -26,10 +38,25 @@ const IPPROTO_ICMPV6: i32 = 58;
 ///   IPv4 socket and the original packet is dropped.
 /// - If it is an IPv6 ICMPv6 echo request, an echo reply is sent via a raw
 ///   IPv6 socket and the original packet is dropped.
+/// - If it is a TCP SYN (no ACK) to any destination reaching this queue, a
+///   stateless SYN-cookie SYN-ACK is sent (see [`crate::cookie::make_cookie`]
+///   and [`packet::tcp_syn_ack`]) and the SYN is dropped — the kernel never
+///   sees it, so no connection state or backlog pressure is created.
+/// - If it is a TCP ACK (no SYN) whose acknowledgment number carries a valid
+///   SYN-cookie (see [`crate::cookie::check_cookie`]), a single stateless
+///   banner segment followed by FIN is sent via `banners` and the ACK is
+///   dropped. An ACK with an invalid or missing cookie is dropped silently.
+/// - Any other TCP segment (RST/FIN/data with no matching cookie) is dropped
+///   silently: the stateless tier keeps no state to continue a conversation
+///   with.
 /// - All other packets are accepted unchanged.
 ///
 /// This function runs indefinitely and only returns on error.
-pub fn run(queue_num: u16) -> Result<(), DeceptionError> {
+pub fn run(
+    queue_num: u16,
+    cookie_key: CookieKey,
+    banners: BannerLookup,
+) -> Result<(), DeceptionError> {
     let mut queue = Queue::open().map_err(DeceptionError::Io)?;
     queue.bind(queue_num).map_err(DeceptionError::Io)?;
 
@@ -56,30 +83,97 @@ pub fn run(queue_num: u16) -> Result<(), DeceptionError> {
         let mut msg = queue.recv().map_err(DeceptionError::Io)?;
         let pkt = msg.get_payload().to_owned();
 
-        let version = pkt.first().map(|b| b >> 4);
-        match version {
-            Some(4) => {
-                if let Some(reply) = packet::icmp_echo_reply(&pkt) {
-                    send_raw4(&raw4, &reply)?;
-                    msg.set_verdict(Verdict::Drop);
-                } else {
-                    msg.set_verdict(Verdict::Accept);
+        let verdict = if let Some(info) = packet::parse_tcp_request(&pkt) {
+            handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &raw4, &raw6)?
+        } else {
+            match pkt.first().map(|b| b >> 4) {
+                Some(4) => {
+                    if let Some(reply) = packet::icmp_echo_reply(&pkt) {
+                        send_raw4(&raw4, &reply)?;
+                        Verdict::Drop
+                    } else {
+                        Verdict::Accept
+                    }
                 }
-            }
-            Some(6) => {
-                if let Some(reply) = packet::icmpv6_echo_reply(&pkt) {
-                    send_raw6(&raw6, &reply)?;
-                    msg.set_verdict(Verdict::Drop);
-                } else {
-                    msg.set_verdict(Verdict::Accept);
+                Some(6) => {
+                    if let Some(reply) = packet::icmpv6_echo_reply(&pkt) {
+                        send_raw6(&raw6, &reply)?;
+                        Verdict::Drop
+                    } else {
+                        Verdict::Accept
+                    }
                 }
+                _ => Verdict::Accept,
             }
-            _ => {
-                msg.set_verdict(Verdict::Accept);
+        };
+
+        msg.set_verdict(verdict);
+        queue.verdict(msg).map_err(DeceptionError::Io)?;
+    }
+}
+
+/// Dispatch a parsed TCP segment (`info`) to the stateless SYN-cookie state
+/// machine, sending any reply via `raw4`/`raw6` and returning the verdict for
+/// the original packet.
+///
+/// - SYN (no ACK): mint a cookie and reply with a SYN-ACK.
+/// - ACK (no SYN): validate the cookie; on success, reply with a banner+FIN.
+/// - Anything else (or an ACK with an invalid cookie): drop silently.
+///
+/// The tuple used for both minting and validating the cookie is built
+/// directly from the segment's own src/dst/ports: on the returning ACK these
+/// are the same orientation (client src, server dst) as they were on the
+/// original SYN, so no swap is needed here (only the *replies* swap
+/// src/dst).
+fn handle_tcp(
+    pkt: &[u8],
+    info: &packet::TcpRequestInfo,
+    cookie_key: &CookieKey,
+    banners: &(dyn Fn(u16) -> Vec<u8> + Send),
+    raw4: &Socket,
+    raw6: &Socket,
+) -> Result<Verdict, DeceptionError> {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let tuple = ConnTuple {
+        src: info.src,
+        src_port: info.src_port,
+        dst: info.dst,
+        dst_port: info.dst_port,
+    };
+
+    if info.syn && !info.ack {
+        let (cookie_seq, mss) = make_cookie(cookie_key, &tuple, info.client_mss, now_secs);
+        if let Some(reply) = packet::tcp_syn_ack(pkt, cookie_seq, mss) {
+            send_reply(&reply, raw4, raw6)?;
+        }
+        return Ok(Verdict::Drop);
+    }
+
+    if info.ack && !info.syn {
+        if check_cookie(cookie_key, &tuple, info.ack_seq, now_secs).is_some() {
+            let banner = banners(info.dst_port);
+            if let Some(reply) = packet::tcp_banner_fin(pkt, &banner) {
+                send_reply(&reply, raw4, raw6)?;
             }
         }
+        return Ok(Verdict::Drop);
+    }
 
-        queue.verdict(msg).map_err(DeceptionError::Io)?;
+    // RST/FIN/data with no matching cookie: nothing to continue statelessly.
+    Ok(Verdict::Drop)
+}
+
+/// Send a fully-built reply datagram (`reply`) via whichever raw socket
+/// matches its IP version.
+fn send_reply(reply: &[u8], raw4: &Socket, raw6: &Socket) -> Result<(), DeceptionError> {
+    match reply.first().map(|b| b >> 4) {
+        Some(4) => send_raw4(raw4, reply),
+        Some(6) => send_raw6(raw6, reply),
+        _ => Ok(()),
     }
 }
 

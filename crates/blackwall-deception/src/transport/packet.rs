@@ -1,6 +1,8 @@
 //! ICMP echo reply and stateless TCP SYN-cookie packet construction from raw
 //! IPv4/IPv6 packets.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use etherparse::{
     Icmpv4Header, Icmpv4Type, Icmpv6Header, Icmpv6Type, Ipv4Header, Ipv6Header, PacketHeaders,
     TcpHeader, TcpOptionElement, TransportHeader,
@@ -12,6 +14,88 @@ use etherparse::{
 /// its own, so this is purely cosmetic (it must merely look like a real
 /// server to the client).
 const STATELESS_WINDOW: u16 = 65535;
+
+/// MSS assumed for a SYN that carries no MSS option, used by
+/// [`parse_tcp_request`].
+pub const DEFAULT_CLIENT_MSS: u16 = 1460;
+
+/// The fields the stateless NFQUEUE dispatcher needs to route an incoming TCP
+/// segment: its identifying 4-tuple, the flags relevant to the SYN-cookie
+/// state machine, the segment's acknowledgment number, and (for a SYN) the
+/// client's advertised MSS.
+///
+/// Pure and side-effect free; the NFQUEUE transport (coverage-excluded I/O)
+/// calls this to decide which stateless reply, if any, to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpRequestInfo {
+    /// Client (source) address.
+    pub src: IpAddr,
+    /// Client (source) port.
+    pub src_port: u16,
+    /// Server (destination) address.
+    pub dst: IpAddr,
+    /// Server (destination) port.
+    pub dst_port: u16,
+    /// Whether the SYN flag is set.
+    pub syn: bool,
+    /// Whether the ACK flag is set.
+    pub ack: bool,
+    /// The segment's acknowledgment number. Only meaningful when `ack` is
+    /// set.
+    pub ack_seq: u32,
+    /// The client's advertised MSS option, or [`DEFAULT_CLIENT_MSS`] if the
+    /// segment carries no MSS option (only meaningful on a SYN).
+    pub client_mss: u16,
+}
+
+/// Parse a raw IPv4 or IPv6 datagram carrying a TCP segment into a
+/// [`TcpRequestInfo`], for the stateless dispatcher to route.
+///
+/// Returns `None` if `request` is not a well-formed IPv4/IPv6 datagram
+/// carrying a TCP segment.
+#[must_use]
+pub fn parse_tcp_request(request: &[u8]) -> Option<TcpRequestInfo> {
+    let headers = PacketHeaders::from_ip_slice(request).ok()?;
+    let net = headers.net?;
+
+    let (src, dst) = if let Some((ip4, _)) = net.ipv4_ref() {
+        (
+            IpAddr::V4(Ipv4Addr::from(ip4.source)),
+            IpAddr::V4(Ipv4Addr::from(ip4.destination)),
+        )
+    } else if let Some((ip6, _)) = net.ipv6_ref() {
+        (
+            IpAddr::V6(Ipv6Addr::from(ip6.source)),
+            IpAddr::V6(Ipv6Addr::from(ip6.destination)),
+        )
+    } else {
+        return None;
+    };
+
+    let tcp = match headers.transport? {
+        TransportHeader::Tcp(h) => h,
+        _ => return None,
+    };
+
+    let client_mss = tcp
+        .options_iterator()
+        .find_map(|opt| match opt {
+            Ok(TcpOptionElement::MaximumSegmentSize(mss)) => Some(mss),
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_CLIENT_MSS);
+
+    Some(TcpRequestInfo {
+        src,
+        src_port: tcp.source_port,
+        dst,
+        dst_port: tcp.destination_port,
+        syn: tcp.syn,
+        ack: tcp.ack,
+        ack_seq: tcp.acknowledgment_number,
+        client_mss,
+    })
+}
 
 /// Parse a raw IPv4 packet containing an ICMP echo request and return the
 /// corresponding echo reply bytes, with source and destination addresses
@@ -746,6 +830,64 @@ mod tests {
         let request = build_icmpv4_request([10, 0, 0, 1], [10, 0, 0, 2], 1, 1, b"");
         assert!(
             tcp_banner_fin(&request, b"banner").is_none(),
+            "non-TCP packet should return None"
+        );
+    }
+
+    #[test]
+    fn parse_tcp_request_reads_syn_tuple_and_mss() {
+        let client = [10, 0, 0, 1];
+        let server = [10, 0, 0, 2];
+        let request = build_tcp_syn_v4(client, server, 54_321, 443, 1_000);
+
+        let info = parse_tcp_request(&request).expect("should parse");
+        assert_eq!(info.src, IpAddr::V4(Ipv4Addr::from(client)));
+        assert_eq!(info.dst, IpAddr::V4(Ipv4Addr::from(server)));
+        assert_eq!(info.src_port, 54_321);
+        assert_eq!(info.dst_port, 443);
+        assert!(info.syn && !info.ack);
+        // PacketBuilder's `.syn()` sets no MSS option, so the default applies.
+        assert_eq!(info.client_mss, DEFAULT_CLIENT_MSS);
+    }
+
+    #[test]
+    fn parse_tcp_request_reads_explicit_mss_option() {
+        let request_headers = PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64)
+            .tcp(54_321, 443, 1_000, 65535)
+            .syn()
+            .options(&[TcpOptionElement::MaximumSegmentSize(1_360)])
+            .unwrap();
+        let mut request = Vec::new();
+        request_headers.write(&mut request, &[]).unwrap();
+
+        let info = parse_tcp_request(&request).expect("should parse");
+        assert_eq!(info.client_mss, 1_360);
+    }
+
+    #[test]
+    fn parse_tcp_request_reads_ack_flags_and_ack_seq() {
+        let request = build_tcp_ack_v4([10, 0, 0, 1], [10, 0, 0, 2], 1234, 80, 1_000, 9_000, &[]);
+        let info = parse_tcp_request(&request).expect("should parse");
+        assert!(info.ack && !info.syn);
+        assert_eq!(info.ack_seq, 9_000);
+    }
+
+    #[test]
+    fn parse_tcp_request_reads_v6_tuple() {
+        let client = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let server = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let request = build_tcp_syn_v6(client, server, 54_321, 443, 2_000);
+
+        let info = parse_tcp_request(&request).expect("should parse");
+        assert_eq!(info.src, IpAddr::V6(Ipv6Addr::from(client)));
+        assert_eq!(info.dst, IpAddr::V6(Ipv6Addr::from(server)));
+    }
+
+    #[test]
+    fn parse_tcp_request_returns_none_for_non_tcp() {
+        let request = build_icmpv4_request([10, 0, 0, 1], [10, 0, 0, 2], 1, 1, b"");
+        assert!(
+            parse_tcp_request(&request).is_none(),
             "non-TCP packet should return None"
         );
     }
