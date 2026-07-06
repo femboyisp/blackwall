@@ -66,19 +66,6 @@ jobs:
           sudo cp /tmp/host-sflow/src/Linux/hsflowd /tmp/host-sflow/src/Linux/mod_pcap.so /opt/host-sflow/
       - name: Build the lab + interop tests (pre-built binaries the gates run directly)
         run: cargo build -p blackwall-lab && cargo build -p blackwall-trafficgen && bash scripts/build-lab-tests.sh
-      # Run the deterministic XDP BPF_PROG_TEST_RUN gate first — it is fast and
-      # must not sit behind the slower, occasionally-flaky scenario gates below.
-      - name: Run the lab gate (xdp prog-test-run)
-        timeout-minutes: 6
-        run: |
-          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
-          exec 3>&1 4>&2 >lab-gate.log 2>&1
-          # Build the test binary as the normal user (needs nightly+bpf-linker for the eBPF build.rs).
-          # `sudo cargo test` fails on GH runners: root has no default rustup toolchain.
-          BIN=$(cargo test -p blackwall-xdp --test prog_test_run --no-run --message-format=json \
-            | grep -o '"executable":"[^"]*prog_test_run[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
-          echo "test binary: $BIN"
-          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture
       - name: Run the lab gate
         timeout-minutes: 6
         run: |
@@ -175,6 +162,17 @@ jobs:
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-auto-bird.kdl lab-junit-flowspec-auto.xml
+      - name: Run the lab gate (xdp prog-test-run)
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Build the test binary as the normal user (needs nightly+bpf-linker for the eBPF build.rs).
+          # `sudo cargo test` fails on GH runners: root has no default rustup toolchain.
+          BIN=$(cargo test -p blackwall-xdp --test prog_test_run --no-run --message-format=json \
+            | grep -o '"executable":"[^"]*prog_test_run[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
+          echo "test binary: $BIN"
+          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture
       - name: Upload JUnit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
