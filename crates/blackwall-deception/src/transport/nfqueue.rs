@@ -49,6 +49,12 @@ pub type BannerLookup = Box<dyn Fn(u16) -> Vec<u8> + Send>;
 /// - Any other TCP segment (RST/FIN/data with no matching cookie) is dropped
 ///   silently: the stateless tier keeps no state to continue a conversation
 ///   with.
+/// - If it is an IPv4/IPv6 UDP datagram, the banner for its destination port
+///   is looked up via `banners` and reflected back (truncated to at most the
+///   request's payload length, see [`packet::udp_response`]) and the
+///   datagram is dropped. A datagram with an empty payload (nothing safely
+///   reflectable) is dropped without a reply. UDP is always stateless: it is
+///   never accepted into the host stack for a deception port.
 /// - All other packets are accepted unchanged.
 ///
 /// This function runs indefinitely and only returns on error.
@@ -85,6 +91,8 @@ pub fn run(
 
         let verdict = if let Some(info) = packet::parse_tcp_request(&pkt) {
             handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &raw4, &raw6)?
+        } else if let Some(info) = packet::parse_udp_request(&pkt) {
+            handle_udp(&pkt, &info, banners.as_ref(), &raw4, &raw6)?
         } else {
             match pkt.first().map(|b| b >> 4) {
                 Some(4) => {
@@ -164,6 +172,31 @@ fn handle_tcp(
     }
 
     // RST/FIN/data with no matching cookie: nothing to continue statelessly.
+    Ok(Verdict::Drop)
+}
+
+/// Dispatch a parsed UDP datagram (`info`) to the stateless reflector,
+/// sending any reply via `raw4`/`raw6` and returning the verdict for the
+/// original packet.
+///
+/// Always drops the original datagram: the stateless tier never lets a
+/// deception-port UDP datagram reach the host stack, and never keeps
+/// per-datagram state. The banner for the datagram's destination port is
+/// looked up via `banners` and reflected back through
+/// [`packet::udp_response`], which enforces the reflection-amplification
+/// guard (the reply is truncated to at most the request's payload length,
+/// and a zero-byte request payload yields no reply at all).
+fn handle_udp(
+    pkt: &[u8],
+    info: &packet::UdpRequestInfo,
+    banners: &(dyn Fn(u16) -> Vec<u8> + Send),
+    raw4: &Socket,
+    raw6: &Socket,
+) -> Result<Verdict, DeceptionError> {
+    let banner = banners(info.dst_port);
+    if let Some(reply) = packet::udp_response(pkt, &banner) {
+        send_reply(&reply, raw4, raw6)?;
+    }
     Ok(Verdict::Drop)
 }
 
