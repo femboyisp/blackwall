@@ -11,7 +11,7 @@
 //! and consumed by the eBPF program in `blackwall-xdp-ebpf`; this loader mirrors
 //! them exactly. In particular the 16-byte `RATE` key is built byte-identically
 //! to the eBPF side (v4 zero-padded into the low four bytes) so rate-limit
-//! lookups actually match — see [`rate_key`].
+//! lookups actually match — see the `rate_key` helper.
 
 use crate::keys::{lpm_key, LpmKey};
 use crate::manager::{XdpExecError, XdpExecutor};

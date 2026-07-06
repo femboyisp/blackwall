@@ -108,9 +108,31 @@ Also: Postgres tables (`detections`, `rtbh_blackholes`, `flowspec_rules`, the
 - The config's `interface` must be the real ingress device (the daemon now
   refuses to start if it doesn't exist).
 
+## On-box XDP fast drop (optional)
+An `xdp` config directive turns on an in-kernel XDP program on the uplink that
+drops and per-source rate-limits attack traffic at the driver level, ahead of
+the nftables classify path:
+```
+xdp interface=eth0 mode=auto default-rate-limit=1000
+```
+- **Source-keyed:** it drops/limits the *attacker source*, not the victim —
+  preserving the victim's other traffic (the on-box complement to whole-IP BGP
+  RTBH). Detections drive per-source rate-limits automatically; `blackwalld xdp
+  block|unblock|rate-limit|list|stats` is the operator control plane (intent is
+  written to Postgres and applied by the running `flow` daemon, like `rtbh`).
+- **Prerequisites:** a kernel with XDP (any modern Linux) and, for `mode=native`,
+  a NIC driver with native XDP support. `mode=auto` (the default) tries native
+  and falls back to generic (skb) mode with a warning, so it works on veth/less
+  capable NICs too. Attach is **non-fatal** — if XDP can't load, the daemon logs
+  a warning and continues on the nft slow path.
+- **Metrics:** `blackwall_xdp_packets_dropped_total{reason}`, `_passed_total`,
+  `_blocked_entries`, `_ratelimit_entries` on `/metrics`.
+
 ## Not yet implemented (know before you rely on it)
-- **No XDP fast path yet.** An optional nftables flowtable (`flowtable devices=…`)
-  offloads established forwarded real-service flows to the kernel conntrack fast
-  path, but there is no XDP/AF_XDP kernel-bypass offload yet (sub-project B).
-  Fine for moderate rates, not for line-rate volumetric attack traffic *on the
-  box* (BGP mitigation pushes that to your router instead).
+- **No SYN-cookie / AF_XDP acceleration yet.** B1 ships XDP source-drop +
+  rate-limit; in-XDP SYN cookies and a zero-copy AF_XDP userspace path are
+  B2–B3 (sub-project B). The nftables flowtable (`flowtable devices=…`) offloads
+  established forwarded real-service flows, but there is no kernel-bypass offload
+  for the deception/inspection path yet. Fine for moderate rates and on-box
+  source-drop; line-rate volumetric attack traffic is still best pushed to your
+  router via BGP mitigation.
