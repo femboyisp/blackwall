@@ -50,6 +50,33 @@ fn first_ipv4_of(iface: &str) -> std::net::Ipv4Addr {
     cidr.split('/').next().unwrap().parse().expect("parse ipv4")
 }
 
+/// The first non-link-local IPv6 address configured on `iface` (e.g. the ULA
+/// the lab allocated from the link's `subnet6`). Link-local `fe80::/10`
+/// addresses are skipped: the scanner targets the routable deception address.
+fn first_ipv6_of(iface: &str) -> std::net::Ipv6Addr {
+    let out = std::process::Command::new("ip")
+        .args(["-o", "-6", "addr", "show", "dev", iface])
+        .output()
+        .expect("run `ip -o -6 addr show`");
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        // "<idx>: <iface>    inet6 fd00::1/64 scope global ..."
+        let Some(cidr) = line.split_whitespace().skip_while(|w| *w != "inet6").nth(1) else {
+            continue;
+        };
+        let Some(addr): Option<std::net::Ipv6Addr> =
+            cidr.split('/').next().and_then(|a| a.parse().ok())
+        else {
+            continue;
+        };
+        // Skip fe80::/10 link-local; the deception address is the ULA/global one.
+        if addr.segments()[0] & 0xffc0 != 0xfe80 {
+            return addr;
+        }
+    }
+    panic!("no non-link-local IPv6 address on {iface}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs CAP_NET_ADMIN + a netns (nft + TPROXY); run in the lab"]
 async fn serves_deception_banner() {
@@ -264,5 +291,77 @@ fn serves_stateless_syn_cookie() {
     // Real end-to-end responder: opens the NFQUEUE + raw sockets and handles
     // SYN-cookie mint/validate + banner+FIN forever (the lab kills it at
     // teardown). This call blocks; it is not a stub.
+    run_nfqueue(policy.engine.nfqueue_num, cookie_key, banners).expect("nfqueue responder");
+}
+
+/// The IPv6 sibling of [`serves_stateless_syn_cookie`] — the #128 gate.
+///
+/// Same shape, but the stateless-tier port is reached over IPv6. Before #128
+/// the v6 TCP SYN-cookie replies were pushed through an `IPPROTO_ICMPV6` raw
+/// socket (which can only carry ICMPv6), so no SYN-ACK ever reached the wire
+/// and the handshake could not complete; the fix sends each L4 protocol through
+/// its own IPv6 raw socket with the source pinned via `IPV6_PKTINFO`. The
+/// scenario's key assertion is a legit v6 `/dev/tcp` connect receiving the
+/// marker banner, proving the v6 cookie handshake + fixed send path work end to
+/// end. The policy is dual-stack only so nft's `real_v4`/`real_v6` sets are
+/// both non-empty (an empty set makes `nft` reject the ruleset); the traffic
+/// under test is v6.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + a netns (nft + raw sockets); run in the lab"]
+fn serves_stateless_syn_cookie_v6() {
+    let iface = first_non_loopback_iface();
+    let addr6 = first_ipv6_of(&iface);
+
+    // Mirror `serves_stateless_syn_cookie`, but the managed prefix under test is
+    // the victim's own v6 /128 (what the scanner hits over IPv6). The lab link
+    // is v6-only (the lab allocates one address family per link), so the iface
+    // has no v4 address; a dummy static v4 prefix + owned address exists only so
+    // nft's `real_v4` set is non-empty (an empty set makes `nft` reject the
+    // ruleset) — the mirror of the dummy v6 in the v4 test. Port 8080 is left
+    // unmatched -> deception -> routed by `stateless_tcp_ports` to the NFQUEUE;
+    // the one benign declared service uses 9000 so 8080 never classifies as a
+    // real (host-accepted) port.
+    let dummy_v4: std::net::Ipv4Addr = "192.0.2.1".parse().expect("dummy v4");
+    let policy = Policy {
+        interface: iface,
+        prefixes: vec![
+            "192.0.2.0/24".parse().expect("v4 prefix"),
+            format!("{addr6}/128").parse().expect("v6 prefix"),
+        ],
+        default_state: PortState::Deception,
+        tenants: vec![Tenant {
+            name: "lab".to_owned(),
+            owned: vec![IpAddr::V4(dummy_v4), IpAddr::V6(addr6)],
+            allows: vec![AllowRule {
+                proto: L4Proto::Tcp,
+                port: 9000,
+                target: ServiceTarget::Host,
+                scope: None,
+            }],
+        }],
+        shaping: Vec::new(),
+        banner_flux: None,
+        dns_flux: None,
+        rtbh: None,
+        flowspec: None,
+        metrics_listen: None,
+        engine: blackwall_core::EngineConfig::default(),
+        flowtable: None,
+        xdp: None,
+        stateless_tcp_ports: vec![8080],
+    };
+
+    blackwall_nft::apply(&policy).expect("nft apply");
+
+    let cookie_key = CookieKey::new([
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10,
+    ]);
+    let banners: blackwall_deception::transport::BannerLookup =
+        Box::new(|_port: u16| SYNCOOKIE_BANNER.to_vec());
+
+    let _ = std::fs::remove_file(SYNCOOKIE_READY_SENTINEL); // fresh for the scenario's file-present probe
+    std::fs::write(SYNCOOKIE_READY_SENTINEL, b"ok").expect("write sentinel");
+
     run_nfqueue(policy.engine.nfqueue_num, cookie_key, banners).expect("nfqueue responder");
 }

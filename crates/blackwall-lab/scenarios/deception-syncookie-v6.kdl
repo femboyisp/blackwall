@@ -1,0 +1,42 @@
+// Stateless SYN-cookie tier end-to-end gate over IPv6 (issue #128): a real
+// client's TCP handshake to a stateless-tier port reached over IPv6 gets a
+// SipHash-cookie SYN-ACK and receives the banner, proving the full mint ->
+// validate -> banner+FIN cycle works over real nft + raw v6 sockets. Before
+// #128 the v6 TCP replies were pushed through an IPPROTO_ICMPV6 raw socket
+// (which can only carry ICMPv6), so no SYN-ACK ever reached the wire; the fix
+// sends each L4 protocol through its own IPv6 raw socket with the source
+// pinned via IPV6_PKTINFO. trafficgen's spoofed-SYN flood is IPv4-only, so
+// this gate proves the legit v6 handshake (the actual #128 regression) rather
+// than the flood-absorption already covered by the v4 `deception-syncookie`.
+//
+// The link is declared attacker-first so the victim receives the second host
+// of `fd00::/64` (`fd00::1`, a clean unicast address) rather than the first
+// (`fd00::`, the all-zeros subnet-router address). The link is v6-only: the lab
+// allocates a single address family per link, so declaring a v4 subnet here
+// would suppress v6 allocation entirely — the interop test supplies a dummy
+// static v4 prefix of its own so nft's `real_v4` set is non-empty.
+topology "deception-syncookie-v6" {
+    node "victim" {
+        run "engine" \
+            cmd="target/debug/lab-tests/blackwall-deception-interop serves_stateless_syn_cookie_v6 --ignored --nocapture"
+    }
+    node "attacker"
+    link "attacker" "victim" subnet6="fd00::/64"
+}
+
+scenario "stateless-cookie-v6-serves" {
+    // The stateless tier has no listening socket (no `port-open:` probe is
+    // possible), so wait on the file-present sentinel the interop test writes
+    // right before it starts the (forever-blocking) NFQUEUE responder.
+    step wait   node="victim" \
+         until="file-present:/run/blackwall-lab/syncookie-ready" timeout="20s"
+    // The key assertion: a legit IPv6 TCP connect from the attacker to the
+    // stateless port receives the marker banner — proving the full cookie
+    // handshake (client SYN -> cookie SYN-ACK -> client ACK -> cookie validated
+    // -> banner+FIN) worked end to end over IPv6 and the fixed send path put
+    // the v6 TCP replies on the wire. A short retry loop absorbs any brief
+    // window before the responder's first packet is serviced.
+    step assert node="attacker" \
+         cmd="timeout 15 bash -c 'for i in $(seq 1 12); do exec 3<>/dev/tcp/fd00::1/8080 && head -c 40 <&3 && break; sleep 1; done'" \
+         contains="STATELESS-COOKIE-OK" timeout="20s"
+}
