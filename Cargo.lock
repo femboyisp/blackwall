@@ -209,6 +209,7 @@ dependencies = [
  "blackwall-core",
  "blackwall-nft",
  "etherparse",
+ "libc",
  "nfq",
  "siphasher",
  "socket2 0.5.10",

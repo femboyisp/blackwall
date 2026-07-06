@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 arc-swap = { workspace = true }
 socket2 = { workspace = true }
+libc = { workspace = true }
 etherparse = { workspace = true }
 nfq = { workspace = true }
 siphasher = "1.0.3"

@@ -2,7 +2,10 @@
 //! and synthesises ICMP/ICMPv6 echo replies and stateless TCP SYN-cookie
 //! replies in userspace.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::ffi::c_void;
+use std::mem;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::os::fd::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nfq::{Queue, Verdict};
@@ -16,11 +19,37 @@ use super::packet;
 /// `IPPROTO_RAW` (255) — raw IP socket that accepts a hand-crafted IP header.
 const IPPROTO_RAW: i32 = 255;
 
-/// `IPPROTO_ICMPV6` (58) — ICMPv6 raw socket protocol number.
+/// `IPPROTO_TCP` (6) — TCP protocol number (IPv6 raw socket / next-header).
+const IPPROTO_TCP: i32 = 6;
+
+/// `IPPROTO_UDP` (17) — UDP protocol number (IPv6 raw socket / next-header).
+const IPPROTO_UDP: i32 = 17;
+
+/// `IPPROTO_ICMPV6` (58) — ICMPv6 raw socket protocol number / next-header.
 ///
-/// Linux does not support `IPV6_HDRINCL`, so ICMPv6 raw sockets must be
-/// opened with this protocol; the kernel builds the IPv6 header itself.
+/// Linux does not support `IPV6_HDRINCL`, so IPv6 raw sockets must be opened
+/// with the L4 protocol they will send; the kernel builds the IPv6 header
+/// itself and sets its Next Header field from the socket's protocol.
 const IPPROTO_ICMPV6: i32 = 58;
+
+/// The raw sockets the responder uses to inject replies onto the wire.
+///
+/// IPv4 uses a single header-included `IPPROTO_RAW` socket: the reply carries
+/// its own hand-built IPv4 header. IPv6 has no `IPV6_HDRINCL`, so each L4
+/// protocol needs its own raw socket opened with that protocol number — an
+/// `IPPROTO_ICMPV6` socket can only emit ICMPv6, so TCP and UDP v6 replies need
+/// their own `IPPROTO_TCP`/`IPPROTO_UDP` sockets (issue #128). The reply's
+/// source address is pinned per-send with `IPV6_PKTINFO` (see [`send_v6_l4`]).
+struct RawSockets {
+    /// IPv4, header-included (`IPPROTO_RAW`).
+    v4: Socket,
+    /// IPv6 `IPPROTO_TCP` — stateless SYN-cookie SYN-ACK and banner+FIN.
+    v6_tcp: Socket,
+    /// IPv6 `IPPROTO_UDP` — stateless UDP reflection replies.
+    v6_udp: Socket,
+    /// IPv6 `IPPROTO_ICMPV6` — ICMPv6 echo replies.
+    v6_icmp: Socket,
+}
 
 /// A lookup from a destination port to the banner bytes the stateless tier's
 /// SYN-cookie ACK handler serves for that port.
@@ -67,23 +96,33 @@ pub fn run(
     queue.bind(queue_num).map_err(DeceptionError::Io)?;
 
     // Pre-open raw sockets for sending replies.
-    let raw4 = Socket::new_raw(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
+    let v4 = Socket::new_raw(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
         .map_err(DeceptionError::Io)?;
-    raw4.set_header_included_v4(true)
+    v4.set_header_included_v4(true)
         .map_err(DeceptionError::Io)?;
 
-    // Linux ICMPv6 raw sockets have no IPV6_HDRINCL; the kernel builds the
-    // IPv6 header from routing and the destination passed to sendto(2).
-    // We therefore open the socket with IPPROTO_ICMPV6 (58) and send only
-    // the ICMPv6 payload (bytes after the 40-byte IPv6 header).
-    // TODO(sub-project B / M3): use IPV6_PKTINFO to bind the source address
-    // to the specific deception IP rather than letting the kernel choose.
-    let raw6 = Socket::new_raw(
+    // Linux IPv6 raw sockets have no IPV6_HDRINCL: the kernel builds the IPv6
+    // header itself and sets its Next Header field from the socket's protocol.
+    // A single IPPROTO_ICMPV6 socket can therefore only emit ICMPv6 messages,
+    // so the stateless TCP (SYN-cookie SYN-ACK, banner+FIN) and UDP replies
+    // each need a raw socket opened with their own protocol number (#128). The
+    // per-send source address is pinned with IPV6_PKTINFO (see `send_v6_l4`).
+    let v6_tcp = Socket::new_raw(Domain::IPV6, Type::RAW, Some(Protocol::from(IPPROTO_TCP)))
+        .map_err(DeceptionError::Io)?;
+    let v6_udp = Socket::new_raw(Domain::IPV6, Type::RAW, Some(Protocol::from(IPPROTO_UDP)))
+        .map_err(DeceptionError::Io)?;
+    let v6_icmp = Socket::new_raw(
         Domain::IPV6,
         Type::RAW,
         Some(Protocol::from(IPPROTO_ICMPV6)),
     )
     .map_err(DeceptionError::Io)?;
+    let socks = RawSockets {
+        v4,
+        v6_tcp,
+        v6_udp,
+        v6_icmp,
+    };
 
     loop {
         let mut msg = queue.recv().map_err(DeceptionError::Io)?;
@@ -100,16 +139,16 @@ pub fn run(
         // errors are logged and the packet is dropped, not propagated;
         // only queue-level errors (`recv`/`verdict`) are fatal.
         let verdict = if let Some(info) = packet::parse_tcp_request(&pkt) {
-            handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &raw4, &raw6)
+            handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &socks)
                 .unwrap_or_else(|e| drop_and_log("tcp", &e))
         } else if let Some(info) = packet::parse_udp_request(&pkt) {
-            handle_udp(&pkt, &info, banners.as_ref(), &raw4, &raw6)
+            handle_udp(&pkt, &info, banners.as_ref(), &socks)
                 .unwrap_or_else(|e| drop_and_log("udp", &e))
         } else {
             match pkt.first().map(|b| b >> 4) {
                 Some(4) => {
                     if let Some(reply) = packet::icmp_echo_reply(&pkt) {
-                        if let Err(e) = send_raw4(&raw4, &reply) {
+                        if let Err(e) = send_reply(&reply, &socks) {
                             drop_and_log("icmp", &e);
                         }
                         Verdict::Drop
@@ -119,7 +158,7 @@ pub fn run(
                 }
                 Some(6) => {
                     if let Some(reply) = packet::icmpv6_echo_reply(&pkt) {
-                        if let Err(e) = send_raw6(&raw6, &reply) {
+                        if let Err(e) = send_reply(&reply, &socks) {
                             drop_and_log("icmpv6", &e);
                         }
                         Verdict::Drop
@@ -154,8 +193,7 @@ fn handle_tcp(
     info: &packet::TcpRequestInfo,
     cookie_key: &CookieKey,
     banners: &(dyn Fn(u16) -> Vec<u8> + Send),
-    raw4: &Socket,
-    raw6: &Socket,
+    socks: &RawSockets,
 ) -> Result<Verdict, DeceptionError> {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -172,7 +210,7 @@ fn handle_tcp(
     if info.syn && !info.ack {
         let (cookie_seq, mss) = make_cookie(cookie_key, &tuple, info.client_mss, now_secs);
         if let Some(reply) = packet::tcp_syn_ack(pkt, cookie_seq, mss) {
-            send_reply(&reply, raw4, raw6)?;
+            send_reply(&reply, socks)?;
         }
         return Ok(Verdict::Drop);
     }
@@ -181,7 +219,7 @@ fn handle_tcp(
         if check_cookie(cookie_key, &tuple, info.ack_seq, now_secs).is_some() {
             let banner = banners(info.dst_port);
             if let Some(reply) = packet::tcp_banner_fin(pkt, &banner) {
-                send_reply(&reply, raw4, raw6)?;
+                send_reply(&reply, socks)?;
             }
         }
         return Ok(Verdict::Drop);
@@ -206,12 +244,11 @@ fn handle_udp(
     pkt: &[u8],
     info: &packet::UdpRequestInfo,
     banners: &(dyn Fn(u16) -> Vec<u8> + Send),
-    raw4: &Socket,
-    raw6: &Socket,
+    socks: &RawSockets,
 ) -> Result<Verdict, DeceptionError> {
     let banner = banners(info.dst_port);
     if let Some(reply) = packet::udp_response(pkt, &banner) {
-        send_reply(&reply, raw4, raw6)?;
+        send_reply(&reply, socks)?;
     }
     Ok(Verdict::Drop)
 }
@@ -229,11 +266,11 @@ fn drop_and_log(kind: &str, err: &DeceptionError) -> Verdict {
 }
 
 /// Send a fully-built reply datagram (`reply`) via whichever raw socket
-/// matches its IP version.
-fn send_reply(reply: &[u8], raw4: &Socket, raw6: &Socket) -> Result<(), DeceptionError> {
+/// matches its IP version (and, for IPv6, its L4 protocol).
+fn send_reply(reply: &[u8], socks: &RawSockets) -> Result<(), DeceptionError> {
     match reply.first().map(|b| b >> 4) {
-        Some(4) => send_raw4(raw4, reply),
-        Some(6) => send_raw6(raw6, reply),
+        Some(4) => send_raw4(&socks.v4, reply),
+        Some(6) => send_raw6(socks, reply),
         _ => Ok(()),
     }
 }
@@ -250,25 +287,136 @@ fn send_raw4(sock: &Socket, buf: &[u8]) -> Result<(), DeceptionError> {
     Ok(())
 }
 
-/// Send the ICMPv6 portion of `buf` (a complete IPv6 datagram) via the raw
-/// socket.
+/// Send the L4 segment of `buf` (a complete IPv6 datagram) via the raw socket
+/// matching its next-header, pinning the reply's source to the datagram's own
+/// source address.
 ///
-/// Linux ICMPv6 raw sockets require sending only the ICMPv6 message (bytes
-/// after the 40-byte IPv6 header); the kernel reconstructs the IPv6 header
-/// using the destination address supplied to `sendto`.
-fn send_raw6(sock: &Socket, buf: &[u8]) -> Result<(), DeceptionError> {
-    // Extract destination address from the IPv6 header (bytes 24–39).
+/// Linux IPv6 raw sockets have no `IPV6_HDRINCL`, so we strip the 40-byte IPv6
+/// header the builders produced and hand the kernel only the L4 segment; the
+/// kernel rebuilds the IPv6 header. The datagram is dispatched to the socket
+/// whose protocol matches the next-header (byte 6): TCP, UDP or ICMPv6 — an
+/// `IPPROTO_ICMPV6` socket cannot carry TCP/UDP, which was the #128 bug.
+fn send_raw6(socks: &RawSockets, buf: &[u8]) -> Result<(), DeceptionError> {
     if buf.len() < 40 {
         return Err(DeceptionError::Protocol("IPv6 reply too short".into()));
     }
+    // IPv6 header: next-header at byte 6, source at 8..24, destination at 24..40.
+    let next_header = buf[6];
+    let src_bytes: [u8; 16] = buf[8..24]
+        .try_into()
+        .map_err(|_| DeceptionError::Protocol("IPv6 src slice wrong size".into()))?;
     let dst_bytes: [u8; 16] = buf[24..40]
         .try_into()
         .map_err(|_| DeceptionError::Protocol("IPv6 dst slice wrong size".into()))?;
+    let src = Ipv6Addr::from(src_bytes);
     let dst = Ipv6Addr::from(dst_bytes);
-    let addr = SockAddr::from(SocketAddrV6::new(dst, 0, 0, 0));
-    // Send only the ICMPv6 payload (skip the 40-byte IPv6 header); the kernel
-    // builds the IPv6 header itself.
-    sock.send_to(&buf[40..], &addr)
-        .map_err(DeceptionError::Io)?;
+    let l4 = &buf[40..];
+
+    let sock = match i32::from(next_header) {
+        IPPROTO_TCP => &socks.v6_tcp,
+        IPPROTO_UDP => &socks.v6_udp,
+        IPPROTO_ICMPV6 => &socks.v6_icmp,
+        other => {
+            return Err(DeceptionError::Protocol(format!(
+                "unsupported IPv6 next-header {other}"
+            )));
+        }
+    };
+    send_v6_l4(sock, src, dst, l4)
+}
+
+/// Send the L4 segment `l4` of an IPv6 reply via `sock`, with the IPv6 source
+/// address pinned to `src` and the destination set to `dst`.
+///
+/// The kernel would otherwise choose the source by routing, but the builders in
+/// [`super::packet`] computed each L4 checksum over a pseudo-header using the
+/// deception IP the client targeted as the source; the kernel must use that
+/// exact source or the checksum is wrong and the client discards the reply.
+/// A per-reply source cannot be expressed with `bind(2)` (it varies per reply
+/// across the managed prefix), so it is set per-message with an `IPV6_PKTINFO`
+/// control message. `socket2` does not expose per-message `PKTINFO`, so this
+/// drops to `libc::sendmsg` (mirroring the `libc` raw-socket precedent in
+/// `blackwall-trafficgen`'s `io::send`).
+fn send_v6_l4(
+    sock: &Socket,
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    l4: &[u8],
+) -> Result<(), DeceptionError> {
+    // Destination sockaddr. Raw sockets ignore the transport port, so it is 0.
+    // SAFETY: `sockaddr_in6` is plain-old-data with no invalid bit patterns; an
+    // all-zero value is a valid, fully-initialised base we then populate.
+    let mut dst_sa: libc::sockaddr_in6 = unsafe { mem::zeroed() };
+    // `AF_INET6` is a small positive constant; the `try_from` (not `as`) cannot
+    // truncate but keeps the crate free of `as` casts.
+    dst_sa.sin6_family = u16::try_from(libc::AF_INET6).unwrap_or(0);
+    dst_sa.sin6_addr.s6_addr = dst.octets();
+
+    // A single iovec over the L4 segment; the kernel prepends the IPv6 header.
+    let mut iov = libc::iovec {
+        // `sendmsg` only reads through `iov_base`; `.cast_mut()` satisfies the
+        // `*mut c_void` field type without implying write access.
+        iov_base: l4.as_ptr().cast::<c_void>().cast_mut(),
+        iov_len: l4.len(),
+    };
+
+    // Control buffer for exactly one IPV6_PKTINFO cmsg. Over-sized (one cmsg
+    // needs 40 bytes here) and aligned to `cmsghdr` so `CMSG_FIRSTHDR` /
+    // `CMSG_DATA` return valid, aligned pointers within it.
+    #[repr(C, align(8))]
+    struct CmsgBuf([u8; 64]);
+    let mut cbuf = CmsgBuf([0u8; 64]);
+
+    // `CMSG_LEN`/`CMSG_SPACE` take a `c_uint`; `in6_pktinfo` is 20 bytes, well
+    // within `u32`, so `try_from` (not `as`) is exact.
+    let pktinfo_len = u32::try_from(mem::size_of::<libc::in6_pktinfo>()).unwrap_or(0);
+
+    // SAFETY: `msghdr` is plain-old-data; an all-zero value is a valid base.
+    let mut mhdr: libc::msghdr = unsafe { mem::zeroed() };
+    mhdr.msg_name = std::ptr::from_mut(&mut dst_sa).cast::<c_void>();
+    mhdr.msg_namelen = u32::try_from(mem::size_of::<libc::sockaddr_in6>()).unwrap_or(0);
+    mhdr.msg_iov = std::ptr::from_mut(&mut iov);
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = cbuf.0.as_mut_ptr().cast::<c_void>();
+    // SAFETY: `CMSG_SPACE` is pure arithmetic over its argument (no memory
+    // access); it is only `unsafe` in `libc` for signature-uniformity.
+    mhdr.msg_controllen = usize::try_from(unsafe { libc::CMSG_SPACE(pktinfo_len) }).unwrap_or(0);
+
+    // SAFETY: `msg_control` points at `cbuf`'s 64 aligned bytes and
+    // `msg_controllen` is the space for one pktinfo cmsg, so `CMSG_FIRSTHDR`
+    // returns either null or a valid, aligned `*mut cmsghdr` inside `cbuf`.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const mhdr) };
+    if cmsg.is_null() {
+        return Err(DeceptionError::Protocol(
+            "CMSG_FIRSTHDR returned null".into(),
+        ));
+    }
+    let pktinfo = libc::in6_pktinfo {
+        ipi6_addr: libc::in6_addr {
+            s6_addr: src.octets(),
+        },
+        // 0 lets the kernel pick the outgoing interface by routing.
+        ipi6_ifindex: 0,
+    };
+    // SAFETY: `cmsg` is a valid, writable, aligned `cmsghdr` within `cbuf`
+    // (checked non-null above); `CMSG_DATA(cmsg)` is its 20-byte payload slot,
+    // entirely inside the 64-byte buffer. `cmsg_len` is written via `try_into`
+    // (its field type is `size_t`/`socklen_t` depending on libc) and the
+    // pktinfo is written unaligned to avoid assuming the payload's alignment.
+    unsafe {
+        (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+        (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(pktinfo_len).try_into().unwrap_or(0);
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>(), pktinfo);
+    }
+
+    // SAFETY: `mhdr` describes a valid destination sockaddr, a single iovec over
+    // `l4`'s readable bytes, and a well-formed control buffer holding one
+    // IPV6_PKTINFO cmsg; `sock` is an open IPv6 raw socket. `sendmsg` only reads
+    // through these for the duration of the call and retains nothing.
+    let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &raw const mhdr, 0) };
+    if n < 0 {
+        return Err(DeceptionError::Io(std::io::Error::last_os_error()));
+    }
     Ok(())
 }
