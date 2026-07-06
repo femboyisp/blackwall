@@ -24,6 +24,7 @@ use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{LpmTrie, LruHashMap, PerCpuArray};
 use aya_ebpf::programs::XdpContext;
+use blackwall_cookie::{check_cookie_raw, make_cookie_raw};
 use blackwall_xdp_common::{
     RateBucket, Stat, REASON_BLOCKLIST, REASON_COUNT, REASON_PASS, REASON_RATELIMIT,
 };
@@ -63,7 +64,38 @@ fn count(reason: u32, bytes: u64) {
 
 #[xdp]
 pub fn xdp_filter(ctx: XdpContext) -> u32 {
+    // B2.1 reference: prove the shared `#![no_std]` SYN-cookie core
+    // (`blackwall-cookie`) links and is callable from this
+    // `bpfel-unknown-none` program, so the future in-kernel B2 SYN-cookie is
+    // byte-identical to the userspace deception tier's. Not yet wired into
+    // this program's packet path (that lands in B2.2, once the cookie is
+    // threaded through TCP SYN/ACK handling here); the result is discarded
+    // through `black_box` so LTO can't eliminate the call, without changing
+    // this program's pass/drop decisions.
+    let _ = core::hint::black_box(syn_cookie_reference());
     try_filter(&ctx).unwrap_or(xdp_action::XDP_PASS)
+}
+
+/// B2.1 proof that [`blackwall_cookie`]'s raw core builds and links for the
+/// `bpfel-unknown-none` target: makes and immediately validates a cookie for
+/// the exact same key/tuple/MSS/time as `blackwall_cookie`'s own
+/// `golden_vector_v4_cookie` test, so a successful call here at
+/// `BPF_PROG_TEST_RUN` time corroborates that golden vector from inside the
+/// bpf target too. XDP-side cookie generation (reading the real SYN/ACK
+/// tuple off the wire) is B2.2.
+#[inline(always)]
+fn syn_cookie_reference() -> bool {
+    const KEY_K0: u64 = 0x0706_0504_0302_0100;
+    const KEY_K1: u64 = 0x0f0e_0d0c_0b0a_0908;
+    const SRC: [u8; 4] = [203, 0, 113, 7];
+    const DST: [u8; 4] = [198, 51, 100, 1];
+    const SRC_PORT: u16 = 54_321;
+    const DST_PORT: u16 = 443;
+    const NOW: u64 = 1_000_000;
+
+    let (cookie, mss) = make_cookie_raw(KEY_K0, KEY_K1, &SRC, SRC_PORT, &DST, DST_PORT, 1460, NOW);
+    let ack = cookie.wrapping_add(1);
+    check_cookie_raw(KEY_K0, KEY_K1, &SRC, SRC_PORT, &DST, DST_PORT, ack, NOW) == Some(mss)
 }
 
 fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
