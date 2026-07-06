@@ -25,6 +25,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut engine = EngineConfig::default();
     let mut flowtable: Option<FlowTableConfig> = None;
     let mut xdp: Option<XdpConfig> = None;
+    let mut stateless_tcp_ports: Vec<u16> = Vec::new();
 
     let mut i = 0;
     while i < lines.len() {
@@ -589,6 +590,31 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 }
                 xdp = Some(cfg);
             }
+            "stateless-tcp" => {
+                let bad = |what: &'static str, v: &str| ConfigError::BadValue {
+                    line: line.number,
+                    what,
+                    value: v.to_owned(),
+                };
+                for tok in &line.words[1..] {
+                    let (k, v) = tok
+                        .split_once('=')
+                        .ok_or_else(|| bad("stateless-tcp", tok.as_str()))?;
+                    if k != "ports" {
+                        return Err(bad("stateless-tcp key", k));
+                    }
+                    for port_tok in v.split(',') {
+                        let port_tok = port_tok.trim();
+                        let n: u16 = port_tok
+                            .parse()
+                            .map_err(|_| bad("stateless-tcp ports", port_tok))?;
+                        if n == 0 {
+                            return Err(bad("stateless-tcp ports", port_tok));
+                        }
+                        stateless_tcp_ports.push(n);
+                    }
+                }
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -630,6 +656,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         engine,
         flowtable,
         xdp,
+        stateless_tcp_ports,
     })
 }
 
@@ -1653,6 +1680,60 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
                 err,
                 ConfigError::BadValue {
                     what: "xdp mode",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_stateless_tcp() {
+        let p = parse_text("interface wan eth0\nstateless-tcp ports=22,80,443\n").unwrap();
+        assert_eq!(p.stateless_tcp_ports, vec![22, 80, 443]);
+    }
+
+    #[test]
+    fn stateless_tcp_absent_is_empty() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert!(p.stateless_tcp_ports.is_empty());
+    }
+
+    #[test]
+    fn rejects_stateless_tcp_bad_port() {
+        let err = parse_text("interface wan eth0\nstateless-tcp ports=22,0,443\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "stateless-tcp ports",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+
+        let err = parse_text("interface wan eth0\nstateless-tcp ports=notaport\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "stateless-tcp ports",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_stateless_tcp_unknown_key() {
+        let err = parse_text("interface wan eth0\nstateless-tcp bogus=1\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "stateless-tcp key",
                     ..
                 }
             ),
