@@ -62,4 +62,6 @@ pub struct Policy {
     /// nftables flowtable fast path for real-service traffic (`flowtable` directive);
     /// `None` keeps all real traffic on the nft slow path.
     pub flowtable: Option<crate::FlowTableConfig>,
+    /// XDP fast-path config (`xdp` directive); `None` disables it.
+    pub xdp: Option<crate::XdpConfig>,
 }

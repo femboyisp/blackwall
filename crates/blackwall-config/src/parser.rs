@@ -6,6 +6,7 @@ use crate::lexer::Line;
 use blackwall_core::{
     AllowRule, BannerFluxConfig, DnsFluxConfig, EngineConfig, FlowSpecPolicy, FlowTableConfig,
     L4Proto, Policy, PortState, RtbhPolicy, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
+    XdpConfig, XdpMode,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -23,6 +24,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut metrics_listen: Option<SocketAddr> = None;
     let mut engine = EngineConfig::default();
     let mut flowtable: Option<FlowTableConfig> = None;
+    let mut xdp: Option<XdpConfig> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -548,6 +550,45 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 }
                 flowtable = Some(FlowTableConfig { devices });
             }
+            "xdp" => {
+                let bad = |what: &'static str, v: &str| ConfigError::BadValue {
+                    line: line.number,
+                    what,
+                    value: v.to_owned(),
+                };
+                let mut cfg = XdpConfig {
+                    interface: None,
+                    mode: XdpMode::default(),
+                    default_rate_limit_pps: None,
+                };
+                for tok in &line.words[1..] {
+                    let (k, v) = tok
+                        .split_once('=')
+                        .ok_or_else(|| bad("xdp", tok.as_str()))?;
+                    match k {
+                        "interface" => cfg.interface = Some(v.to_owned()),
+                        "mode" => {
+                            cfg.mode = match v {
+                                "auto" => XdpMode::Auto,
+                                "native" => XdpMode::Native,
+                                "generic" => XdpMode::Generic,
+                                _ => return Err(bad("xdp mode", v)),
+                            }
+                        }
+                        "default-rate-limit" => {
+                            let n = v
+                                .parse::<u64>()
+                                .map_err(|_| bad("xdp default-rate-limit", v))?;
+                            if n == 0 {
+                                return Err(bad("xdp default-rate-limit", "must be >= 1"));
+                            }
+                            cfg.default_rate_limit_pps = Some(n);
+                        }
+                        other => return Err(bad("xdp key", other)),
+                    }
+                }
+                xdp = Some(cfg);
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -588,6 +629,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         metrics_listen,
         engine,
         flowtable,
+        xdp,
     })
 }
 
@@ -1564,6 +1606,53 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
                 err,
                 ConfigError::BadValue {
                     what: "flowtable",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_xdp_directive() {
+        let p = parse_text(
+            "interface wan eth0\nxdp interface=eth0 mode=native default-rate-limit=1000\n",
+        )
+        .unwrap();
+        let x = p.xdp.expect("xdp set");
+        assert_eq!(x.interface.as_deref(), Some("eth0"));
+        assert_eq!(x.mode, blackwall_core::XdpMode::Native);
+        assert_eq!(x.default_rate_limit_pps, Some(1000));
+    }
+
+    #[test]
+    fn xdp_absent_is_none() {
+        assert!(parse_text("interface wan eth0\n").unwrap().xdp.is_none());
+    }
+
+    #[test]
+    fn rejects_xdp_unknown_key() {
+        let err = parse_text("interface wan eth0\nxdp bogus=1\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp key",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_xdp_bad_mode() {
+        let err = parse_text("interface wan eth0\nxdp mode=turbo\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp mode",
                     ..
                 }
             ),

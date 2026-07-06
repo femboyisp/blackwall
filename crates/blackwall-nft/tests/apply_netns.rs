@@ -31,6 +31,7 @@ fn sample() -> Policy {
         metrics_listen: None,
         engine: blackwall_core::EngineConfig::default(),
         flowtable: None,
+        xdp: None,
     }
 }
 
@@ -84,6 +85,7 @@ fn stale_set_elements_removed_on_second_apply() {
         metrics_listen: None,
         engine: blackwall_core::EngineConfig::default(),
         flowtable: None,
+        xdp: None,
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 
