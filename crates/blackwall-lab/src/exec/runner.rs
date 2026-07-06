@@ -5,9 +5,10 @@ use crate::assert::{evaluate, StepOutcome};
 use crate::error::LabError;
 use crate::exec::{netns, proc};
 use crate::plan::{compile, ExecutionPlan, Op};
-use crate::report::{to_junit, to_tap, RunReport, ScenarioResult, StepResult};
+use crate::report::{tap_header, tap_step_line, to_junit, RunReport, ScenarioResult, StepResult};
 use crate::topology::model::{DaemonKind, Manifest, Step};
 use crate::topology::{parse_manifest, validate};
+use std::io::Write;
 use std::process::Child;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -201,8 +202,20 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
 
     guard.children = realize(&plan, &map)?;
 
+    // Stream TAP as the run progresses (blackwall#88): print the header/plan
+    // line up front and each step's result line the moment it completes,
+    // flushing stdout so CI shows it in real time. The old behaviour built
+    // the whole document in memory and printed it only after every step had
+    // run, so a hang anywhere in the run emitted nothing at all — no way to
+    // tell which step stalled. Streaming means a hang on step K still shows
+    // 1..K on stdout before the run stalls on K+1.
+    let total: usize = manifest.scenarios.iter().map(|sc| sc.steps.len()).sum();
+    print!("{}", tap_header(total));
+    let _ = std::io::stdout().flush();
+
     let mut scenarios = Vec::new();
     let mut all_pass = true;
+    let mut n = 0_usize;
     for sc in &manifest.scenarios {
         let mut steps = Vec::new();
         for step in &sc.steps {
@@ -210,7 +223,11 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
             if matches!(outcome, StepOutcome::Fail(_)) {
                 all_pass = false;
             }
-            steps.push(StepResult { name, outcome });
+            let result = StepResult { name, outcome };
+            n += 1;
+            print!("{}", tap_step_line(n, &result));
+            let _ = std::io::stdout().flush();
+            steps.push(result);
         }
         scenarios.push(ScenarioResult {
             name: sc.name.clone(),
@@ -219,7 +236,9 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
     }
 
     let report = RunReport { scenarios };
-    print!("{}", to_tap(&report));
+    // JUnit is still written all-or-nothing at the end: unlike TAP it has no
+    // streaming consumer in CI, and it's only lost on a hang — the streamed
+    // TAP above is the diagnostic for that case.
     if let Some(path) = junit_path {
         std::fs::write(path, to_junit(&report))
             .map_err(|e| LabError::Exec(format!("write junit: {e}")))?;
