@@ -23,6 +23,9 @@ pub(crate) struct MetricsSources {
     /// A shared handle to the attached XDP data plane, for per-CPU counter and
     /// map-occupancy gauges; `None` when XDP is disabled or failed to attach.
     pub xdp: Option<Arc<blackwall_xdp::XdpDataplane>>,
+    /// Stateless SYN-cookie / UDP responder counters; `None` outside the
+    /// deception engine (e.g. the `flow` daemon, which has no responder).
+    pub stateless: Option<Arc<blackwall_deception::transport::StatelessMetrics>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -84,6 +87,9 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             kind: MetricKind::Gauge,
             value: count_to_f64(inflight.load(std::sync::atomic::Ordering::Relaxed)),
         });
+    }
+    if let Some(stateless) = &sources.stateless {
+        m.extend(stateless_metrics(stateless));
     }
 
     let s = &sources.store;
@@ -154,6 +160,40 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
     m
 }
 
+/// Render the four stateless SYN-cookie / UDP responder counters from a live
+/// [`blackwall_deception::transport::StatelessMetrics`] snapshot.
+///
+/// Pure and side-effect free (unlike [`gather`], which also awaits DB
+/// queries), so it is unit-tested directly without a live `Store`.
+fn stateless_metrics(stateless: &blackwall_deception::transport::StatelessMetrics) -> Vec<Metric> {
+    vec![
+        Metric {
+            name: "blackwall_stateless_syn_cookies_sent_total",
+            help: "Stateless SYN-cookie SYN-ACKs sent",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(stateless.syn_cookies_sent()),
+        },
+        Metric {
+            name: "blackwall_stateless_acks_validated_total",
+            help: "Stateless-tier completing ACKs whose SYN-cookie validated",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(stateless.acks_validated()),
+        },
+        Metric {
+            name: "blackwall_stateless_acks_rejected_total",
+            help: "Stateless-tier ACKs whose SYN-cookie failed validation",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(stateless.acks_rejected()),
+        },
+        Metric {
+            name: "blackwall_stateless_udp_responses_total",
+            help: "Stateless UDP responses sent",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(stateless.udp_responses()),
+        },
+    ]
+}
+
 /// Render the labelled XDP data-plane block from a live `stats()` snapshot, or
 /// `None` when XDP is not attached. Per-CPU counters expose the *packet*
 /// dimension of each [`blackwall_xdp::XdpStats`] `Stat`.
@@ -220,4 +260,44 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
     };
     let _ = sock.write_all(response.as_bytes()).await;
     let _ = sock.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stateless_metrics;
+    use blackwall_deception::transport::StatelessMetrics;
+    use blackwall_metrics::render_prometheus;
+
+    #[test]
+    fn stateless_metrics_renders_all_four_counters_with_expected_values() {
+        let stateless = StatelessMetrics::new();
+        stateless.record_syn_cookie_sent();
+        stateless.record_syn_cookie_sent();
+        stateless.record_ack_validated();
+        stateless.record_ack_rejected();
+        stateless.record_ack_rejected();
+        stateless.record_ack_rejected();
+        stateless.record_udp_response();
+
+        let body = render_prometheus(&stateless_metrics(&stateless));
+
+        assert!(body.contains("# TYPE blackwall_stateless_syn_cookies_sent_total counter"));
+        assert!(body.contains("blackwall_stateless_syn_cookies_sent_total 2\n"));
+        assert!(body.contains("# TYPE blackwall_stateless_acks_validated_total counter"));
+        assert!(body.contains("blackwall_stateless_acks_validated_total 1\n"));
+        assert!(body.contains("# TYPE blackwall_stateless_acks_rejected_total counter"));
+        assert!(body.contains("blackwall_stateless_acks_rejected_total 3\n"));
+        assert!(body.contains("# TYPE blackwall_stateless_udp_responses_total counter"));
+        assert!(body.contains("blackwall_stateless_udp_responses_total 1\n"));
+    }
+
+    #[test]
+    fn stateless_metrics_renders_zeros_for_a_fresh_counter_set() {
+        let stateless = StatelessMetrics::new();
+        let body = render_prometheus(&stateless_metrics(&stateless));
+        assert!(body.contains("blackwall_stateless_syn_cookies_sent_total 0\n"));
+        assert!(body.contains("blackwall_stateless_acks_validated_total 0\n"));
+        assert!(body.contains("blackwall_stateless_acks_rejected_total 0\n"));
+        assert!(body.contains("blackwall_stateless_udp_responses_total 0\n"));
+    }
 }
