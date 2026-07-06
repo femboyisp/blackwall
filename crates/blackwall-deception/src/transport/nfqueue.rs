@@ -89,15 +89,29 @@ pub fn run(
         let mut msg = queue.recv().map_err(DeceptionError::Io)?;
         let pkt = msg.get_payload().to_owned();
 
+        // A single reply that fails to send (e.g. a spoofed source address
+        // that happens to land on a broadcast address, for which the kernel
+        // rejects an unset-SO_BROADCAST raw socket with EACCES; or a
+        // transient ENETUNREACH/EINVAL for a bogus attacker-controlled
+        // address) must never take down the whole responder: that would let
+        // a single crafted or spoofed packet in a flood turn the stateless
+        // tier's own resilience into a self-inflicted denial of service for
+        // every other, legitimate flow sharing this queue. So reply-send
+        // errors are logged and the packet is dropped, not propagated;
+        // only queue-level errors (`recv`/`verdict`) are fatal.
         let verdict = if let Some(info) = packet::parse_tcp_request(&pkt) {
-            handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &raw4, &raw6)?
+            handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &raw4, &raw6)
+                .unwrap_or_else(|e| drop_and_log("tcp", &e))
         } else if let Some(info) = packet::parse_udp_request(&pkt) {
-            handle_udp(&pkt, &info, banners.as_ref(), &raw4, &raw6)?
+            handle_udp(&pkt, &info, banners.as_ref(), &raw4, &raw6)
+                .unwrap_or_else(|e| drop_and_log("udp", &e))
         } else {
             match pkt.first().map(|b| b >> 4) {
                 Some(4) => {
                     if let Some(reply) = packet::icmp_echo_reply(&pkt) {
-                        send_raw4(&raw4, &reply)?;
+                        if let Err(e) = send_raw4(&raw4, &reply) {
+                            drop_and_log("icmp", &e);
+                        }
                         Verdict::Drop
                     } else {
                         Verdict::Accept
@@ -105,7 +119,9 @@ pub fn run(
                 }
                 Some(6) => {
                     if let Some(reply) = packet::icmpv6_echo_reply(&pkt) {
-                        send_raw6(&raw6, &reply)?;
+                        if let Err(e) = send_raw6(&raw6, &reply) {
+                            drop_and_log("icmpv6", &e);
+                        }
                         Verdict::Drop
                     } else {
                         Verdict::Accept
@@ -198,6 +214,18 @@ fn handle_udp(
         send_reply(&reply, raw4, raw6)?;
     }
     Ok(Verdict::Drop)
+}
+
+/// Log a per-packet reply-send failure (see the `run` loop's dispatch) and
+/// yield the [`Verdict::Drop`] the caller falls back to.
+///
+/// Never propagated as fatal: the original packet is dropped either way (the
+/// stateless tier keeps no state to retry), so a reply that could not be
+/// sent is exactly as harmless to this responder's availability as one that
+/// was never attempted.
+fn drop_and_log(kind: &str, err: &DeceptionError) -> Verdict {
+    eprintln!("blackwall-deception: nfqueue: {kind} reply send failed, dropping packet: {err}");
+    Verdict::Drop
 }
 
 /// Send a fully-built reply datagram (`reply`) via whichever raw socket
