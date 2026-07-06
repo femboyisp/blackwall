@@ -9,6 +9,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use nfq::{Queue, Verdict};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -17,6 +18,7 @@ use crate::error::DeceptionError;
 
 use super::metrics::StatelessMetrics;
 use super::packet;
+use super::traits::DeceptionTransport;
 
 /// `IPPROTO_RAW` (255) — raw IP socket that accepts a hand-crafted IP header.
 const IPPROTO_RAW: i32 = 255;
@@ -179,6 +181,65 @@ pub fn run(
 
         msg.set_verdict(verdict);
         queue.verdict(msg).map_err(DeceptionError::Io)?;
+    }
+}
+
+/// The stateless tier's [`DeceptionTransport`] impl: wraps [`run`] (this
+/// module's blocking NFQUEUE loop) without changing its internals.
+///
+/// Holds exactly the already-constructed parameters `run` needs. `run` is a
+/// blocking, synchronous loop, so [`DeceptionTransport::run`] offloads it
+/// onto a blocking thread (as `blackwalld run` already did before this
+/// transport existed) rather than blocking the async runtime.
+pub struct NfqueueTransport {
+    queue_num: u16,
+    cookie_key: CookieKey,
+    banners: BannerLookup,
+    metrics: Arc<StatelessMetrics>,
+}
+
+impl NfqueueTransport {
+    /// Build the stateless NFQUEUE transport for queue `queue_num`, using
+    /// `cookie_key` to mint/validate SYN cookies and `banners` to look up the
+    /// canned response for a destination port. `metrics` is shared with the
+    /// `/metrics` endpoint.
+    #[must_use]
+    pub fn new(
+        queue_num: u16,
+        cookie_key: CookieKey,
+        banners: BannerLookup,
+        metrics: Arc<StatelessMetrics>,
+    ) -> Self {
+        Self {
+            queue_num,
+            cookie_key,
+            banners,
+            metrics,
+        }
+    }
+}
+
+#[async_trait]
+impl DeceptionTransport for NfqueueTransport {
+    fn name(&self) -> &str {
+        "nfqueue-stateless"
+    }
+
+    async fn run(self: Box<Self>) {
+        let Self {
+            queue_num,
+            cookie_key,
+            banners,
+            metrics,
+        } = *self;
+        // `run` is blocking/sync; run it on a blocking thread so it does not
+        // stall the async runtime.
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = run(queue_num, cookie_key, banners, metrics) {
+                tracing::error!(%err, "nfqueue loop exited");
+            }
+        })
+        .await;
     }
 }
 
@@ -433,4 +494,24 @@ fn send_v6_l4(
         return Err(DeceptionError::Io(std::io::Error::last_os_error()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `NfqueueTransport::new` only stores its parameters (opening the queue
+    // and raw sockets happens in `run`, on first use), so `name()` is
+    // testable without CAP_NET_ADMIN or a live NFQUEUE — unlike the rest of
+    // this file, which is coverage-excluded for exactly that reason.
+    #[test]
+    fn nfqueue_transport_name() {
+        let transport = NfqueueTransport::new(
+            0,
+            CookieKey::new([0u8; 16]),
+            Box::new(|_port| Vec::new()),
+            Arc::new(StatelessMetrics::new()),
+        );
+        assert_eq!(transport.name(), "nfqueue-stateless");
+    }
 }
