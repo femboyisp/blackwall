@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use blackwall_deception::transport::{
-    run_nfqueue, serve, BannerLookup, StatelessMetrics, TproxyListener,
+    BannerLookup, DeceptionTransport, NfqueueTransport, StatelessMetrics, TproxyListener,
+    TproxyTransport,
 };
 use blackwall_deception::{default_registry, CookieKey, EngineLimits, SharedBanners};
 use blackwall_discovery::IncusClient;
@@ -1600,24 +1601,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Stateless SYN-cookie / UDP responder counters (shared with /metrics).
             let stateless_metrics = std::sync::Arc::new(StatelessMetrics::new());
 
-            let mut transports = tokio::task::JoinSet::new();
-            transports.spawn(serve(
-                listener_v4,
-                registry.clone(),
-                tx.clone(),
-                engine_limits,
-                inflight.clone(),
-            ));
+            // Build the uniform list of transports (interactive TPROXY
+            // listener(s) + the stateless NFQUEUE responder) and supervise
+            // them all through `DeceptionTransport`, exactly as the two were
+            // spawned individually before: same tasks, same `JoinSet`, same
+            // teardown semantics.
             let has_v6 = listener_v6.is_some();
+            let mut deception_transports: Vec<Box<dyn DeceptionTransport>> =
+                vec![Box::new(TproxyTransport::new(
+                    listener_v4,
+                    registry.clone(),
+                    tx.clone(),
+                    engine_limits,
+                    inflight.clone(),
+                ))];
             if let Some(v6) = listener_v6 {
-                transports.spawn(serve(
+                deception_transports.push(Box::new(TproxyTransport::new(
                     v6,
                     registry.clone(),
                     tx.clone(),
                     engine_limits,
                     inflight.clone(),
-                ));
+                )));
             }
+            deception_transports.push(Box::new(NfqueueTransport::new(
+                nfqueue_num,
+                cookie_key,
+                banner_lookup,
+                stateless_metrics.clone(),
+            )));
 
             // Optional Prometheus metrics endpoint (deception gauges).
             if let Some(metrics_listen) = policy.metrics_listen {
@@ -1631,17 +1643,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
-            transports.spawn(async move {
-                // run_nfqueue is blocking/sync; run it on a blocking thread.
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(err) =
-                        run_nfqueue(nfqueue_num, cookie_key, banner_lookup, stateless_metrics)
-                    {
-                        tracing::error!(%err, "nfqueue loop exited");
-                    }
-                })
-                .await;
-            });
+
+            let mut transports = tokio::task::JoinSet::new();
+            for transport in deception_transports {
+                tracing::debug!(name = transport.name(), "spawning deception transport");
+                transports.spawn(async move { transport.run().await });
+            }
 
             // Spawn the Incus discovery loop as a supervised task that reconnects
             // forever. Without this, an Incus restart ends the event stream and

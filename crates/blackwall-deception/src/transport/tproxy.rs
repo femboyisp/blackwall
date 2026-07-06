@@ -5,6 +5,7 @@ use crate::conn::{AsyncStream, DeceptionConn, DeceptionMeta};
 use crate::emulator::{EmulatorOutcome, EmulatorRegistry};
 use crate::error::DeceptionError;
 use crate::limits::EngineLimits;
+use async_trait::async_trait;
 use blackwall_core::L4Proto;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
@@ -12,6 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
+
+use super::traits::DeceptionTransport;
 
 /// RAII counter for live in-flight deception sessions: increments on
 /// construction, decrements on drop (covering every task exit path — success,
@@ -148,5 +151,59 @@ pub async fn serve(
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+/// The interactive tier's [`DeceptionTransport`] impl: wraps [`serve`] (this
+/// module's accept loop) without changing its internals.
+///
+/// Holds exactly the already-constructed handles `serve` needs (one instance
+/// per bound listener — `blackwalld run` builds one for the IPv4 listener and,
+/// when it bound, another for IPv6).
+pub struct TproxyTransport {
+    listener: TproxyListener,
+    registry: Arc<EmulatorRegistry>,
+    sessions: mpsc::Sender<SessionRecord>,
+    limits: EngineLimits,
+    inflight: Arc<AtomicUsize>,
+}
+
+impl TproxyTransport {
+    /// Build the interactive TPROXY transport around an already-bound
+    /// `listener`, dispatching to `registry`'s emulators, reporting completed
+    /// sessions on `sessions`, enforcing `limits`, and tracking `inflight`.
+    #[must_use]
+    pub fn new(
+        listener: TproxyListener,
+        registry: Arc<EmulatorRegistry>,
+        sessions: mpsc::Sender<SessionRecord>,
+        limits: EngineLimits,
+        inflight: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            listener,
+            registry,
+            sessions,
+            limits,
+            inflight,
+        }
+    }
+}
+
+#[async_trait]
+impl DeceptionTransport for TproxyTransport {
+    fn name(&self) -> &str {
+        "tproxy-interactive"
+    }
+
+    async fn run(self: Box<Self>) {
+        let Self {
+            listener,
+            registry,
+            sessions,
+            limits,
+            inflight,
+        } = *self;
+        serve(listener, registry, sessions, limits, inflight).await;
     }
 }
