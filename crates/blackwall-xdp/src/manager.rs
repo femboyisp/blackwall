@@ -159,6 +159,19 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         }
     }
 
+    /// Manually clear a rate limit on a source address (always applies — see
+    /// [`XdpController::manual_clear_rate`]).
+    pub async fn apply_clear_rate(&mut self, src: IpAddr, wall_now: u64) -> ApplyOutcome {
+        match self.controller.manual_clear_rate(src) {
+            Ok(action) => {
+                self.execute_and_journal(action, XdpOrigin::Manual, wall_now)
+                    .await;
+                ApplyOutcome::Applied
+            }
+            Err(e) => ApplyOutcome::Rejected(e),
+        }
+    }
+
     /// Manually rate-limit a source address.
     ///
     /// Returns [`ApplyOutcome::Applied`] if newly installed (or upgraded to
@@ -510,6 +523,24 @@ mod tests {
         assert!(matches!(
             recorded.last().unwrap().0,
             XdpAction::Unblock { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn apply_clear_rate_removes_and_journals() {
+        let mut m = mgr(false, false);
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        m.apply_rate_limit(addr, 500, 500, 0).await;
+        assert_eq!(m.active().len(), 1);
+
+        let outcome = m.apply_clear_rate(addr, 1000).await;
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(m.active().is_empty(), "clear-rate must remove the entry");
+
+        let recorded = m.journal().recorded.lock().unwrap();
+        assert!(matches!(
+            recorded.last().unwrap().0,
+            XdpAction::ClearRate { .. }
         ));
     }
 

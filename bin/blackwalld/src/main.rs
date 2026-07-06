@@ -190,6 +190,11 @@ enum XdpCmd {
         #[arg(long)]
         operator: Option<String>,
     },
+    /// Queue a rate-limit clear for attacker source `ip`.
+    ClearRate {
+        /// The attacker source address to stop rate-limiting.
+        ip: IpAddr,
+    },
     /// List the active `xdp_entries` map mirror.
     List,
     /// Print active-entry counts from the DB mirror.
@@ -1035,8 +1040,8 @@ async fn xdp_manager_task(
 ///
 /// `block`/`rate_limit`: `Applied` marks the row `applied`; `Deferred` leaves
 /// it `pending` (retried on the next tick); `Rejected` marks it `rejected`.
-/// `unblock`: always applies, then marks `applied`. Unknown actions (e.g.
-/// `clear_rate`, which no CLI emits) are logged and left untouched.
+/// `unblock`/`clear_rate`: always applies, then marks `applied`. Unknown
+/// actions are logged and left untouched.
 async fn apply_xdp_request(
     manager: &mut DaemonXdpManager,
     request_store: &blackwall_state::Store,
@@ -1073,6 +1078,10 @@ async fn apply_xdp_request(
                 return;
             };
             manager.apply_remove(net, wall_now()).await;
+            mark(req.id, "applied").await;
+        }
+        "clear_rate" => {
+            manager.apply_clear_rate(req.target, wall_now()).await;
             mark(req.id, "applied").await;
         }
         "rate_limit" => {
@@ -1995,6 +2004,7 @@ async fn run_xdp(action: XdpCmd) -> Result<(), Box<dyn std::error::Error>> {
             config,
             operator,
         } => xdp_rate_limit(ip, pps, burst, &config, operator).await,
+        XdpCmd::ClearRate { ip } => xdp_clear_rate(ip).await,
         XdpCmd::List => xdp_list().await,
         XdpCmd::Stats => xdp_stats().await,
     }
@@ -2102,6 +2112,19 @@ async fn xdp_rate_limit(
         )
         .await?;
     println!("queued (request {id}); the running daemon will program the map.");
+    Ok(())
+}
+
+/// `xdp clear-rate`: queue a `"clear_rate"` intent row for source `ip`.
+async fn xdp_clear_rate(ip: IpAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to queue an xdp request")?;
+    let store = blackwall_state::Store::connect(&database_url).await?;
+    store.migrate().await?;
+    let id = store
+        .xdp_enqueue_request("clear_rate", ip, None, None, None, &default_operator())
+        .await?;
+    println!("queued (request {id}); the running daemon will remove the map entry.");
     Ok(())
 }
 

@@ -211,6 +211,22 @@ impl XdpController {
         })
     }
 
+    /// Manually clear a rate limit on a source address.
+    ///
+    /// Always succeeds (idempotent even if `src` was not rate-limited) — like
+    /// `manual_unblock`, removing an entry only frees capacity, so there is
+    /// nothing to cap-check. Also drops `src` from every target's `by_target`
+    /// source-set so a later auto `Cleared` for that target does not attempt
+    /// to double-handle (and re-emit a `ClearRate` for) an already-cleared
+    /// source.
+    pub fn manual_clear_rate(&mut self, src: IpAddr) -> Result<XdpAction, String> {
+        self.rate_limited.remove(&src);
+        for sources in self.by_target.values_mut() {
+            sources.remove(&src);
+        }
+        Ok(XdpAction::ClearRate { src })
+    }
+
     /// Whether `net` overlaps one of the configured own prefixes, in either
     /// direction.
     ///
@@ -507,6 +523,54 @@ mod tests {
         // swallow it — the self-block guard must catch this direction too.
         let mut c = XdpController::new(own(), 100, 1000);
         assert!(c.manual_block("203.0.0.0/16".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn manual_clear_rate_removes_source() {
+        let mut c = XdpController::new(own(), 100, 1000);
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        c.manual_rate_limit(addr, 500, 500).unwrap();
+        assert_eq!(c.active_entries().len(), 1);
+
+        let act = c.manual_clear_rate(addr).unwrap();
+        assert!(matches!(act, XdpAction::ClearRate { src } if src == addr));
+        assert!(
+            c.active_entries().is_empty(),
+            "cleared source must no longer be active"
+        );
+    }
+
+    #[test]
+    fn manual_clear_rate_is_idempotent_for_unknown_source() {
+        let mut c = XdpController::new(own(), 100, 1000);
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        let act = c.manual_clear_rate(addr).unwrap();
+        assert!(matches!(act, XdpAction::ClearRate { src } if src == addr));
+        assert!(c.active_entries().is_empty());
+    }
+
+    #[test]
+    fn manual_clear_rate_drops_source_from_by_target_so_later_clear_is_noop() {
+        // Rate-limit a source via a detection (populates by_target), then
+        // manually clear it. A later `Cleared` for that target must not
+        // re-emit a ClearRate for the already-cleared source.
+        let mut c = XdpController::new(own(), 100, 1000);
+        c.on_detection(&DetectionEvent::Opened(det(
+            "203.0.113.7",
+            vec!["198.51.100.9"],
+        )));
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        c.manual_clear_rate(addr).unwrap();
+        assert!(c.active_entries().is_empty());
+
+        let acts = c.on_detection(&DetectionEvent::Cleared {
+            target: "203.0.113.7".parse().unwrap(),
+            at_ms: 1000,
+        });
+        assert!(
+            acts.is_empty(),
+            "manually cleared source must not be double-handled by a later Cleared"
+        );
     }
 
     #[test]
