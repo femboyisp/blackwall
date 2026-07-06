@@ -4,9 +4,10 @@ mod metrics;
 mod nfqueue;
 mod packet;
 mod tproxy;
+mod traits;
 
 pub use metrics::StatelessMetrics;
-pub use nfqueue::{run as run_nfqueue, BannerLookup};
+pub use nfqueue::{run as run_nfqueue, BannerLookup, NfqueueTransport};
 // Pure, byte-exact stateless TCP SYN-cookie packet builders (Component 2 of
 // the stateless SYN-cookie tier design), plus the request parser the NFQUEUE
 // TCP dispatcher (Component 2b) uses to route SYN/ACK segments. Re-exported
@@ -16,4 +17,5 @@ pub use nfqueue::{run as run_nfqueue, BannerLookup};
 pub use packet::{
     parse_tcp_request, tcp_banner_fin, tcp_syn_ack, TcpRequestInfo, DEFAULT_CLIENT_MSS,
 };
-pub use tproxy::{serve, SessionRecord, TproxyListener};
+pub use tproxy::{serve, SessionRecord, TproxyListener, TproxyTransport};
+pub use traits::DeceptionTransport;
