@@ -6,7 +6,9 @@
 //!   cargo test -p blackwall-deception --test interop -- serves_deception_banner --ignored --nocapture
 
 use blackwall_core::{AllowRule, L4Proto, Policy, PortState, ServiceTarget, Tenant};
-use blackwall_deception::transport::{run_nfqueue, serve, SessionRecord, TproxyListener};
+use blackwall_deception::transport::{
+    run_nfqueue, serve, SessionRecord, StatelessMetrics, TproxyListener,
+};
 use blackwall_deception::{default_registry, BannerStore, CookieKey, EngineLimits};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -291,7 +293,9 @@ fn serves_stateless_syn_cookie() {
     // Real end-to-end responder: opens the NFQUEUE + raw sockets and handles
     // SYN-cookie mint/validate + banner+FIN forever (the lab kills it at
     // teardown). This call blocks; it is not a stub.
-    run_nfqueue(policy.engine.nfqueue_num, cookie_key, banners).expect("nfqueue responder");
+    let metrics = Arc::new(StatelessMetrics::new());
+    run_nfqueue(policy.engine.nfqueue_num, cookie_key, banners, metrics)
+        .expect("nfqueue responder");
 }
 
 /// The IPv6 sibling of [`serves_stateless_syn_cookie`] — the #128 gate.
@@ -363,5 +367,7 @@ fn serves_stateless_syn_cookie_v6() {
     let _ = std::fs::remove_file(SYNCOOKIE_READY_SENTINEL); // fresh for the scenario's file-present probe
     std::fs::write(SYNCOOKIE_READY_SENTINEL, b"ok").expect("write sentinel");
 
-    run_nfqueue(policy.engine.nfqueue_num, cookie_key, banners).expect("nfqueue responder");
+    let metrics = Arc::new(StatelessMetrics::new());
+    run_nfqueue(policy.engine.nfqueue_num, cookie_key, banners, metrics)
+        .expect("nfqueue responder");
 }

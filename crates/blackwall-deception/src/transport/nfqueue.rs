@@ -6,6 +6,7 @@ use std::ffi::c_void;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nfq::{Queue, Verdict};
@@ -14,6 +15,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use crate::cookie::{check_cookie, make_cookie, ConnTuple, CookieKey};
 use crate::error::DeceptionError;
 
+use super::metrics::StatelessMetrics;
 use super::packet;
 
 /// `IPPROTO_RAW` (255) — raw IP socket that accepts a hand-crafted IP header.
@@ -86,11 +88,16 @@ pub type BannerLookup = Box<dyn Fn(u16) -> Vec<u8> + Send>;
 ///   never accepted into the host stack for a deception port.
 /// - All other packets are accepted unchanged.
 ///
+/// `metrics` is bumped on each reply actually sent (SYN-ACK, validated/
+/// rejected ACK, UDP response) so `/metrics` reflects real replies rather
+/// than mere receipt of a request.
+///
 /// This function runs indefinitely and only returns on error.
 pub fn run(
     queue_num: u16,
     cookie_key: CookieKey,
     banners: BannerLookup,
+    metrics: Arc<StatelessMetrics>,
 ) -> Result<(), DeceptionError> {
     let mut queue = Queue::open().map_err(DeceptionError::Io)?;
     queue.bind(queue_num).map_err(DeceptionError::Io)?;
@@ -139,10 +146,10 @@ pub fn run(
         // errors are logged and the packet is dropped, not propagated;
         // only queue-level errors (`recv`/`verdict`) are fatal.
         let verdict = if let Some(info) = packet::parse_tcp_request(&pkt) {
-            handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &socks)
+            handle_tcp(&pkt, &info, &cookie_key, banners.as_ref(), &socks, &metrics)
                 .unwrap_or_else(|e| drop_and_log("tcp", &e))
         } else if let Some(info) = packet::parse_udp_request(&pkt) {
-            handle_udp(&pkt, &info, banners.as_ref(), &socks)
+            handle_udp(&pkt, &info, banners.as_ref(), &socks, &metrics)
                 .unwrap_or_else(|e| drop_and_log("udp", &e))
         } else {
             match pkt.first().map(|b| b >> 4) {
@@ -194,6 +201,7 @@ fn handle_tcp(
     cookie_key: &CookieKey,
     banners: &(dyn Fn(u16) -> Vec<u8> + Send),
     socks: &RawSockets,
+    metrics: &StatelessMetrics,
 ) -> Result<Verdict, DeceptionError> {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -211,16 +219,20 @@ fn handle_tcp(
         let (cookie_seq, mss) = make_cookie(cookie_key, &tuple, info.client_mss, now_secs);
         if let Some(reply) = packet::tcp_syn_ack(pkt, cookie_seq, mss) {
             send_reply(&reply, socks)?;
+            metrics.record_syn_cookie_sent();
         }
         return Ok(Verdict::Drop);
     }
 
     if info.ack && !info.syn {
         if check_cookie(cookie_key, &tuple, info.ack_seq, now_secs).is_some() {
+            metrics.record_ack_validated();
             let banner = banners(info.dst_port);
             if let Some(reply) = packet::tcp_banner_fin(pkt, &banner) {
                 send_reply(&reply, socks)?;
             }
+        } else {
+            metrics.record_ack_rejected();
         }
         return Ok(Verdict::Drop);
     }
@@ -245,10 +257,12 @@ fn handle_udp(
     info: &packet::UdpRequestInfo,
     banners: &(dyn Fn(u16) -> Vec<u8> + Send),
     socks: &RawSockets,
+    metrics: &StatelessMetrics,
 ) -> Result<Verdict, DeceptionError> {
     let banner = banners(info.dst_port);
     if let Some(reply) = packet::udp_response(pkt, &banner) {
         send_reply(&reply, socks)?;
+        metrics.record_udp_response();
     }
     Ok(Verdict::Drop)
 }

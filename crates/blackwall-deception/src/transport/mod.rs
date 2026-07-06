@@ -1,9 +1,11 @@
 //! Deception traffic transports.
 
+mod metrics;
 mod nfqueue;
 mod packet;
 mod tproxy;
 
+pub use metrics::StatelessMetrics;
 pub use nfqueue::{run as run_nfqueue, BannerLookup};
 // Pure, byte-exact stateless TCP SYN-cookie packet builders (Component 2 of
 // the stateless SYN-cookie tier design), plus the request parser the NFQUEUE

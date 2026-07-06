@@ -7,7 +7,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use blackwall_deception::transport::{run_nfqueue, serve, BannerLookup, TproxyListener};
+use blackwall_deception::transport::{
+    run_nfqueue, serve, BannerLookup, StatelessMetrics, TproxyListener,
+};
 use blackwall_deception::{default_registry, CookieKey, EngineLimits, SharedBanners};
 use blackwall_discovery::IncusClient;
 use blackwall_speedtest::providers::{
@@ -1402,6 +1404,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     collector: Some(collector_metrics.clone()),
                     inflight: None,
                     xdp: xdp_for_metrics.clone(),
+                    stateless: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1594,6 +1597,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             // Live in-flight deception-session gauge (shared with /metrics).
             let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Stateless SYN-cookie / UDP responder counters (shared with /metrics).
+            let stateless_metrics = std::sync::Arc::new(StatelessMetrics::new());
 
             let mut transports = tokio::task::JoinSet::new();
             transports.spawn(serve(
@@ -1622,13 +1627,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     collector: None,
                     inflight: Some(inflight.clone()),
                     xdp: None,
+                    stateless: Some(stateless_metrics.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
             transports.spawn(async move {
                 // run_nfqueue is blocking/sync; run it on a blocking thread.
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(err) = run_nfqueue(nfqueue_num, cookie_key, banner_lookup) {
+                    if let Err(err) =
+                        run_nfqueue(nfqueue_num, cookie_key, banner_lookup, stateless_metrics)
+                    {
                         tracing::error!(%err, "nfqueue loop exited");
                     }
                 })
