@@ -29,6 +29,13 @@ struct RateLimitEntry {
     origin: XdpOrigin,
     pps: u64,
     burst: u64,
+    /// The victim this source was rate-limited on behalf of, for an
+    /// auto-installed entry (`None` for a manual one). Persisted alongside
+    /// the rate limit so a restart can rebuild `by_target` (see
+    /// [`XdpController::mark_resumed`]); only the first victim a shared
+    /// source was installed for is retained, matching the one-row-per-source
+    /// granularity of the `xdp_entries` mirror.
+    victim: Option<IpAddr>,
 }
 
 /// A decision the [`XdpController`] emits for the executor to apply.
@@ -45,6 +52,11 @@ pub enum XdpAction {
         pps: u64,
         /// Burst bucket size, in packets.
         burst: u64,
+        /// The victim this rate limit was installed for, when auto-installed
+        /// from a detection (`None` for a manual, operator-issued rate
+        /// limit). Carried end-to-end so the journal can persist it and a
+        /// restart can rebuild [`XdpController`]'s victim -> sources map.
+        victim: Option<IpAddr>,
     },
     /// Drop all traffic matching `net`.
     Block {
@@ -184,6 +196,7 @@ impl XdpController {
             origin: XdpOrigin::Manual,
             pps,
             burst,
+            victim: None,
         };
         match self.rate_limited.entry(addr) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -192,6 +205,7 @@ impl XdpController {
                     src: addr,
                     pps,
                     burst,
+                    victim: None,
                 });
             }
             std::collections::hash_map::Entry::Vacant(_) if at_cap => {
@@ -208,6 +222,7 @@ impl XdpController {
             src: addr,
             pps,
             burst,
+            victim: None,
         })
     }
 
@@ -261,6 +276,7 @@ impl XdpController {
                         src: *src,
                         pps: entry.pps,
                         burst: entry.burst,
+                        victim: entry.victim,
                     },
                     entry.origin,
                 )
@@ -277,11 +293,32 @@ impl XdpController {
     /// Fold a persisted active entry into the controller's bookkeeping
     /// (cap accounting + dedup) on restart, without emitting an action of its
     /// own — the caller (the manager) re-issues the executor call directly.
+    ///
+    /// For a resumed `RateLimit` with a known `victim`, also repopulates
+    /// `by_target[victim]` with `src` — this is what lets a later `Cleared`
+    /// for that victim correctly find and release the source, closing the
+    /// restart-orphan gap that motivated persisting `victim` in the first
+    /// place (see the module-level `xdp_entries.victim` column).
     pub fn mark_resumed(&mut self, action: &XdpAction, origin: XdpOrigin) {
         match *action {
-            XdpAction::RateLimit { src, pps, burst } => {
-                self.rate_limited
-                    .insert(src, RateLimitEntry { origin, pps, burst });
+            XdpAction::RateLimit {
+                src,
+                pps,
+                burst,
+                victim,
+            } => {
+                self.rate_limited.insert(
+                    src,
+                    RateLimitEntry {
+                        origin,
+                        pps,
+                        burst,
+                        victim,
+                    },
+                );
+                if let Some(victim) = victim {
+                    self.by_target.entry(victim).or_default().insert(src);
+                }
             }
             XdpAction::Block { net } => {
                 self.blocked_nets.insert(net, origin);
@@ -318,6 +355,7 @@ impl XdpController {
                     origin: XdpOrigin::Auto,
                     pps: self.default_rate_pps,
                     burst: self.default_rate_pps,
+                    victim: Some(d.target),
                 },
             );
             self.by_target.entry(d.target).or_default().insert(*src);
@@ -325,6 +363,7 @@ impl XdpController {
                 src: *src,
                 pps: self.default_rate_pps,
                 burst: self.default_rate_pps,
+                victim: Some(d.target),
             });
         }
         actions
@@ -592,5 +631,79 @@ mod tests {
             }
             other => panic!("expected RateLimit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mark_resumed_rebuilds_by_target_so_cleared_releases_the_source() {
+        // Regression test for #119: a restart rehydrates a persisted auto
+        // rate-limit via `mark_resumed`. Before the fix, `by_target` stayed
+        // empty across the restart, so a later `Cleared` for the victim
+        // found nothing to release and the source stayed rate-limited
+        // forever. With the fix, `mark_resumed` repopulates `by_target` from
+        // the resumed action's `victim`, so `Cleared` emits `ClearRate` for
+        // the source, exactly as it would have in the pre-restart session.
+        let mut c = XdpController::new(own(), 100, 1000);
+        let victim: IpAddr = "203.0.113.7".parse().unwrap();
+        let src: IpAddr = "198.51.100.9".parse().unwrap();
+
+        c.mark_resumed(
+            &XdpAction::RateLimit {
+                src,
+                pps: 1000,
+                burst: 1000,
+                victim: Some(victim),
+            },
+            XdpOrigin::Auto,
+        );
+        assert_eq!(
+            c.active_entries().len(),
+            1,
+            "the resumed rate limit must be in the active set"
+        );
+
+        let acts = c.on_detection(&DetectionEvent::Cleared {
+            target: victim,
+            at_ms: 1000,
+        });
+        assert_eq!(
+            acts,
+            vec![XdpAction::ClearRate { src }],
+            "Cleared must release the resumed source now that by_target was rebuilt"
+        );
+        assert!(c.active_entries().is_empty());
+    }
+
+    #[test]
+    fn mark_resumed_without_victim_does_not_populate_by_target() {
+        // A resumed manual rate-limit (no victim) must not create a
+        // `by_target` entry: nothing should auto-clear it, since it was
+        // never tied to a detection in the first place.
+        let mut c = XdpController::new(own(), 100, 1000);
+        let victim: IpAddr = "203.0.113.7".parse().unwrap();
+        let src: IpAddr = "198.51.100.9".parse().unwrap();
+
+        c.mark_resumed(
+            &XdpAction::RateLimit {
+                src,
+                pps: 500,
+                burst: 500,
+                victim: None,
+            },
+            XdpOrigin::Manual,
+        );
+
+        let acts = c.on_detection(&DetectionEvent::Cleared {
+            target: victim,
+            at_ms: 1000,
+        });
+        assert!(
+            acts.is_empty(),
+            "a resumed manual rate-limit has no victim to be cleared by"
+        );
+        assert_eq!(
+            c.active_entries().len(),
+            1,
+            "the resumed manual rate-limit must remain active"
+        );
     }
 }
