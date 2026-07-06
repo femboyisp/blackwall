@@ -136,6 +136,7 @@ mod tests {
             engine: crate::EngineConfig::default(),
             flowtable: None,
             xdp: None,
+            stateless_tcp_ports: Vec::new(),
         }
     }
 
@@ -298,6 +299,7 @@ mod tests {
             engine: crate::EngineConfig::default(),
             flowtable: None,
             xdp: None,
+            stateless_tcp_ports: Vec::new(),
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
