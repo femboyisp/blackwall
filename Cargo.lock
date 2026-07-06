@@ -191,6 +191,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-cookie"
+version = "0.1.0"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "blackwall-core"
 version = "0.1.0"
 dependencies = [
@@ -206,12 +213,12 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "blackwall-cookie",
  "blackwall-core",
  "blackwall-nft",
  "etherparse",
  "libc",
  "nfq",
- "siphasher",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
