@@ -11,6 +11,7 @@ name = "blackwall-xdp"
 path = "src/main.rs"
 
 [dependencies]
+blackwall-cookie = { path = "../blackwall-cookie" }
 blackwall-xdp-common = { path = "../blackwall-xdp-common" }
 aya-ebpf = "0.1.1"
 network-types = "0.0.7"

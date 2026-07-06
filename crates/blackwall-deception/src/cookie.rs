@@ -6,33 +6,20 @@
 //! cookie is fully recomputed from the returning ACK. This mirrors the shape
 //! of Linux's `net/ipv4/syncookies.c`.
 //!
-//! The core (`make_cookie_raw` / `check_cookie_raw`) takes raw octet slices
-//! and primitives only — no `String`/`Vec`/allocation in the hot path — so
-//! the identical logic can be called from a `#![no_std]` eBPF crate (the B2
-//! XDP promotion) and produce byte-identical cookies to this userspace tier.
+//! The raw cookie math (hot-path hashing over raw octet slices and
+//! primitives, no `String`/`Vec`/allocation) lives in the `#![no_std]`
+//! [`blackwall_cookie`] crate, which this module re-exports / wraps. That
+//! same crate is depended on directly by the `#![no_std]` XDP eBPF program
+//! (the B2 in-kernel SYN-cookie promotion), so userspace and XDP compile the
+//! identical hashing code and produce byte-identical cookies — there is no
+//! second implementation to drift out of sync. This module keeps the
+//! `std`-flavored ergonomics on top: [`CookieKey`] (redacted `Debug`) and
+//! [`ConnTuple`] (`IpAddr`-based, no manual octet handling).
 
 use std::fmt;
 use std::net::IpAddr;
 
-use siphasher::sip::SipHasher24;
-
-/// Plausible MSS values a stateless SYN-ACK can advertise, smallest first.
-///
-/// Mirrors the shape of Linux's `msstab`: [`mss_index_for`] picks the
-/// largest entry that is less than or equal to the client's advertised MSS.
-pub const MSS_TABLE: [u16; 8] = [216, 536, 1200, 1360, 1400, 1440, 1460, 8960];
-
-/// Right-shift applied to the Unix timestamp (seconds) to obtain the coarse
-/// time counter `t`. A shift of 6 yields 64-second time slots.
-pub const COUNTER_SHIFT: u32 = 6;
-
-/// Number of low bits of the SipHash output kept in the cookie (21 bits).
-const HASH_MASK: u64 = 0x001F_FFFF;
-
-/// Maximum size of the scratch buffer hashed per cookie: two 16-byte (IPv6)
-/// addresses, two 2-byte ports, an 8-byte time counter, and a 1-byte MSS
-/// index.
-const MAX_TUPLE_BUF: usize = 16 + 2 + 16 + 2 + 8 + 1;
+pub use blackwall_cookie::{mss_index_for, COUNTER_SHIFT, MSS_TABLE};
 
 /// A 128-bit secret key for the SYN-cookie SipHash, with a redacted [`Debug`].
 ///
@@ -98,81 +85,12 @@ fn ip_addr_octets(addr: IpAddr, buf: &mut [u8; 16]) -> usize {
     }
 }
 
-/// Pick the MSS-table index (0..=7) whose value is the largest entry in
-/// [`MSS_TABLE`] that is less than or equal to `client_mss`. Falls back to
-/// index 0 (the smallest table entry) if `client_mss` is smaller than every
-/// table entry.
-#[must_use]
-pub fn mss_index_for(client_mss: u16) -> u8 {
-    let mut idx: u8 = 0;
-    for (i, &mss) in MSS_TABLE.iter().enumerate() {
-        if mss <= client_mss {
-            // `i` ranges over `0..MSS_TABLE.len()` (8), always fits in `u8`.
-            idx = u8::try_from(i).unwrap_or(idx);
-        }
-    }
-    idx
-}
-
-/// Decode the MSS-table index (bits 21..=23) out of a cookie value.
-fn decode_mss_index(cookie: u32) -> u8 {
-    let idx = (cookie >> 21) & 0x7;
-    // Masked to 3 bits, always < 8, always fits in `u8`.
-    u8::try_from(idx).unwrap_or(0)
-}
-
-/// Hash the connection tuple, time counter, and MSS index with the keyed
-/// SipHash-2-4, then assemble the cookie: top byte is the low 8 bits of `t`,
-/// next 3 bits are `mss_index`, and the low 21 bits are the truncated hash.
-fn cookie_for_slot(
-    key: &CookieKey,
-    src_octets: &[u8],
-    src_port: u16,
-    dst_octets: &[u8],
-    dst_port: u16,
-    mss_index: u8,
-    t: u64,
-) -> u32 {
-    let mut buf = [0_u8; MAX_TUPLE_BUF];
-    let mut pos = 0_usize;
-
-    buf[pos..pos + src_octets.len()].copy_from_slice(src_octets);
-    pos += src_octets.len();
-
-    let src_port_bytes = src_port.to_be_bytes();
-    buf[pos..pos + src_port_bytes.len()].copy_from_slice(&src_port_bytes);
-    pos += src_port_bytes.len();
-
-    buf[pos..pos + dst_octets.len()].copy_from_slice(dst_octets);
-    pos += dst_octets.len();
-
-    let dst_port_bytes = dst_port.to_be_bytes();
-    buf[pos..pos + dst_port_bytes.len()].copy_from_slice(&dst_port_bytes);
-    pos += dst_port_bytes.len();
-
-    let t_bytes = t.to_be_bytes();
-    buf[pos..pos + t_bytes.len()].copy_from_slice(&t_bytes);
-    pos += t_bytes.len();
-
-    buf[pos] = mss_index;
-    pos += 1;
-
-    let (k0, k1) = key.to_u64_pair();
-    let hasher = SipHasher24::new_with_keys(k0, k1);
-    let hash = hasher.hash(&buf[..pos]);
-
-    // `t & 0xFF` is < 256 by construction, always fits in `u8`.
-    let t_low = u8::try_from(t & 0xFF).unwrap_or(0);
-    // `hash & HASH_MASK` is < 2^21 by construction, always fits in `u32`.
-    let hash_low = u32::try_from(hash & HASH_MASK).unwrap_or(0);
-
-    (u32::from(t_low) << 24) | (u32::from(mss_index & 0x7) << 21) | hash_low
-}
-
 /// Low-level cookie construction over raw address octets, ports, MSS, and
-/// the current time. This is the `no_std`-friendly core B2's eBPF crate
-/// calls directly (no `IpAddr`, no allocation): `src_octets`/`dst_octets`
-/// are the address's canonical bytes (4 for IPv4, 16 for IPv6).
+/// the current time. This is the thin `std` wrapper over
+/// [`blackwall_cookie::make_cookie_raw`] — the actual `no_std`-friendly core
+/// B2's eBPF crate calls directly (no `IpAddr`, no allocation):
+/// `src_octets`/`dst_octets` are the address's canonical bytes (4 for IPv4,
+/// 16 for IPv6).
 ///
 /// Returns `(cookie_seq, mss_used)`.
 #[must_use]
@@ -185,17 +103,15 @@ pub fn make_cookie_raw(
     client_mss: u16,
     now_secs: u64,
 ) -> (u32, u16) {
-    let mss_index = mss_index_for(client_mss);
-    let mss_used = MSS_TABLE[usize::from(mss_index)];
-    let t = now_secs >> COUNTER_SHIFT;
-    let cookie = cookie_for_slot(
-        key, src_octets, src_port, dst_octets, dst_port, mss_index, t,
-    );
-    (cookie, mss_used)
+    let (k0, k1) = key.to_u64_pair();
+    blackwall_cookie::make_cookie_raw(
+        k0, k1, src_octets, src_port, dst_octets, dst_port, client_mss, now_secs,
+    )
 }
 
 /// Low-level cookie validation over raw address octets, ports, the ACK's
-/// sequence number, and the current time. The `no_std`-friendly counterpart
+/// sequence number, and the current time. The thin `std` wrapper over
+/// [`blackwall_cookie::check_cookie_raw`], the `no_std`-friendly counterpart
 /// to [`make_cookie_raw`].
 ///
 /// The ACK carries `ack_seq == cookie_seq + 1`. Recomputes the expected
@@ -212,19 +128,10 @@ pub fn check_cookie_raw(
     ack_seq: u32,
     now_secs: u64,
 ) -> Option<u16> {
-    let cookie = ack_seq.wrapping_sub(1);
-    let mss_index = decode_mss_index(cookie);
-    let t_now = now_secs >> COUNTER_SHIFT;
-
-    for t in [t_now, t_now.wrapping_sub(1)] {
-        let expected = cookie_for_slot(
-            key, src_octets, src_port, dst_octets, dst_port, mss_index, t,
-        );
-        if expected == cookie {
-            return Some(MSS_TABLE[usize::from(mss_index)]);
-        }
-    }
-    None
+    let (k0, k1) = key.to_u64_pair();
+    blackwall_cookie::check_cookie_raw(
+        k0, k1, src_octets, src_port, dst_octets, dst_port, ack_seq, now_secs,
+    )
 }
 
 /// Build a SYN-cookie for `tuple` and the client's advertised MSS.
@@ -453,6 +360,22 @@ mod tests {
                 NOW
             )
         );
+    }
+
+    /// Golden vector shared with `blackwall_cookie`'s own
+    /// `golden_vector_v4_cookie` test (same key bytes, tuple, MSS, and time):
+    /// the `std` wrapper here must produce the exact same cookie as the
+    /// `no_std` core the eBPF crate links directly, proving the wrapper adds
+    /// no divergence.
+    #[test]
+    fn golden_vector_matches_shared_core() {
+        let tuple = v4_tuple();
+        let (seq, mss) = make_cookie(&KEY, &tuple, 1460, NOW);
+        assert_eq!(
+            seq, 0x09D7_DE6F,
+            "must match blackwall_cookie's golden vector"
+        );
+        assert_eq!(mss, 1460);
     }
 
     #[test]
