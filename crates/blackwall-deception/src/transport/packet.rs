@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use etherparse::{
     Icmpv4Header, Icmpv4Type, Icmpv6Header, Icmpv6Type, Ipv4Header, Ipv6Header, PacketHeaders,
-    TcpHeader, TcpOptionElement, TransportHeader,
+    TcpHeader, TcpOptionElement, TransportHeader, UdpHeader,
 };
 
 /// TCP advertised window size used by the stateless responder's replies.
@@ -352,6 +352,126 @@ pub fn tcp_banner_fin(ack_request: &[u8], banner: &[u8]) -> Option<Vec<u8>> {
         let payload_len = u16::try_from(reply_tcp.header_len() + banner.len()).ok()?;
         let reply_ip6 = swapped_ipv6_reply(ip6, payload_len);
         write_ipv6_tcp(reply_ip6, reply_tcp, banner)
+    } else {
+        None
+    }
+}
+
+/// The fields the stateless NFQUEUE dispatcher needs to route an incoming UDP
+/// datagram: its destination port (to look up a canned banner) and the
+/// request's UDP payload length (the reflection-amplification budget
+/// available to any reply — see [`udp_response`]).
+///
+/// Pure and side-effect free; the NFQUEUE transport (coverage-excluded I/O)
+/// calls this to decide which stateless reply, if any, to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpRequestInfo {
+    /// Server (destination) port.
+    pub dst_port: u16,
+    /// Length in bytes of the request's UDP payload.
+    pub payload_len: usize,
+}
+
+/// Parse a raw IPv4 or IPv6 datagram carrying a UDP datagram into a
+/// [`UdpRequestInfo`], for the stateless dispatcher to route.
+///
+/// Returns `None` if `request` is not a well-formed IPv4/IPv6 datagram
+/// carrying a UDP datagram.
+#[must_use]
+pub fn parse_udp_request(request: &[u8]) -> Option<UdpRequestInfo> {
+    let headers = PacketHeaders::from_ip_slice(request).ok()?;
+    let net = headers.net?;
+    if net.ipv4_ref().is_none() && net.ipv6_ref().is_none() {
+        return None;
+    }
+
+    let udp = match headers.transport? {
+        TransportHeader::Udp(h) => h,
+        _ => return None,
+    };
+
+    Some(UdpRequestInfo {
+        dst_port: udp.destination_port,
+        payload_len: headers.payload.slice().len(),
+    })
+}
+
+/// Parse a raw IPv4 or IPv6 datagram carrying a UDP request and build a
+/// stateless reply datagram carrying (a prefix of) `payload`, with
+/// source/destination addresses and UDP ports swapped and the UDP/IP
+/// checksums recomputed.
+///
+/// **Reflection-amplification guard (mandatory):** the reply's UDP payload
+/// is truncated to at most the length of the *request's* UDP payload, so the
+/// reply can never be larger than the datagram that triggered it
+/// (amplification factor <= 1) — this is what makes it safe to answer
+/// arbitrary, unauthenticated UDP probes: Blackwall can never be weaponised
+/// as a UDP reflector/amplifier. If the request's UDP payload is empty there
+/// is nothing that can be safely reflected, and this returns `None` rather
+/// than manufacture a reply out of thin air.
+///
+/// Returns `None` if `request` is not a well-formed IPv4/IPv6 datagram
+/// carrying a UDP datagram, or if the request's UDP payload is empty.
+pub fn udp_response(request: &[u8], payload: &[u8]) -> Option<Vec<u8>> {
+    let headers = PacketHeaders::from_ip_slice(request).ok()?;
+    let net = headers.net?;
+
+    let udp = match headers.transport? {
+        TransportHeader::Udp(h) => h,
+        _ => return None,
+    };
+
+    let request_payload_len = headers.payload.slice().len();
+    if request_payload_len == 0 {
+        return None;
+    }
+    // Amplification guard: never reply with more than was received.
+    let reply_len = payload.len().min(request_payload_len);
+    let reply_payload = &payload[..reply_len];
+
+    if let Some((ip4, _)) = net.ipv4_ref() {
+        let udp_len = u16::try_from(UdpHeader::LEN + reply_payload.len()).ok()?;
+        let mut reply_ip4 = Ipv4Header::new(
+            udp_len,
+            ip4.time_to_live,
+            ip4.protocol,
+            ip4.destination, // swap: original dst becomes new src
+            ip4.source,      // swap: original src becomes new dst
+        )
+        .ok()?;
+        let reply_udp = UdpHeader::with_ipv4_checksum(
+            udp.destination_port, // swap
+            udp.source_port,      // swap
+            &reply_ip4,
+            reply_payload,
+        )
+        .ok()?;
+        reply_ip4.header_checksum = reply_ip4.calc_header_checksum();
+
+        let mut out = Vec::with_capacity(
+            reply_ip4.header_len() + reply_udp.header_len() + reply_payload.len(),
+        );
+        reply_ip4.write(&mut out).ok()?;
+        reply_udp.write(&mut out).ok()?;
+        out.extend_from_slice(reply_payload);
+        Some(out)
+    } else if let Some((ip6, _)) = net.ipv6_ref() {
+        let udp_len = u16::try_from(UdpHeader::LEN + reply_payload.len()).ok()?;
+        let reply_ip6 = swapped_ipv6_reply(ip6, udp_len);
+        let reply_udp = UdpHeader::with_ipv6_checksum(
+            udp.destination_port, // swap
+            udp.source_port,      // swap
+            &reply_ip6,
+            reply_payload,
+        )
+        .ok()?;
+
+        let mut out =
+            Vec::with_capacity(Ipv6Header::LEN + reply_udp.header_len() + reply_payload.len());
+        reply_ip6.write(&mut out).ok()?;
+        reply_udp.write(&mut out).ok()?;
+        out.extend_from_slice(reply_payload);
+        Some(out)
     } else {
         None
     }
@@ -931,5 +1051,192 @@ mod tests {
             "banner+FIN seq must equal what the client acked (cookie_seq + 1)"
         );
         assert_eq!(banner_fin_tcp.sequence_number, cookie_seq + 1);
+    }
+
+    fn build_udp_v4(
+        src: [u8; 4],
+        dst: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let builder = PacketBuilder::ipv4(src, dst, 64).udp(src_port, dst_port);
+        let mut pkt = Vec::new();
+        builder.write(&mut pkt, payload).unwrap();
+        pkt
+    }
+
+    fn build_udp_v6(
+        src: [u8; 16],
+        dst: [u8; 16],
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let builder = PacketBuilder::ipv6(src, dst, 64).udp(src_port, dst_port);
+        let mut pkt = Vec::new();
+        builder.write(&mut pkt, payload).unwrap();
+        pkt
+    }
+
+    /// Pull the UDP header and IP header pair out of a serialized reply,
+    /// panicking if the reply is not a well-formed IPv4+UDP datagram.
+    fn parse_v4_udp(pkt: &[u8]) -> (Ipv4Header, UdpHeader, Vec<u8>) {
+        let parsed = PacketHeaders::from_ip_slice(pkt).unwrap();
+        let net = parsed.net.unwrap();
+        let (ip4, _) = net.ipv4_ref().unwrap();
+        let ip4 = ip4.clone();
+        let udp = match parsed.transport.unwrap() {
+            TransportHeader::Udp(h) => h,
+            other => panic!("expected UDP, got {other:?}"),
+        };
+        (ip4, udp, parsed.payload.slice().to_owned())
+    }
+
+    /// Pull the UDP header and IP header pair out of a serialized reply,
+    /// panicking if the reply is not a well-formed IPv6+UDP datagram.
+    fn parse_v6_udp(pkt: &[u8]) -> (Ipv6Header, UdpHeader, Vec<u8>) {
+        let parsed = PacketHeaders::from_ip_slice(pkt).unwrap();
+        let net = parsed.net.unwrap();
+        let (ip6, _) = net.ipv6_ref().unwrap();
+        let ip6 = ip6.clone();
+        let udp = match parsed.transport.unwrap() {
+            TransportHeader::Udp(h) => h,
+            other => panic!("expected UDP, got {other:?}"),
+        };
+        (ip6, udp, parsed.payload.slice().to_owned())
+    }
+
+    #[test]
+    fn udp_response_v4_swaps_addresses_ports_and_truncates_to_request_len() {
+        let client = [10, 0, 0, 1];
+        let server = [10, 0, 0, 2];
+        // 8-byte request payload; candidate reply is longer (12 bytes) so the
+        // amplification guard must truncate it to 8.
+        let request = build_udp_v4(client, server, 54_321, 53, b"12345678");
+        let candidate_reply = b"012345678901";
+
+        let reply = udp_response(&request, candidate_reply).expect("reply should be Some");
+        let (ip4, udp, payload) = parse_v4_udp(&reply);
+
+        assert_eq!(ip4.source, server, "source should be the original dest");
+        assert_eq!(ip4.destination, client, "dest should be the original src");
+        assert_eq!(udp.source_port, 53);
+        assert_eq!(udp.destination_port, 54_321);
+        assert_eq!(payload.len(), 8, "reply must be truncated to request len");
+        assert_eq!(payload, &candidate_reply[..8]);
+
+        assert_eq!(
+            udp.checksum,
+            udp.calc_checksum_ipv4(&ip4, &payload).unwrap(),
+            "UDP checksum must be valid"
+        );
+        assert_eq!(
+            ip4.header_checksum,
+            ip4.calc_header_checksum(),
+            "IPv4 header checksum must be valid"
+        );
+    }
+
+    #[test]
+    fn udp_response_v4_happy_path_shorter_reply_is_unchanged() {
+        let client = [10, 0, 0, 1];
+        let server = [10, 0, 0, 2];
+        let request = build_udp_v4(client, server, 12_345, 53, b"a 20-byte-ish query!");
+        let candidate_reply = b"a short answer";
+
+        let reply = udp_response(&request, candidate_reply).expect("reply should be Some");
+        let (_, _, payload) = parse_v4_udp(&reply);
+        assert_eq!(
+            payload, candidate_reply,
+            "a reply not exceeding the request len must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn udp_response_returns_none_for_zero_byte_request_payload() {
+        let request = build_udp_v4([10, 0, 0, 1], [10, 0, 0, 2], 54_321, 53, b"");
+        assert!(
+            udp_response(&request, b"anything").is_none(),
+            "a zero-byte request payload must not be reflected"
+        );
+    }
+
+    #[test]
+    fn udp_response_v6_happy_path_and_checksum() {
+        let client = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let server = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let request = build_udp_v6(client, server, 54_321, 123, b"ntp-ish request!");
+        let candidate_reply = b"ntp-ish reply";
+
+        let reply = udp_response(&request, candidate_reply).expect("reply should be Some");
+        let (ip6, udp, payload) = parse_v6_udp(&reply);
+
+        assert_eq!(ip6.source, server, "source should be the original dest");
+        assert_eq!(ip6.destination, client, "dest should be the original src");
+        assert_eq!(udp.source_port, 123);
+        assert_eq!(udp.destination_port, 54_321);
+        assert_eq!(payload, candidate_reply);
+
+        assert_eq!(
+            udp.checksum,
+            udp.calc_checksum_ipv6(&ip6, &payload).unwrap(),
+            "UDP checksum must be valid over the v6 pseudo-header"
+        );
+    }
+
+    #[test]
+    fn udp_response_v6_amplification_guard_truncates() {
+        let client = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let server = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let request = build_udp_v6(client, server, 54_321, 123, b"abcd");
+        let candidate_reply = b"much longer than the four byte request";
+
+        let reply = udp_response(&request, candidate_reply).expect("reply should be Some");
+        let (_, _, payload) = parse_v6_udp(&reply);
+        assert_eq!(payload.len(), 4, "reply must be truncated to request len");
+        assert_eq!(payload, b"much");
+    }
+
+    #[test]
+    fn udp_response_returns_none_for_non_udp() {
+        let tcp_request = build_tcp_syn_v4([10, 0, 0, 1], [10, 0, 0, 2], 1234, 80, 1_000);
+        assert!(
+            udp_response(&tcp_request, b"reply").is_none(),
+            "TCP packet should return None"
+        );
+
+        let icmp_request = build_icmpv4_request([10, 0, 0, 1], [10, 0, 0, 2], 1, 1, b"");
+        assert!(
+            udp_response(&icmp_request, b"reply").is_none(),
+            "ICMP packet should return None"
+        );
+    }
+
+    #[test]
+    fn parse_udp_request_reads_dst_port_and_payload_len_v4() {
+        let request = build_udp_v4([10, 0, 0, 1], [10, 0, 0, 2], 54_321, 53, b"12345678");
+        let info = parse_udp_request(&request).expect("should parse");
+        assert_eq!(info.dst_port, 53);
+        assert_eq!(info.payload_len, 8);
+    }
+
+    #[test]
+    fn parse_udp_request_reads_dst_port_and_payload_len_v6() {
+        let client = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let server = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let request = build_udp_v6(client, server, 54_321, 123, b"abcde");
+        let info = parse_udp_request(&request).expect("should parse");
+        assert_eq!(info.dst_port, 123);
+        assert_eq!(info.payload_len, 5);
+    }
+
+    #[test]
+    fn parse_udp_request_returns_none_for_non_udp() {
+        let request = build_tcp_syn_v4([10, 0, 0, 1], [10, 0, 0, 2], 1234, 80, 1_000);
+        assert!(
+            parse_udp_request(&request).is_none(),
+            "non-UDP packet should return None"
+        );
     }
 }
