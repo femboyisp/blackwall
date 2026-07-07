@@ -561,6 +561,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     interface: None,
                     mode: XdpMode::default(),
                     default_rate_limit_pps: None,
+                    cookie_ports: Vec::new(),
                 };
                 for tok in &line.words[1..] {
                     let (k, v) = tok
@@ -584,6 +585,18 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                                 return Err(bad("xdp default-rate-limit", "must be >= 1"));
                             }
                             cfg.default_rate_limit_pps = Some(n);
+                        }
+                        "cookie-ports" => {
+                            for port_tok in v.split(',') {
+                                let port_tok = port_tok.trim();
+                                let n: u16 = port_tok
+                                    .parse()
+                                    .map_err(|_| bad("xdp cookie-ports", port_tok))?;
+                                if n == 0 {
+                                    return Err(bad("xdp cookie-ports", port_tok));
+                                }
+                                cfg.cookie_ports.push(n);
+                            }
                         }
                         other => return Err(bad("xdp key", other)),
                     }
@@ -1650,6 +1663,42 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
         assert_eq!(x.interface.as_deref(), Some("eth0"));
         assert_eq!(x.mode, blackwall_core::XdpMode::Native);
         assert_eq!(x.default_rate_limit_pps, Some(1000));
+        assert!(x.cookie_ports.is_empty());
+    }
+
+    #[test]
+    fn parses_xdp_cookie_ports() {
+        let p =
+            parse_text("interface wan eth0\nxdp interface=eth0 cookie-ports=8080,443\n").unwrap();
+        let x = p.xdp.expect("xdp set");
+        assert_eq!(x.cookie_ports, vec![8080, 443]);
+    }
+
+    #[test]
+    fn rejects_xdp_cookie_ports_bad() {
+        let err = parse_text("interface wan eth0\nxdp cookie-ports=8080,0\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp cookie-ports",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+
+        let err = parse_text("interface wan eth0\nxdp cookie-ports=notaport\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp cookie-ports",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

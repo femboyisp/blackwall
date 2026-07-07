@@ -26,4 +26,11 @@ pub struct XdpConfig {
     /// identified attacker source; `None` means the sink drops nothing
     /// automatically and only operator CLI actions populate the maps.
     pub default_rate_limit_pps: Option<u64>,
+    /// Deception TCP ports the in-kernel SYN-cookie fast path answers on
+    /// behalf of the box's owned prefixes (`cookie-ports=` directive). Empty
+    /// (the default) leaves the fast path inert: the flow daemon never loads
+    /// the cookie secret/protected prefixes/ports into the XDP maps, and the
+    /// eBPF SYN handler falls through to `XDP_PASS` for every port (B2.3a/b
+    /// fail-closed behavior).
+    pub cookie_ports: Vec<u16>,
 }
