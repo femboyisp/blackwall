@@ -2,10 +2,26 @@
 //!
 //! Parses `Ethernet -> IPv4/IPv6` with explicit bounds checks, then applies, in
 //! order, per source address: (1) an LPM blocklist drop, (2) a per-source LRU
-//! token-bucket rate-limit drop, and otherwise (3) pass. Every decision bumps a
-//! per-CPU stats counter keyed by reason code. Map names (`BLOCK_V4`,
-//! `BLOCK_V6`, `RATE`, `STATS`) and the shared POD layouts in
-//! `blackwall-xdp-common` form the contract consumed by the userspace loader.
+//! token-bucket rate-limit drop, (3) — for an IPv4 TCP **SYN** (ACK clear) — an
+//! in-kernel SipHash-cookie **SYN-ACK** answered via `XDP_TX` (sub-project
+//! B2.2), and otherwise (4) pass. Every decision bumps a per-CPU stats counter
+//! keyed by reason code. Map names (`BLOCK_V4`, `BLOCK_V6`, `RATE`, `STATS`)
+//! and the shared POD layouts in `blackwall-xdp-common` form the contract
+//! consumed by the userspace loader.
+//!
+//! # In-kernel SYN-cookie (B2.2)
+//!
+//! On an IPv4 TCP segment with SYN set and ACK clear, [`try_synack_v4`]
+//! transforms the packet **in place, at the same byte length**, into a SYN-ACK
+//! whose sequence number is a stateless SipHash SYN-cookie (computed by the
+//! shared [`blackwall_cookie`] core, byte-identical to the userspace deception
+//! tier) and bounces it back out the ingress interface with `XDP_TX`, absorbing
+//! SYN floods at the driver level ahead of nft. A legitimate client's
+//! subsequent ACK is **not** validated here — it falls through to `XDP_PASS`
+//! and the existing userspace NFQUEUE tier validates the cookie (with the same
+//! key) and serves the banner. That key-sharing, IPv6, a config-driven
+//! protected-port set, and a real wall-clock time source are B2.3; see the
+//! `// B2.3:` markers below.
 //!
 //! # `as`-cast exemption
 //!
@@ -24,13 +40,15 @@ use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{LpmTrie, LruHashMap, PerCpuArray};
 use aya_ebpf::programs::XdpContext;
-use blackwall_cookie::{check_cookie_raw, make_cookie_raw};
+use blackwall_cookie::make_cookie_raw;
 use blackwall_xdp_common::{
     RateBucket, Stat, REASON_BLOCKLIST, REASON_COUNT, REASON_PASS, REASON_RATELIMIT,
+    REASON_SYNCOOKIE,
 };
 use core::mem;
 use network_types::eth::{EthHdr, EtherType};
-use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
+use network_types::ip::{IpProto, Ipv4Hdr, Ipv6Hdr};
+use network_types::tcp::TcpHdr;
 
 #[map]
 static BLOCK_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(65536, 1);
@@ -41,6 +59,78 @@ static RATE: LruHashMap<[u8; 16], RateBucket> = LruHashMap::with_max_entries(1_0
 #[map]
 static STATS: PerCpuArray<Stat> = PerCpuArray::with_max_entries(REASON_COUNT, 0);
 
+// Absolute packet offsets for the Ethernet + IPv4 (IHL 5) + TCP layout the
+// SYN-cookie fast path operates on. Every access is still `ptr_at`
+// bounds-checked; these name the byte positions, they do not assert them.
+/// Ethernet destination MAC.
+const OFF_MAC_DST: usize = 0;
+/// Ethernet source MAC.
+const OFF_MAC_SRC: usize = 6;
+/// IPv4 header start (after the Ethernet header).
+const OFF_IP: usize = EthHdr::LEN;
+/// IPv4 header-checksum field.
+const OFF_IP_CHECK: usize = OFF_IP + 10;
+/// IPv4 source address.
+const OFF_IP_SRC: usize = OFF_IP + 12;
+/// IPv4 destination address.
+const OFF_IP_DST: usize = OFF_IP + 16;
+/// TCP header start (Ethernet + 20-byte IPv4 header).
+const OFF_TCP: usize = OFF_IP + Ipv4Hdr::LEN;
+/// TCP source port.
+const OFF_TCP_SRCPORT: usize = OFF_TCP;
+/// TCP destination port.
+const OFF_TCP_DSTPORT: usize = OFF_TCP + 2;
+/// TCP sequence number.
+const OFF_TCP_SEQ: usize = OFF_TCP + 4;
+/// TCP acknowledgment number.
+const OFF_TCP_ACK: usize = OFF_TCP + 8;
+/// TCP data-offset byte (high nibble = header words, low nibble reserved).
+const OFF_TCP_DATAOFF: usize = OFF_TCP + 12;
+/// TCP flags byte (CWR..FIN); the data-offset nibble is in the byte before it.
+const OFF_TCP_FLAGS: usize = OFF_TCP + 13;
+/// TCP window field.
+const OFF_TCP_WINDOW: usize = OFF_TCP + 14;
+/// TCP checksum field.
+const OFF_TCP_CHECK: usize = OFF_TCP + 16;
+/// TCP urgent-pointer field.
+const OFF_TCP_URG: usize = OFF_TCP + 18;
+/// TCP options region (after the fixed 20-byte TCP header).
+const OFF_TCP_OPTS: usize = OFF_TCP + 20;
+
+/// TCP flags for a bare SYN-ACK: ACK (0x10) | SYN (0x02), all others clear.
+const TCP_FLAGS_SYN_ACK: u8 = 0x12;
+/// Advertised window in the SYN-ACK; mirrors the userspace tier's
+/// `STATELESS_WINDOW` so the two responders look identical on the wire.
+const SYNACK_WINDOW: u16 = 65535;
+/// Default client MSS assumed when the SYN carries no MSS option (mirrors
+/// `blackwall_deception::transport::packet::DEFAULT_CLIENT_MSS`).
+const DEFAULT_CLIENT_MSS: u16 = 1460;
+/// Upper bound on the TCP options region in bytes (data-offset nibble is 4
+/// bits, so the whole TCP header is at most 60 bytes: 60 - 20 = 40).
+const MAX_TCP_OPTS: usize = 40;
+/// Upper bound (bytes) on the TCP segment the checksum covers. A SYN carries no
+/// payload, so the segment is just the header (<= 60 bytes); segments larger
+/// than this bail to `XDP_PASS` rather than emit a wrong checksum. B2.2 scope.
+const MAX_TCP_SEG: usize = 64;
+
+// B2.3: fixed SYN-cookie secret key. In B2.3 this becomes a value read from a
+// userspace-populated BPF map, shared with the NFQUEUE tier so the ACK it later
+// receives validates against the same key. For B2.2 it is a compile-time
+// constant matching the golden vector the `BPF_PROG_TEST_RUN` test asserts
+// (bytes 0x00..=0x0f split little-endian into the SipHash (k0, k1) pair, the
+// same split `blackwall_deception::CookieKey::to_u64_pair` performs).
+const COOKIE_KEY: [u8; 16] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+];
+// B2.3: fixed cookie time base (Unix seconds). In B2.3 this becomes a real
+// wall-clock read agreed with the userspace tier (the cookie encodes a coarse
+// 64-second time slot; the validating ACK must land in the same or previous
+// slot). For B2.2 it is a constant so the emitted cookie is deterministic and
+// the test can predict it exactly. `bpf_ktime_get_ns` is imported and used by
+// the rate limiter, but it is boot-monotonic, not wall-clock, so it is *not*
+// the cookie time source.
+const COOKIE_NOW_SECS: u64 = 1_000_000;
+
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     let start = ctx.data();
@@ -49,6 +139,81 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
         return Err(());
     }
     Ok((start + offset) as *const T)
+}
+
+#[inline(always)]
+fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
+    Ok(ptr_at::<T>(ctx, offset)? as *mut T)
+}
+
+/// Bounds-checked single-byte load from the packet at `offset`.
+#[inline(always)]
+fn load_u8(ctx: &XdpContext, offset: usize) -> Result<u8, ()> {
+    let p: *const u8 = ptr_at(ctx, offset)?;
+    // SAFETY: `ptr_at` bounds-checked one byte at `offset` against `data_end`.
+    Ok(unsafe { *p })
+}
+
+/// Bounds-checked single-byte store into the packet at `offset`.
+#[inline(always)]
+fn store_u8(ctx: &XdpContext, offset: usize, value: u8) -> Result<(), ()> {
+    let p: *mut u8 = ptr_at_mut(ctx, offset)?;
+    // SAFETY: `ptr_at_mut` bounds-checked one writable byte at `offset`.
+    unsafe { *p = value };
+    Ok(())
+}
+
+/// Load a big-endian `u16` from the packet at `offset`.
+#[inline(always)]
+fn load_be16(ctx: &XdpContext, offset: usize) -> Result<u16, ()> {
+    let hi = load_u8(ctx, offset)?;
+    let lo = load_u8(ctx, offset + 1)?;
+    Ok((u16::from(hi) << 8) | u16::from(lo))
+}
+
+/// Store a `u16` big-endian into the packet at `offset`.
+#[inline(always)]
+fn store_be16(ctx: &XdpContext, offset: usize, value: u16) -> Result<(), ()> {
+    store_u8(ctx, offset, (value >> 8) as u8)?;
+    store_u8(ctx, offset + 1, (value & 0xff) as u8)
+}
+
+/// Load a big-endian `u32` from the packet at `offset`.
+#[inline(always)]
+fn load_be32(ctx: &XdpContext, offset: usize) -> Result<u32, ()> {
+    let hi = load_be16(ctx, offset)?;
+    let lo = load_be16(ctx, offset + 2)?;
+    Ok((u32::from(hi) << 16) | u32::from(lo))
+}
+
+/// Store a `u32` big-endian into the packet at `offset`.
+#[inline(always)]
+fn store_be32(ctx: &XdpContext, offset: usize, value: u32) -> Result<(), ()> {
+    store_be16(ctx, offset, (value >> 16) as u16)?;
+    store_be16(ctx, offset + 2, (value & 0xffff) as u16)
+}
+
+/// Swap `N` consecutive bytes at `a` with the `N` at `b` (constant `N` keeps
+/// the loop verifier-friendly). Used to exchange MAC/IP/port pairs in place.
+#[inline(always)]
+fn swap_bytes<const N: usize>(ctx: &XdpContext, a: usize, b: usize) -> Result<(), ()> {
+    for k in 0..N {
+        let x = load_u8(ctx, a + k)?;
+        let y = load_u8(ctx, b + k)?;
+        store_u8(ctx, a + k, y)?;
+        store_u8(ctx, b + k, x)?;
+    }
+    Ok(())
+}
+
+/// Fold a 32-bit ones-complement accumulator down to the final 16-bit Internet
+/// checksum. Two unrolled folds cover any accumulator this program produces
+/// (bounded well under `2^20`), avoiding a `while` loop.
+#[inline(always)]
+fn fold_checksum(sum: u32) -> u16 {
+    let sum = (sum & 0xffff) + (sum >> 16);
+    let sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
 }
 
 fn count(reason: u32, bytes: u64) {
@@ -64,38 +229,7 @@ fn count(reason: u32, bytes: u64) {
 
 #[xdp]
 pub fn xdp_filter(ctx: XdpContext) -> u32 {
-    // B2.1 reference: prove the shared `#![no_std]` SYN-cookie core
-    // (`blackwall-cookie`) links and is callable from this
-    // `bpfel-unknown-none` program, so the future in-kernel B2 SYN-cookie is
-    // byte-identical to the userspace deception tier's. Not yet wired into
-    // this program's packet path (that lands in B2.2, once the cookie is
-    // threaded through TCP SYN/ACK handling here); the result is discarded
-    // through `black_box` so LTO can't eliminate the call, without changing
-    // this program's pass/drop decisions.
-    let _ = core::hint::black_box(syn_cookie_reference());
     try_filter(&ctx).unwrap_or(xdp_action::XDP_PASS)
-}
-
-/// B2.1 proof that [`blackwall_cookie`]'s raw core builds and links for the
-/// `bpfel-unknown-none` target: makes and immediately validates a cookie for
-/// the exact same key/tuple/MSS/time as `blackwall_cookie`'s own
-/// `golden_vector_v4_cookie` test, so a successful call here at
-/// `BPF_PROG_TEST_RUN` time corroborates that golden vector from inside the
-/// bpf target too. XDP-side cookie generation (reading the real SYN/ACK
-/// tuple off the wire) is B2.2.
-#[inline(always)]
-fn syn_cookie_reference() -> bool {
-    const KEY_K0: u64 = 0x0706_0504_0302_0100;
-    const KEY_K1: u64 = 0x0f0e_0d0c_0b0a_0908;
-    const SRC: [u8; 4] = [203, 0, 113, 7];
-    const DST: [u8; 4] = [198, 51, 100, 1];
-    const SRC_PORT: u16 = 54_321;
-    const DST_PORT: u16 = 443;
-    const NOW: u64 = 1_000_000;
-
-    let (cookie, mss) = make_cookie_raw(KEY_K0, KEY_K1, &SRC, SRC_PORT, &DST, DST_PORT, 1460, NOW);
-    let ack = cookie.wrapping_add(1);
-    check_cookie_raw(KEY_K0, KEY_K1, &SRC, SRC_PORT, &DST, DST_PORT, ack, NOW) == Some(mss)
 }
 
 fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
@@ -105,7 +239,7 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
     let ethertype = unsafe { (*eth).ether_type };
     match ethertype {
         EtherType::Ipv4 => {
-            let ip: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+            let ip: *const Ipv4Hdr = ptr_at(ctx, OFF_IP)?;
             // SAFETY: `ptr_at` bounds-checked the IPv4 header.
             let src = unsafe { (*ip).src_addr() }.octets();
             if blocked_v4(src) {
@@ -118,9 +252,16 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 count(REASON_RATELIMIT, frame_len);
                 return Ok(xdp_action::XDP_DROP);
             }
+            // Absorb a TCP SYN in-kernel with a SipHash-cookie SYN-ACK
+            // (`XDP_TX`); anything else (non-TCP, non-SYN, malformed options)
+            // bails out of this fast path and falls through to `XDP_PASS`.
+            if let Ok(action) = try_synack_v4(ctx) {
+                count(REASON_SYNCOOKIE, frame_len);
+                return Ok(action);
+            }
         }
         EtherType::Ipv6 => {
-            let ip: *const Ipv6Hdr = ptr_at(ctx, EthHdr::LEN)?;
+            let ip: *const Ipv6Hdr = ptr_at(ctx, OFF_IP)?;
             // SAFETY: `ptr_at` bounds-checked the IPv6 header.
             let src = unsafe { (*ip).src_addr() }.octets();
             if blocked_v6(src) {
@@ -136,6 +277,219 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
     }
     count(REASON_PASS, frame_len);
     Ok(xdp_action::XDP_PASS)
+}
+
+/// Attempt the B2.2 in-kernel SYN-cookie transform on an IPv4 packet.
+///
+/// Returns `Ok(XDP_TX)` if the packet was an IPv4 (IHL 5) TCP SYN (ACK clear)
+/// with room in its options for a 4-byte MSS option, and was rewritten in place
+/// — same byte length — into a SipHash-cookie SYN-ACK ready to bounce back out
+/// the ingress interface. Returns `Err(())` for anything else (non-TCP, IP
+/// options present, not a SYN, no options room, or a segment larger than
+/// [`MAX_TCP_SEG`]); the caller then falls through to `XDP_PASS`.
+///
+/// All bounds are validated *before* any mutation, so a bail can never leave a
+/// half-rewritten packet on the wire.
+fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
+    let ip: *const Ipv4Hdr = ptr_at(ctx, OFF_IP)?;
+    // SAFETY: `ptr_at` bounds-checked the 20-byte IPv4 header.
+    let ihl = unsafe { (*ip).ihl() };
+    // SAFETY: same bounds-checked header.
+    let proto = unsafe { (*ip).proto };
+    if ihl != 5 || proto != IpProto::Tcp {
+        return Err(());
+    }
+    // SAFETY: same bounds-checked header; `tot_len` is stored big-endian.
+    let ip_total = usize::from(u16::from_be(unsafe { (*ip).tot_len }));
+
+    let tcp: *const TcpHdr = ptr_at(ctx, OFF_TCP)?;
+    // SAFETY: `ptr_at` bounds-checked the fixed 20-byte TCP header.
+    let is_syn = unsafe { (*tcp).syn() } == 1;
+    // SAFETY: same bounds-checked header.
+    let is_ack = unsafe { (*tcp).ack() } == 1;
+    if !is_syn || is_ack {
+        return Err(());
+    }
+    // SAFETY: same bounds-checked header.
+    let doff = usize::from(unsafe { (*tcp).doff() });
+    if doff < 5 {
+        return Err(());
+    }
+    let tcp_hdr_len = doff * 4;
+    let options_len = tcp_hdr_len - 20;
+    // Need at least a 4-byte MSS option's worth of options room, and cap the
+    // segment the checksum covers (a SYN has no payload).
+    if options_len < 4 || options_len > MAX_TCP_OPTS {
+        return Err(());
+    }
+    // A SYN carries no payload: require the IP total length to be exactly the
+    // IPv4 + TCP headers. This makes the checksummed TCP segment equal to the
+    // header region we rewrite (so no access reads past what we validate) and
+    // is the B2.2 scope (TCP Fast Open payloads are out of scope).
+    if ip_total != 20 + tcp_hdr_len {
+        return Err(());
+    }
+    let seg_len = tcp_hdr_len;
+    if seg_len > MAX_TCP_SEG {
+        return Err(());
+    }
+
+    // Read the client's 4-tuple, ISN, and advertised MSS.
+    let src = [
+        load_u8(ctx, OFF_IP_SRC)?,
+        load_u8(ctx, OFF_IP_SRC + 1)?,
+        load_u8(ctx, OFF_IP_SRC + 2)?,
+        load_u8(ctx, OFF_IP_SRC + 3)?,
+    ];
+    let dst = [
+        load_u8(ctx, OFF_IP_DST)?,
+        load_u8(ctx, OFF_IP_DST + 1)?,
+        load_u8(ctx, OFF_IP_DST + 2)?,
+        load_u8(ctx, OFF_IP_DST + 3)?,
+    ];
+    let src_port = load_be16(ctx, OFF_TCP_SRCPORT)?;
+    let dst_port = load_be16(ctx, OFF_TCP_DSTPORT)?;
+    let client_seq = load_be32(ctx, OFF_TCP_SEQ)?;
+    let client_mss = parse_mss(ctx)?;
+
+    // Compute the stateless SYN-cookie with the shared no_std core.
+    let (k0, k1) = cookie_keys();
+    let (cookie_seq, mss) = make_cookie_raw(
+        k0,
+        k1,
+        &src,
+        src_port,
+        &dst,
+        dst_port,
+        client_mss,
+        COOKIE_NOW_SECS,
+    );
+
+    let ack = client_seq.wrapping_add(1);
+
+    // --- in-place, same-length SYN -> SYN-ACK surgery ---
+    // Reflect the frame: swap MACs, IP addresses, TCP ports.
+    swap_bytes::<6>(ctx, OFF_MAC_DST, OFF_MAC_SRC)?;
+    swap_bytes::<4>(ctx, OFF_IP_SRC, OFF_IP_DST)?;
+    swap_bytes::<2>(ctx, OFF_TCP_SRCPORT, OFF_TCP_DSTPORT)?;
+    // Data offset kept, reserved nibble cleared; seq = cookie; ack =
+    // client_seq + 1; flags = SYN|ACK only; fixed window; zeroed urgent pointer.
+    store_u8(ctx, OFF_TCP_DATAOFF, (doff << 4) as u8)?;
+    store_be32(ctx, OFF_TCP_SEQ, cookie_seq)?;
+    store_be32(ctx, OFF_TCP_ACK, ack)?;
+    store_u8(ctx, OFF_TCP_FLAGS, TCP_FLAGS_SYN_ACK)?;
+    store_be16(ctx, OFF_TCP_WINDOW, SYNACK_WINDOW)?;
+    store_be16(ctx, OFF_TCP_URG, 0)?;
+    // Rewrite the options region in place: one 4-byte MSS option, NOP-padded to
+    // the original options length so the data-offset and total length are
+    // unchanged (no resize).
+    write_mss_option(ctx, options_len, mss)?;
+
+    // IPv4 header checksum: recomputed over the fixed 20-byte header.
+    store_be16(ctx, OFF_IP_CHECK, 0)?;
+    let ip_check = ipv4_checksum(ctx)?;
+    store_be16(ctx, OFF_IP_CHECK, ip_check)?;
+
+    // TCP checksum: computed *analytically* from the exact header/options bytes
+    // we just wrote plus the (swap-invariant) pseudo-header. A variable-length
+    // re-read of the segment is rejected by the verifier (it cannot relate the
+    // runtime data-offset to `data_end`), and it is unnecessary — every byte of
+    // the reply's TCP segment is a value we chose here.
+    let mut sum: u32 = 0;
+    // Pseudo-header: source + destination address (the address sum is invariant
+    // under the src/dst swap, so the pre-swap octets are fine), protocol, and
+    // the TCP segment length.
+    sum += u32::from(u16::from_be_bytes([src[0], src[1]]));
+    sum += u32::from(u16::from_be_bytes([src[2], src[3]]));
+    sum += u32::from(u16::from_be_bytes([dst[0], dst[1]]));
+    sum += u32::from(u16::from_be_bytes([dst[2], dst[3]]));
+    sum += u32::from(IpProto::Tcp as u8);
+    sum += seg_len as u32;
+    // TCP header words. Ports are swapped; the checksum and urgent-pointer words
+    // are zero and contribute nothing.
+    sum += u32::from(dst_port); // reply source port = original destination port
+    sum += u32::from(src_port); // reply destination port = original source port
+    sum += (cookie_seq >> 16) + (cookie_seq & 0xffff);
+    sum += (ack >> 16) + (ack & 0xffff);
+    sum += ((doff as u32) << 12) | 0x0012; // data-offset word | SYN|ACK flags
+    sum += u32::from(SYNACK_WINDOW);
+    // Options: one MSS option (kind 2, len 4, mss) then NOP padding, which is an
+    // even number of 0x01 bytes (options length is a multiple of 4), i.e.
+    // whole 0x0101 words.
+    sum += 0x0204;
+    sum += u32::from(mss);
+    let nop_words = (options_len - 4) / 2;
+    sum += (nop_words as u32) * 0x0101;
+    let tcp_check = fold_checksum(sum);
+    store_be16(ctx, OFF_TCP_CHECK, tcp_check)?;
+
+    Ok(xdp_action::XDP_TX)
+}
+
+/// Split the fixed [`COOKIE_KEY`] into the SipHash `(k0, k1)` little-endian
+/// `u64` pair, matching `blackwall_deception::CookieKey::to_u64_pair`.
+#[inline(always)]
+fn cookie_keys() -> (u64, u64) {
+    let mut k0 = [0u8; 8];
+    let mut k1 = [0u8; 8];
+    k0.copy_from_slice(&COOKIE_KEY[0..8]);
+    k1.copy_from_slice(&COOKIE_KEY[8..16]);
+    (u64::from_le_bytes(k0), u64::from_le_bytes(k1))
+}
+
+/// Return the client's advertised MSS if the **first** TCP option is an MSS
+/// option (kind 2, len 4), else [`DEFAULT_CLIENT_MSS`].
+///
+/// B2.2 reads the MSS only at this fixed position — where Linux and most stacks
+/// place it (MSS is conventionally the first SYN option) — because a general,
+/// runtime-offset option walk is rejected by the eBPF verifier (it cannot bound
+/// an accumulating cursor against `data_end`). A SYN whose MSS sits after a
+/// NOP/SACK-permitted/timestamp/window-scale option simply gets the default MSS
+/// in its cookie; full option walking is deferred. Every access here is a
+/// constant offset, so it is trivially bounds-checked.
+fn parse_mss(ctx: &XdpContext) -> Result<u16, ()> {
+    let kind = load_u8(ctx, OFF_TCP_OPTS)?;
+    let len = load_u8(ctx, OFF_TCP_OPTS + 1)?;
+    if kind == 2 && len == 4 {
+        return load_be16(ctx, OFF_TCP_OPTS + 2);
+    }
+    Ok(DEFAULT_CLIENT_MSS)
+}
+
+/// Write a single 4-byte MSS option at the start of the options region, then
+/// NOP-pad (`0x01`) out to `options_len` so the TCP header keeps its original
+/// byte length. `options_len` is `>= 4` (validated by the caller) and `<=
+/// MAX_TCP_OPTS`.
+fn write_mss_option(ctx: &XdpContext, options_len: usize, mss: u16) -> Result<(), ()> {
+    store_u8(ctx, OFF_TCP_OPTS, 2)?; // kind = MSS
+    store_u8(ctx, OFF_TCP_OPTS + 1, 4)?; // len = 4
+    store_be16(ctx, OFF_TCP_OPTS + 2, mss)?;
+    for k in 4..MAX_TCP_OPTS {
+        if k >= options_len {
+            break;
+        }
+        store_u8(ctx, OFF_TCP_OPTS + k, 1)?; // NOP padding
+    }
+    Ok(())
+}
+
+/// Recompute the IPv4 header checksum over the 20-byte header (IHL 5). The
+/// checksum field must already be zeroed by the caller.
+///
+/// The header is copied onto the stack with a **single** bounds-checked 20-byte
+/// load, then summed from the stack array. Summing the packet word-by-word
+/// instead makes the verifier reject the program: bpf-linker unrolls the loop
+/// and coalesces the per-word `data_end` guards, after which the verifier can
+/// no longer prove the later words are in range.
+fn ipv4_checksum(ctx: &XdpContext) -> Result<u16, ()> {
+    let p: *const [u8; 20] = ptr_at(ctx, OFF_IP)?;
+    // SAFETY: `ptr_at` bounds-checked all 20 header bytes against `data_end`.
+    let bytes = unsafe { *p };
+    let mut sum: u32 = 0;
+    for k in 0..10 {
+        sum += u32::from(u16::from_be_bytes([bytes[k * 2], bytes[k * 2 + 1]]));
+    }
+    Ok(fold_checksum(sum))
 }
 
 fn blocked_v4(addr: [u8; 4]) -> bool {
