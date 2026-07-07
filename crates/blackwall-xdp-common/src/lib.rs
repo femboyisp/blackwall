@@ -64,6 +64,24 @@ pub struct Stat {
     pub bytes: u64,
 }
 
+/// Value of the single-entry `COOKIE_KEY` map: the 128-bit SYN-cookie secret,
+/// pre-split into the SipHash-2-4 `(k0, k1)` little-endian `u64` pair the cookie
+/// core ([`blackwall_cookie::make_cookie_raw`]) consumes.
+///
+/// The split is performed once, in userspace ([`crate`]'s consumer
+/// `blackwall_xdp::keys::encode_cookie_key`), so the eBPF SYN handler reads
+/// `k0`/`k1` directly with no in-kernel byte juggling. Both `u64`s are stored in
+/// the map in host-native byte order — userspace and the eBPF program share the
+/// machine's endianness, exactly as the `RateBucket` `u64` fields already do.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CookieKeyValue {
+    /// Low 64 bits of the key (`u64::from_le_bytes(key[0..8])`).
+    pub k0: u64,
+    /// High 64 bits of the key (`u64::from_le_bytes(key[8..16])`).
+    pub k1: u64,
+}
+
 /// Build an IPv4 LPM key.
 #[must_use]
 pub fn lpm_key_v4(prefixlen: u8, addr: [u8; 4]) -> LpmKeyV4 {
@@ -106,5 +124,14 @@ mod tests {
     fn rate_bucket_and_stat_are_pod() {
         assert_eq!(core::mem::size_of::<RateBucket>(), 32);
         assert_eq!(core::mem::size_of::<Stat>(), 16);
+    }
+
+    #[test]
+    fn cookie_key_value_is_pod() {
+        // Two `u64`s, no padding: the byte layout shared with the eBPF reader.
+        assert_eq!(core::mem::size_of::<CookieKeyValue>(), 16);
+        let v = CookieKeyValue { k0: 1, k1: 2 };
+        assert_eq!(v.k0, 1);
+        assert_eq!(v.k1, 2);
     }
 }

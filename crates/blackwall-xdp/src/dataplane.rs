@@ -13,7 +13,7 @@
 //! to the eBPF side (v4 zero-padded into the low four bytes) so rate-limit
 //! lookups actually match — see the `rate_key` helper.
 
-use crate::keys::{lpm_key, LpmKey};
+use crate::keys::{encode_cookie_key, lpm_key, LpmKey};
 use crate::manager::{XdpExecError, XdpExecutor};
 use crate::XdpAction;
 use async_trait::async_trait;
@@ -22,7 +22,9 @@ use aya::maps::{HashMap, LpmTrie, MapData, PerCpuArray};
 use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
 use blackwall_core::XdpMode;
-use blackwall_xdp_common::{RateBucket, Stat, REASON_BLOCKLIST, REASON_PASS, REASON_RATELIMIT};
+use blackwall_xdp_common::{
+    CookieKeyValue, RateBucket, Stat, REASON_BLOCKLIST, REASON_PASS, REASON_RATELIMIT,
+};
 use ipnet::IpNet;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -52,7 +54,14 @@ struct DataplaneMaps {
     rate: HashMap<MapData, [u8; 16], RateBucketPod>,
     /// Per-CPU decision counters, indexed by `REASON_*`.
     stats: PerCpuArray<MapData, StatPod>,
+    /// Single-entry (key `0`) map carrying the SYN-cookie secret the in-kernel
+    /// fast path reads before minting a cookie.
+    cookie_key: HashMap<MapData, u32, CookieKeyPod>,
 }
+
+/// Fixed map key of the sole `COOKIE_KEY` entry (mirrors the eBPF
+/// `COOKIE_KEY_SLOT`).
+const COOKIE_KEY_SLOT: u32 = 0;
 
 /// `#[repr(transparent)]` newtype so the foreign [`RateBucket`] POD can carry an
 /// [`aya::Pod`] impl (the orphan rule forbids implementing it directly).
@@ -75,6 +84,17 @@ struct StatPod(Stat);
 // `u64` fields; `#[repr(transparent)]` makes `StatPod` share its exact layout,
 // so it is byte-for-byte valid as a per-CPU BPF map value.
 unsafe impl aya::Pod for StatPod {}
+
+/// `#[repr(transparent)]` newtype giving the foreign [`CookieKeyValue`] POD an
+/// [`aya::Pod`] impl for the `COOKIE_KEY` map value.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct CookieKeyPod(CookieKeyValue);
+
+// SAFETY: `CookieKeyValue` is a `#[repr(C)]` `Copy + 'static` plain-old-data
+// struct of two `u64` fields; `#[repr(transparent)]` makes `CookieKeyPod` share
+// its exact layout, so it is byte-for-byte valid as a BPF map value.
+unsafe impl aya::Pod for CookieKeyPod {}
 
 /// A snapshot of the data plane's per-CPU decision counters plus current map
 /// occupancy.
@@ -188,6 +208,7 @@ impl XdpDataplane {
             block_v6: take_map(&mut ebpf, "BLOCK_V6")?,
             rate: take_map(&mut ebpf, "RATE")?,
             stats: take_map(&mut ebpf, "STATS")?,
+            cookie_key: take_map(&mut ebpf, "COOKIE_KEY")?,
         };
 
         Ok(Self {
@@ -230,6 +251,24 @@ impl XdpDataplane {
     /// Returns [`XdpError::Map`] if the map delete fails.
     pub fn clear_rate_limit(&mut self, addr: IpAddr) -> Result<(), XdpError> {
         self.locked()?.clear_rate_limit(addr)
+    }
+
+    /// Install the 128-bit SYN-cookie secret into the `COOKIE_KEY` map so the
+    /// in-kernel fast path can mint cookies. Until this is called the SYN
+    /// handler falls through to `XDP_PASS` (never minting under a garbage key).
+    ///
+    /// The 16 bytes are split into the SipHash `(k0, k1)` little-endian pair
+    /// ([`encode_cookie_key`]), byte-identical to how the userspace deception
+    /// tier derives its key, so both tiers authenticate the same cookies.
+    ///
+    /// B2.3b: the shared secret becomes cross-daemon config-driven rather than a
+    /// caller-supplied literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XdpError::Map`] if the map write fails.
+    pub fn set_cookie_key(&mut self, key: [u8; 16]) -> Result<(), XdpError> {
+        self.locked()?.set_cookie_key(key)
     }
 
     /// Snapshot the per-CPU stats counters and current map occupancy.
@@ -314,6 +353,13 @@ impl DataplaneMaps {
     /// Remove any token bucket installed for `addr`.
     fn clear_rate_limit(&mut self, addr: IpAddr) -> Result<(), XdpError> {
         self.rate.remove(&rate_key(addr)).map_err(map_err)
+    }
+
+    /// Write the SYN-cookie secret into the single-entry `COOKIE_KEY` map.
+    fn set_cookie_key(&mut self, key: [u8; 16]) -> Result<(), XdpError> {
+        self.cookie_key
+            .insert(COOKIE_KEY_SLOT, CookieKeyPod(encode_cookie_key(key)), 0)
+            .map_err(map_err)
     }
 
     /// Sum the per-CPU counters and count the blocklist/rate map entries.
