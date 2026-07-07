@@ -83,24 +83,9 @@ impl Drop for Teardown {
         // pidfile it wrote before the namespace/scratch dir go away (deleting
         // the netns alone does not stop a running BIRD process).
         proc::kill_pidfiles(&format!("/run/blackwall-lab/{}", self.run_id));
-        // Scoped final reap (#137): SIGKILL anything still attached to this
-        // run's namespaces before deleting them — a daemon that re-parented out
-        // of its process group, or a grandchild the group kill missed. Scoped
-        // by the run-unique namespace name, so it can never hit an unrelated
-        // process. Must precede netns_del: a process holding a socket in a
-        // namespace keeps it (and its dataplane state) alive after del.
-        for ns in &self.netns {
-            netns::kill_netns_procs(ns);
-        }
         for ns in &self.netns {
             let _ = netns::netns_del(ns);
         }
-        // Idempotent host-namespace dataplane sweep (#137): clear any Blackwall
-        // nft table / TPROXY policy-route left in the host netns (no-op when
-        // absent). Per-node state already went away with netns_del above; this
-        // guards the case a scenario applied in the host namespace, where
-        // netns_del can't reach it, so it can't wedge the next gate.
-        netns::clear_host_dataplane();
         // Remove this run's scratch dir (bird + knot config/state/sockets).
         let _ = std::fs::remove_dir_all(format!("/run/blackwall-lab/{}", self.run_id));
     }
@@ -329,20 +314,10 @@ fn run_step(id: &str, manifest: &Manifest, step: &Step) -> (String, StepOutcome)
 
 /// Tear down every lab namespace on this host (`lab down` with no arg).
 pub(crate) fn down_all() -> Result<(), LabError> {
-    // First reap any orphaned lab process whose namespace name was already
-    // deleted (#137): a prior gate whose `lab test` was force-killed before its
-    // Teardown ran can leave an engine/daemon alive in an anonymous namespace,
-    // holding ports/nft state that wedges the next gate. Scoped to lab-owned
-    // command signatures; runs before the namespace sweep so freed ports/state
-    // are gone by the time the next gate starts.
-    proc::reap_orphan_lab_procs();
     let c = netns::run(std::process::Command::new("ip").args(["netns", "list"]))?;
     for line in c.stdout.lines() {
         if let Some(ns) = line.split_whitespace().next() {
             if ns.starts_with("bw-") {
-                // Reap any process still attached before deleting the namespace
-                // (#137) — the same scoped final reap the runner's Teardown does.
-                netns::kill_netns_procs(ns);
                 netns::netns_del(ns)?;
             }
         }
@@ -356,10 +331,6 @@ pub(crate) fn down_all() -> Result<(), LabError> {
             }
         }
     }
-    // Idempotent host-namespace dataplane sweep (#137): clear any Blackwall nft
-    // table / TPROXY policy-route left in the host netns (no-op when absent), so
-    // a pre-gate `lab down` fully clears a prior gate's residue.
-    netns::clear_host_dataplane();
     // Remove every run's scratch dir along with the namespace sweep.
     let _ = std::fs::remove_dir_all("/run/blackwall-lab");
     Ok(())
