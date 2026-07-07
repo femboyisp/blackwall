@@ -221,7 +221,10 @@ jobs:
           BIN=$(cargo test -p blackwall-xdp --test afxdp_redirect --no-run --message-format=json \
             | grep -o '"executable":"[^"]*afxdp_redirect[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
           echo "test binary: $BIN"
-          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture
+          # --test-threads=1: the AF_XDP tests each set up a veth pair + bind an
+          # AF_XDP socket on it; run in parallel they race over shared net state
+          # and flake. Serial execution is deterministic.
+          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture --test-threads=1
       - name: Run the lab gate (xdp prog-test-run)
         timeout-minutes: 6
         run: |
