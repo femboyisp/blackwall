@@ -477,6 +477,54 @@ pub fn udp_response(request: &[u8], payload: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Length of an Ethernet II header (dst MAC + src MAC + EtherType).
+const ETH_HEADER_LEN: usize = 14;
+/// EtherType for IPv4, big-endian, as it appears in bytes `[12..14]` of an
+/// Ethernet II frame.
+const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
+
+/// Build a full Ethernet II reply **frame** for a redirected IPv4 UDP request
+/// **frame**, for the AF_XDP UDP responder (sub-project B3.2).
+///
+/// The AF_XDP fast path delivers whole layer-2 frames (Ethernet header
+/// included), so this is the L2 wrapper around [`udp_response`]: it strips the
+/// 14-byte Ethernet header, delegates the IPv4 UDP reply construction (and the
+/// mandatory reflection-amplification guard) to [`udp_response`], then prepends
+/// a reply Ethernet header with the source and destination MAC addresses
+/// swapped relative to the request (the reply goes back to whoever sent the
+/// request) and the same IPv4 EtherType.
+///
+/// Scope (B3.2): IPv4 only. A frame that is too short, is not IPv4
+/// (`EtherType != 0x0800`), or whose inner datagram [`udp_response`] declines
+/// (not UDP, or a zero-byte request payload that cannot be safely reflected)
+/// yields `None`.
+///
+/// Returns `None` if `frame` is shorter than an Ethernet + minimal IPv4 header,
+/// is not an IPv4 frame, or [`udp_response`] returns `None` for the inner
+/// datagram.
+#[must_use]
+pub fn udp_l2_response(frame: &[u8], payload: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < ETH_HEADER_LEN {
+        return None;
+    }
+    // IPv4 only for B3.2 (the eBPF redirect fast path is IPv4-only).
+    if frame[12..ETH_HEADER_LEN] != ETHERTYPE_IPV4 {
+        return None;
+    }
+
+    let ip_request = &frame[ETH_HEADER_LEN..];
+    let ip_reply = udp_response(ip_request, payload)?;
+
+    let mut out = Vec::with_capacity(ETH_HEADER_LEN + ip_reply.len());
+    // Reply dst MAC = request src MAC (bytes 6..12); reply src MAC = request
+    // dst MAC (bytes 0..6). The EtherType is copied through unchanged (IPv4).
+    out.extend_from_slice(&frame[6..12]); // dst MAC <- request src
+    out.extend_from_slice(&frame[0..6]); // src MAC <- request dst
+    out.extend_from_slice(&ETHERTYPE_IPV4);
+    out.extend_from_slice(&ip_reply);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1285,97 @@ mod tests {
         assert!(
             parse_udp_request(&request).is_none(),
             "non-UDP packet should return None"
+        );
+    }
+
+    /// Wrap a raw IPv4 datagram in an Ethernet II frame with the given MACs.
+    fn eth_wrap_ipv4(dst_mac: [u8; 6], src_mac: [u8; 6], ip: &[u8]) -> Vec<u8> {
+        let mut f = Vec::with_capacity(ETH_HEADER_LEN + ip.len());
+        f.extend_from_slice(&dst_mac);
+        f.extend_from_slice(&src_mac);
+        f.extend_from_slice(&ETHERTYPE_IPV4);
+        f.extend_from_slice(ip);
+        f
+    }
+
+    #[test]
+    fn udp_l2_response_swaps_macs_addresses_ports_and_truncates() {
+        let client = [10, 0, 0, 1];
+        let server = [10, 0, 0, 2];
+        let client_mac = [0x02, 0, 0, 0, 0, 0x01];
+        let server_mac = [0x02, 0, 0, 0, 0, 0x02];
+        // 8-byte request payload; candidate reply is longer so the guard truncates.
+        let ip_request = build_udp_v4(client, server, 54_321, 53, b"12345678");
+        // Frame as it arrives at the redirect socket: dst MAC = server, src = client.
+        let frame = eth_wrap_ipv4(server_mac, client_mac, &ip_request);
+
+        let reply_frame = udp_l2_response(&frame, b"012345678901").expect("reply should be Some");
+
+        // Ethernet: dst MAC is the request's source, src MAC is the request's dest.
+        assert_eq!(
+            &reply_frame[0..6],
+            &client_mac,
+            "reply dst MAC = request src"
+        );
+        assert_eq!(
+            &reply_frame[6..12],
+            &server_mac,
+            "reply src MAC = request dst"
+        );
+        assert_eq!(
+            &reply_frame[12..14],
+            &ETHERTYPE_IPV4,
+            "EtherType stays IPv4"
+        );
+
+        // Inner IPv4/UDP: addresses and ports swapped, payload truncated to 8.
+        let (ip4, udp, payload) = parse_v4_udp(&reply_frame[ETH_HEADER_LEN..]);
+        assert_eq!(ip4.source, server, "reply src IP = request dst");
+        assert_eq!(ip4.destination, client, "reply dst IP = request src");
+        assert_eq!(udp.source_port, 53);
+        assert_eq!(udp.destination_port, 54_321);
+        assert_eq!(payload.len(), 8, "reply must be truncated to request len");
+        assert_eq!(payload, b"01234567");
+    }
+
+    #[test]
+    fn udp_l2_response_returns_none_for_short_frame() {
+        assert!(
+            udp_l2_response(&[0u8; 10], b"x").is_none(),
+            "a frame shorter than an Ethernet header must return None"
+        );
+    }
+
+    #[test]
+    fn udp_l2_response_returns_none_for_non_ipv4_ethertype() {
+        let client = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let server = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let ip6_request = build_udp_v6(client, server, 54_321, 123, b"abcd");
+        // Wrap with the IPv6 EtherType (0x86DD), which B3.2 does not handle.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x02]);
+        frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+        frame.extend_from_slice(&[0x86, 0xDD]);
+        frame.extend_from_slice(&ip6_request);
+        assert!(
+            udp_l2_response(&frame, b"reply").is_none(),
+            "a non-IPv4 EtherType must return None (IPv4-only scope)"
+        );
+    }
+
+    #[test]
+    fn udp_l2_response_returns_none_when_inner_response_declines() {
+        // Zero-byte request payload: udp_response returns None (nothing safe to
+        // reflect), so the L2 wrapper must too.
+        let ip_request = build_udp_v4([10, 0, 0, 1], [10, 0, 0, 2], 54_321, 53, b"");
+        let frame = eth_wrap_ipv4(
+            [0x02, 0, 0, 0, 0, 0x02],
+            [0x02, 0, 0, 0, 0, 0x01],
+            &ip_request,
+        );
+        assert!(
+            udp_l2_response(&frame, b"anything").is_none(),
+            "a zero-byte request payload must not be reflected"
         );
     }
 }

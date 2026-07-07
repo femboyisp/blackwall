@@ -209,7 +209,10 @@ jobs:
       - name: Run the lab gate (xdp AF_XDP redirect)
         # B3.1: end-to-end AF_XDP redirect on a veth pair (attach xdp_filter, bind
         # an AF_XDP socket into XSKS, inject a UDP frame, assert it lands on the
-        # socket). Requires CONFIG_XDP_SOCKETS + CAP_NET_ADMIN/RAW; copy-mode.
+        # socket). B3.2: the same binary also proves the zero-copy TX round trip
+        # (recv -> udp_l2_response -> send), asserting a reflection-safe reply is
+        # observed egressing the veth. Requires CONFIG_XDP_SOCKETS +
+        # CAP_NET_ADMIN/RAW; copy-mode.
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
@@ -218,7 +221,10 @@ jobs:
           BIN=$(cargo test -p blackwall-xdp --test afxdp_redirect --no-run --message-format=json \
             | grep -o '"executable":"[^"]*afxdp_redirect[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
           echo "test binary: $BIN"
-          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture
+          # --test-threads=1: the AF_XDP tests each set up a veth pair + bind an
+          # AF_XDP socket on it; run in parallel they race over shared net state
+          # and flake. Serial execution is deterministic.
+          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture --test-threads=1
       - name: Run the lab gate (xdp prog-test-run)
         timeout-minutes: 6
         run: |

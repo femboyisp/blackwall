@@ -562,6 +562,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     mode: XdpMode::default(),
                     default_rate_limit_pps: None,
                     cookie_ports: Vec::new(),
+                    afxdp_udp_ports: Vec::new(),
                 };
                 for tok in &line.words[1..] {
                     let (k, v) = tok
@@ -596,6 +597,18 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                                     return Err(bad("xdp cookie-ports", port_tok));
                                 }
                                 cfg.cookie_ports.push(n);
+                            }
+                        }
+                        "afxdp-udp-ports" => {
+                            for port_tok in v.split(',') {
+                                let port_tok = port_tok.trim();
+                                let n: u16 = port_tok
+                                    .parse()
+                                    .map_err(|_| bad("xdp afxdp-udp-ports", port_tok))?;
+                                if n == 0 {
+                                    return Err(bad("xdp afxdp-udp-ports", port_tok));
+                                }
+                                cfg.afxdp_udp_ports.push(n);
                             }
                         }
                         other => return Err(bad("xdp key", other)),
@@ -1664,6 +1677,7 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
         assert_eq!(x.mode, blackwall_core::XdpMode::Native);
         assert_eq!(x.default_rate_limit_pps, Some(1000));
         assert!(x.cookie_ports.is_empty());
+        assert!(x.afxdp_udp_ports.is_empty());
     }
 
     #[test]
@@ -1672,6 +1686,41 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
             parse_text("interface wan eth0\nxdp interface=eth0 cookie-ports=8080,443\n").unwrap();
         let x = p.xdp.expect("xdp set");
         assert_eq!(x.cookie_ports, vec![8080, 443]);
+    }
+
+    #[test]
+    fn parses_xdp_afxdp_udp_ports() {
+        let p =
+            parse_text("interface wan eth0\nxdp interface=eth0 afxdp-udp-ports=53,123\n").unwrap();
+        let x = p.xdp.expect("xdp set");
+        assert_eq!(x.afxdp_udp_ports, vec![53, 123]);
+    }
+
+    #[test]
+    fn rejects_xdp_afxdp_udp_ports_bad() {
+        let err = parse_text("interface wan eth0\nxdp afxdp-udp-ports=53,0\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp afxdp-udp-ports",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+
+        let err = parse_text("interface wan eth0\nxdp afxdp-udp-ports=notaport\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp afxdp-udp-ports",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

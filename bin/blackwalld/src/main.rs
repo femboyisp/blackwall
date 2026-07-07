@@ -1039,6 +1039,96 @@ async fn xdp_manager_task(
     }
 }
 
+/// Default banner the AF_XDP UDP responder reflects to every redirected port
+/// (sub-project B3.2). The reflection-amplification guard in
+/// [`blackwall_deception::transport::udp_l2_response`] truncates it to at most
+/// the request's own payload length, so it can never amplify.
+///
+/// This is a deliberately minimal banner source: the flow daemon (`Command::Flow`)
+/// runs no deception engine and holds no live banner store (unlike `Command::Run`),
+/// so B3.2 ships a single static payload for all AF_XDP-redirected UDP ports.
+/// Per-port banners (wiring the deception banner store into the flow daemon) are
+/// a follow-up.
+const AFXDP_UDP_BANNER: &[u8] = b"blackwall\n";
+
+/// Dedicated blocking-thread receive loop for the AF_XDP UDP responder
+/// (sub-project B3.2). Binds an `AF_XDP` socket on `iface` RX queue 0, registers
+/// it into the `XSKS` map, installs the `REDIRECT_PORT` set, then answers every
+/// redirected IPv4 UDP datagram with the reflection-safe
+/// [`blackwall_deception::transport::udp_l2_response`] builder, transmitting the
+/// reply **zero-copy** over the same socket's TX ring.
+///
+/// Non-fatal: any setup failure logs a warning and returns, leaving the AF_XDP
+/// UDP fast path inert (the box keeps running). The loop exits promptly once
+/// `stop` is set (checked between each bounded `recv_one` poll). Queue 0 only;
+/// multi-queue is a follow-up.
+fn afxdp_udp_responder_loop(
+    iface: &str,
+    dataplane: &Arc<blackwall_xdp::XdpDataplane>,
+    ports: &[u16],
+    responses: &std::sync::atomic::AtomicU64,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+
+    let mut sock = match blackwall_xdp::AfXdpSocket::bind(iface, 0) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(
+                %err, interface = %iface,
+                "XDP: AF_XDP UDP responder bind failed; responder disabled"
+            );
+            return;
+        }
+    };
+    // SAFETY: `sock` owns the AF_XDP socket fd and lives for the whole loop
+    // below (dropped only on return, after the last map use), so it satisfies
+    // `register_xsk`'s requirement that the fd outlive its registration.
+    if let Err(err) = unsafe { dataplane.register_xsk(sock.queue_id(), sock.raw_fd()) } {
+        tracing::warn!(%err, "XDP: AF_XDP UDP responder xsk registration failed; responder disabled");
+        return;
+    }
+    // Install the redirect ports only after the socket is registered, so no UDP
+    // is diverted to an empty XSKS slot during startup.
+    if let Err(err) = dataplane.set_redirect_ports(ports) {
+        tracing::warn!(%err, "XDP: AF_XDP UDP responder redirect-port install failed; responder disabled");
+        return;
+    }
+    tracing::info!(
+        interface = %iface, ports = ports.len(),
+        "XDP: AF_XDP UDP responder active on queue 0"
+    );
+
+    let mut frame = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        match sock.recv_one(200, &mut frame) {
+            Ok(true) => {
+                // Reflection-safe reply (IPv4 UDP only). `None` = not IPv4 UDP,
+                // or the reflection guard declined (empty request payload) —
+                // drop silently.
+                if let Some(reply) =
+                    blackwall_deception::transport::udp_l2_response(&frame, AFXDP_UDP_BANNER)
+                {
+                    match sock.send(&reply) {
+                        Ok(()) => {
+                            responses.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            tracing::debug!(%err, "XDP: AF_XDP UDP reply send failed; dropping")
+                        }
+                    }
+                }
+            }
+            Ok(false) => {} // poll timeout: loop back and re-check `stop`.
+            Err(err) => {
+                tracing::warn!(%err, "XDP: AF_XDP UDP responder receive error; stopping responder");
+                break;
+            }
+        }
+    }
+    tracing::info!("XDP: AF_XDP UDP responder stopped");
+}
+
 /// Apply one pending `xdp_requests` row and record its outcome — the XDP
 /// analogue of [`apply_request`].
 ///
@@ -1318,6 +1408,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::task::JoinHandle<()>,
                 Arc<blackwall_xdp::XdpDataplane>,
             )> = None;
+            // AF_XDP UDP responder (B3.2): the shared replies-sent counter (for
+            // `/metrics`) and the dedicated blocking thread's stop flag + join
+            // handle (for graceful teardown), populated when `afxdp-udp-ports`
+            // is configured and the responder thread spawns.
+            let mut afxdp_udp_metric: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+            let mut afxdp_responder: Option<(
+                std::thread::JoinHandle<()>,
+                Arc<std::sync::atomic::AtomicBool>,
+            )> = None;
             let sink = if let Some(xdp_cfg) = policy.xdp.clone() {
                 let iface = xdp_cfg
                     .interface
@@ -1378,6 +1477,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                         let dataplane = Arc::new(dataplane);
                         xdp_for_metrics = Some(dataplane.clone());
+
+                        // AF_XDP UDP responder fast path (B3.2): only activated
+                        // when `afxdp-udp-ports` is configured (empty leaves it
+                        // disabled — nothing is redirected, per B3.1's
+                        // fail-closed design). Runs on a dedicated blocking
+                        // thread (AF_XDP recv/poll must not block the async
+                        // runtime); binds the socket, registers it into `XSKS`,
+                        // installs the redirect ports and answers redirected UDP
+                        // at line rate. NON-FATAL like the rest of this attach
+                        // path.
+                        if !xdp_cfg.afxdp_udp_ports.is_empty() {
+                            let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let dp = dataplane.clone();
+                            let iface_t = iface.clone();
+                            let ports_t = xdp_cfg.afxdp_udp_ports.clone();
+                            let counter_t = counter.clone();
+                            let stop_t = stop.clone();
+                            match std::thread::Builder::new()
+                                .name("afxdp-udp-responder".to_owned())
+                                .spawn(move || {
+                                    afxdp_udp_responder_loop(
+                                        &iface_t, &dp, &ports_t, &counter_t, &stop_t,
+                                    );
+                                }) {
+                                Ok(handle) => {
+                                    afxdp_udp_metric = Some(counter);
+                                    afxdp_responder = Some((handle, stop));
+                                    tracing::info!(
+                                        ports = xdp_cfg.afxdp_udp_ports.len(),
+                                        "XDP: AF_XDP UDP responder thread spawned"
+                                    );
+                                }
+                                Err(err) => tracing::warn!(
+                                    %err,
+                                    "XDP: failed to spawn AF_XDP UDP responder thread; \
+                                     responder disabled"
+                                ),
+                            }
+                        }
+
                         // `None` default-rate-limit means "no auto mitigation":
                         // detections are drained but ignored; only operator CLI
                         // requests populate the maps.
@@ -1435,6 +1575,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     inflight: None,
                     xdp: xdp_for_metrics.clone(),
                     stateless: None,
+                    afxdp_udp_responses: afxdp_udp_metric.clone(),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1447,22 +1588,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 1000,
                 Some(collector_metrics),
             );
-            match xdp_shutdown {
+            let run_result = match xdp_shutdown {
                 // With XDP attached, race the collector against a shutdown signal
                 // so we can best-effort detach the data plane (drop the handle,
                 // which releases the eBPF link) instead of leaving it attached.
                 Some((handle, dataplane)) => {
                     tokio::select! {
-                        r = collector => { r?; }
+                        r = collector => r,
                         () = wait_for_shutdown() => {
                             tracing::info!("shutdown signal received; detaching XDP data plane (best-effort)");
                             handle.abort();
                             drop(dataplane);
+                            Ok(())
                         }
                     }
                 }
-                None => collector.await?,
+                None => collector.await,
+            };
+
+            // Stop the AF_XDP UDP responder thread gracefully: set its flag and
+            // join (it wakes from its bounded poll within ~200 ms). Best-effort
+            // — the process is exiting either way.
+            if let Some((handle, stop)) = afxdp_responder {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = handle.join();
             }
+            run_result?;
             Ok(())
         }
         Command::Apply {
@@ -1673,6 +1824,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     inflight: Some(inflight.clone()),
                     xdp: None,
                     stateless: Some(stateless_metrics.clone()),
+                    afxdp_udp_responses: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }

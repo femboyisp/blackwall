@@ -17,5 +17,9 @@ pub use nfqueue::{run as run_nfqueue, BannerLookup, NfqueueTransport};
 pub use packet::{
     parse_tcp_request, tcp_banner_fin, tcp_syn_ack, TcpRequestInfo, DEFAULT_CLIENT_MSS,
 };
+// UDP request parser + reflection-safe responder, plus the AF_XDP L2-frame
+// wrapper (`udp_l2_response`, sub-project B3.2) the flow daemon's AF_XDP UDP
+// responder loop uses to turn a redirected Ethernet frame into a reply frame.
+pub use packet::{parse_udp_request, udp_l2_response, udp_response, UdpRequestInfo};
 pub use tproxy::{serve, SessionRecord, TproxyListener, TproxyTransport};
 pub use traits::DeceptionTransport;

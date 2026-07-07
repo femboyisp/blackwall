@@ -367,6 +367,7 @@ dependencies = [
  "aya",
  "blackwall-cookie",
  "blackwall-core",
+ "blackwall-deception",
  "blackwall-flow",
  "blackwall-xdp-common",
  "ipnet",
