@@ -7,16 +7,18 @@ service — scanners and attackers can't tell which ports are real. A port only 
 forwarded service when you explicitly open it (via a declarative config file, the API, or Incus
 auto-discovery); everything else is answered by an interactive honeypot engine that behaves like
 the real thing. Blackwall is built for high packet rates and multi-tenant hosting, with a fast
-nftables data plane and an on-box XDP/eBPF fast-drop path today, BGP scrubbing, and DNS fast-flux,
-with SYN-cookie/AF_XDP acceleration on the roadmap.
+nftables data plane and an on-box XDP/eBPF fast-drop + SYN-cookie path today, BGP scrubbing, and
+DNS fast-flux, with a zero-copy AF_XDP path on the roadmap.
 
 > ⚠️ **Status:** active development. Sub-project **A** (deception firewall) is feature-complete
 > through M3 — the nftables data plane enforces deception (TPROXY/NFQUEUE → honeypot engine) and
 > real-service forwarding, with protocol emulators, Incus discovery, CAKE shaping, and DNS/banner
-> fast-flux. Sub-project **D** ships volumetric detection (D1), and **C** (BGP control plane) ships
-> RTBH end to end plus FlowSpec auto-mitigation. Sub-project **B** (the XDP/eBPF DDoS data plane)
-> ships its first increment — an on-box XDP source-drop + per-source rate-limiter driven by the
-> detection loop (B1); SYN cookies, AF_XDP, and the DDoS-lab XDP gate (B2–B4) are next. A·M4
+> fast-flux — plus a stateless SYN-cookie deception tier (keyed SipHash cookies + a reflection-safe
+> UDP responder) for scan/flood volume. Sub-project **D** ships volumetric detection (D1), and **C**
+> (BGP control plane) ships RTBH end to end plus FlowSpec auto-mitigation. Sub-project **B** (the
+> XDP/eBPF DDoS data plane) ships its first two increments — an on-box XDP source-drop +
+> per-source rate-limiter (B1) and an in-kernel SYN-cookie fast path sharing its key with the
+> userspace tier (B2); a zero-copy AF_XDP path and the DDoS-lab XDP gate (B3–B4) are next. A·M4
 > (API/ops) remains. See the [Roadmap](#roadmap).
 
 ## How it works
@@ -25,8 +27,8 @@ Every `(IP, protocol, port)` across your prefixes is in exactly one of three sta
 
 | State | Behaviour |
 |-------|-----------|
-| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. An optional nftables **flowtable** offloads established forwarded flows to the kernel conntrack fast path (`flowtable devices=…`), and an optional **XDP** fast path (`xdp` directive) drops/rate-limits attack sources at the driver level; an AF_XDP path is on the roadmap. |
-| **Deception** *(default)* | Looks open and alive. Closed ports answer a real TCP handshake and carry on a believable, protocol-aware conversation (SSH, HTTP, SMTP, databases, …) like an interactive honeypot — but nothing real is ever reached, and every probe is logged. |
+| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. An optional nftables **flowtable** offloads established forwarded flows to the kernel conntrack fast path (`flowtable devices=…`), and an optional **XDP** fast path (`xdp` directive) drops/rate-limits attack sources at the driver level; a zero-copy AF_XDP path is on the roadmap. |
+| **Deception** *(default)* | Looks open and alive. Closed ports answer a real TCP handshake and carry on a believable, protocol-aware conversation (SSH, HTTP, SMTP, databases, …) like an interactive honeypot — but nothing real is ever reached, and every probe is logged. Ports opted into the **stateless tier** (`stateless-tcp ports=…`) are instead answered with a keyed SYN-cookie handshake carrying no per-connection state, optionally fronted by an in-kernel XDP fast path (`xdp cookie-ports=…`) that answers the same cookie ahead of nftables. |
 | **Closed** | Silently dropped (e.g. management ports). |
 
 A scan of one of your hosts therefore shows *lots* of open ports, with your one or two real
@@ -36,13 +38,18 @@ deception) while real services stay stable.
 ## Features
 
 - **All-ports-open deception** across whole IPv4 + IPv6 prefixes.
-- **Interactive honeypot engine** *(Milestone 2)* — stateless SYN-cookie answers for scan/flood
-  volume, plus per-protocol emulators that hold real multi-turn conversations and capture
-  attacker activity.
+- **Interactive honeypot engine** *(Milestone 2)* — per-protocol emulators (SSH, HTTP, SMTP, Redis,
+  MySQL, PostgreSQL) that hold real multi-turn conversations and capture attacker activity.
+- **Stateless SYN-cookie deception tier** — a keyed SipHash-2-4 SYN-cookie responder answers scan/
+  flood volume on configured ports (`stateless-tcp ports=…`) with no per-connection state, plus a
+  reflection-safe UDP responder (reply length ≤ request, so it can never be an amplifier); dual-stack
+  IPv4/IPv6. An in-kernel XDP fast path (`xdp cookie-ports=…`) answers the same cookie via `XDP_TX`
+  ahead of nftables, sharing its key with the userspace tier over Postgres.
 - **Declarative config DSL** — high-level, readable rules compiled down to nftables.
 - **nftables data plane** — real traffic accepted/DNAT'd (`nat:` targets) with an optional flowtable
-  fast path for established forwarded flows; deception traffic handed to userspace via TPROXY/NFQUEUE;
-  designed so an XDP/AF_XDP fast path slots in later.
+  fast path for established forwarded flows; deception traffic handed to userspace via TPROXY
+  (interactive) or NFQUEUE (stateless SYN-cookie tier); an on-box XDP fast path (drop/rate-limit +
+  SYN cookies) already slots in ahead of it, with a zero-copy AF_XDP path still on the roadmap.
 - **Multi-tenant** — per-tenant IP/prefix ownership; tenants manage ports only on their own
   addresses, via config or API.
 - **PostgreSQL-backed state** with a full audit log of every policy change.
@@ -51,8 +58,10 @@ deception) while real services stay stable.
 - **Moving-target & DNS fast-flux, automatic CAKE traffic shaping, REST API + Prometheus
   metrics** *(later milestones)*.
 - **DDoS mitigation** — on-box **XDP/eBPF fast drop + per-source rate-limit** (source-keyed, driven
-  by the detection loop; `xdp` directive) and ISP-level BGP scrubbing (RTBH, FlowSpec) for operators
-  announcing their own ASN. SYNPROXY/SYN-cookies and AF_XDP are on the roadmap.
+  by the detection loop; `xdp` directive), a **stateless SYN-cookie tier** (userspace
+  `stateless-tcp ports=…` + in-kernel `xdp cookie-ports=…` fast path sharing one SipHash key via
+  Postgres), and ISP-level BGP scrubbing (RTBH, FlowSpec) for operators announcing their own ASN.
+  A zero-copy AF_XDP path is on the roadmap.
 
 ## Configuration
 
@@ -84,6 +93,11 @@ metrics listen=127.0.0.1:9100
 # tproxy-port / nfqueue are a single source of truth — the nft rules follow them.
 engine max-concurrent=1024 session-timeout=60 tproxy-port=61000 nfqueue=0
 
+# Optional stateless SYN-cookie deception tier: routes these deception TCP ports
+# to a keyed SipHash SYN-cookie responder (NFQUEUE) instead of the interactive
+# TPROXY honeypot, so a spoofed-source SYN flood against them creates no state.
+stateless-tcp ports=22,80,443
+
 # Optional flowtable fast path for real-service traffic. List every device a
 # forwarded flow traverses (uplink + backend); offload engages only when both
 # directions' devices are present. Omit the directive to keep the nft slow path.
@@ -92,8 +106,10 @@ flowtable devices=eth0,incusbr0
 # Optional on-box XDP fast drop / per-source rate-limit (source-keyed: drops the
 # attacker, not the victim). Driven by the detection loop on `blackwalld flow`;
 # operator control via `blackwalld xdp block|unblock|rate-limit|list|stats`.
-# mode auto = native XDP with a generic (skb) fallback. Omit to disable XDP.
-xdp interface=eth0 mode=auto default-rate-limit=1000
+# mode auto = native XDP with a generic (skb) fallback. cookie-ports= additionally
+# answers SYNs to those ports in-kernel with the same keyed cookie as the
+# userspace stateless-tcp tier above (shared via Postgres). Omit to disable XDP.
+xdp interface=eth0 mode=auto default-rate-limit=1000 cookie-ports=8080,443
 ```
 
 With a `metrics` block, `blackwalld flow` serves `GET /metrics` (Prometheus text) exposing BGP
@@ -223,8 +239,19 @@ Blackwall is built as four independent sub-projects, each delivered in milestone
   from multi-provider speedtests, banner fast-flux, DNS fast-flux (RFC 2136 + TSIG to Knot).
 - ⏳ **M4 — API & ops:** tenant-scoped REST API, Prometheus metrics, daemon supervision.
 
-**B — DDoS data plane** *(not started)* — XDP/eBPF + AF_XDP fast drop, SYNPROXY, conntrack, rate
-limiting. The DDoS-lab traffic-generation foundation (`blackwall-trafficgen`) is in place ahead of it.
+**B — DDoS data plane** *(in progress)* — XDP/eBPF fast drop, stateless SYN cookies, AF_XDP,
+conntrack, rate limiting.
+- ✅ **B1 — On-box XDP fast drop:** in-kernel, source-keyed drop + per-source rate-limiting on the
+  uplink, driven by the detection loop; `xdp` directive; non-fatal attach with a generic-mode
+  fallback.
+- ✅ **B2 — Stateless SYN cookies:** a keyed SipHash-2-4 responder (userspace, NFQUEUE;
+  `stateless-tcp ports=…`) plus a reflection-safe UDP responder for the deception tier, and an
+  in-kernel `XDP_TX` SYN-cookie fast path (`xdp cookie-ports=…`) sharing the same key with the
+  userspace tier via Postgres — the two tiers interoperate on a single handshake.
+- ⏳ **B3 — AF_XDP:** a zero-copy userspace fast path.
+- ⏳ **B4 — xdpcap + DDoS-lab XDP gate:** observability and the netns lab gate for the XDP data plane.
+
+The DDoS-lab traffic-generation foundation (`blackwall-trafficgen`) is in place ahead of B3/B4.
 
 **C — ISP/BGP control plane** *(in progress)* — a native injection-only iBGP speaker to BIRD.
 - ✅ **C1 — RTBH:** byte-exact BGP codec + speaker (C1a); pure blackhole controller (C1b);
