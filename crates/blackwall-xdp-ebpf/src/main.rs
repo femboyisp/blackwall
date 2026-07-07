@@ -34,9 +34,10 @@
 //! `CLOCK_MONOTONIC`) divided down to seconds — a real, monotonic clock rather
 //! than a fixed constant. **Cross-tier requirement:** the userspace responder
 //! that validates the returning ACK must slot the cookie against the *same*
-//! clock. It currently reads `SystemTime`/UNIX; B2.3c switches it to
-//! `CLOCK_MONOTONIC` so both tiers agree on the 64-second time slot. Until then
-//! the two tiers do not share a time base — that switch is out of scope here.
+//! clock. As of B2.3c-2a the userspace NFQUEUE responder also reads
+//! `CLOCK_MONOTONIC` and shares this tier's cookie secret via the
+//! Postgres-backed `cookie_secret` (B2.3c-1), so both tiers now agree on the
+//! same key and the same 64-second time slot.
 //!
 //! # Protected-prefix + protected-port gating (B2.3b)
 //!

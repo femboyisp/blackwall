@@ -7,7 +7,6 @@ use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use nfq::{Queue, Verdict};
@@ -243,6 +242,33 @@ impl DeceptionTransport for NfqueueTransport {
     }
 }
 
+/// Seconds since boot on `CLOCK_MONOTONIC`, used as the SYN-cookie time base.
+///
+/// **Must match the eBPF fast path's time base.** The in-XDP SYN-cookie
+/// responder (`blackwall-xdp-ebpf`) mints/validates cookies against
+/// `bpf_ktime_get_ns() / 1_000_000_000`, which is nanoseconds since boot on
+/// `CLOCK_MONOTONIC`. This userspace tier shares the same 128-bit cookie
+/// secret (via [`blackwall_state::Store::cookie_secret`]) and must therefore
+/// also share this clock, or a cookie minted by one tier fails to validate
+/// in the other even though the secret matches. On the (essentially
+/// impossible) failure of `clock_gettime`, falls back to `0` rather than
+/// panicking — a fixed time base only degrades to overly strict cookie
+/// expiry, never a crash.
+fn monotonic_secs() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable `libc::timespec` on the stack;
+    // `clock_gettime` with `CLOCK_MONOTONIC` only writes through the given
+    // pointer and cannot fail in a way that leaves `ts` partially written.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    u64::try_from(ts.tv_sec).unwrap_or(0)
+}
+
 /// Dispatch a parsed TCP segment (`info`) to the stateless SYN-cookie state
 /// machine, sending any reply via `raw4`/`raw6` and returning the verdict for
 /// the original packet.
@@ -264,10 +290,7 @@ fn handle_tcp(
     socks: &RawSockets,
     metrics: &StatelessMetrics,
 ) -> Result<Verdict, DeceptionError> {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_secs = monotonic_secs();
 
     let tuple = ConnTuple {
         src: info.src,
