@@ -57,6 +57,14 @@ struct DataplaneMaps {
     /// Single-entry (key `0`) map carrying the SYN-cookie secret the in-kernel
     /// fast path reads before minting a cookie.
     cookie_key: HashMap<MapData, u32, CookieKeyPod>,
+    /// Protected IPv4 deception prefixes (`{prefixlen:u32, addr:[u8;4]}` LPM
+    /// key); the SYN-cookie fast path answers a SYN only if its destination IP
+    /// LPM-matches an entry here (B2.3b gating).
+    protect_v4: LpmTrie<MapData, [u8; 4], u8>,
+    /// Protected TCP destination (deception) ports, keyed by the host-native
+    /// `u16` port value; the fast path answers a SYN only if its destination
+    /// port is present here (B2.3b gating).
+    protect_port: HashMap<MapData, u16, u8>,
 }
 
 /// Fixed map key of the sole `COOKIE_KEY` entry (mirrors the eBPF
@@ -209,6 +217,8 @@ impl XdpDataplane {
             rate: take_map(&mut ebpf, "RATE")?,
             stats: take_map(&mut ebpf, "STATS")?,
             cookie_key: take_map(&mut ebpf, "COOKIE_KEY")?,
+            protect_v4: take_map(&mut ebpf, "PROTECT_V4")?,
+            protect_port: take_map(&mut ebpf, "PROTECT_PORT")?,
         };
 
         Ok(Self {
@@ -261,7 +271,7 @@ impl XdpDataplane {
     /// ([`encode_cookie_key`]), byte-identical to how the userspace deception
     /// tier derives its key, so both tiers authenticate the same cookies.
     ///
-    /// B2.3b: the shared secret becomes cross-daemon config-driven rather than a
+    /// B2.3c: the shared secret becomes cross-daemon config-driven rather than a
     /// caller-supplied literal.
     ///
     /// # Errors
@@ -269,6 +279,38 @@ impl XdpDataplane {
     /// Returns [`XdpError::Map`] if the map write fails.
     pub fn set_cookie_key(&mut self, key: [u8; 16]) -> Result<(), XdpError> {
         self.locked()?.set_cookie_key(key)
+    }
+
+    /// Install the box's own protected deception prefixes into `PROTECT_V4`.
+    ///
+    /// The in-kernel SYN-cookie fast path answers a SYN only if its destination
+    /// IP LPM-matches one of these prefixes (and its destination port is a
+    /// protected port). Until at least one prefix is installed the fast path
+    /// answers no SYNs at all, so real services are never hijacked. Entries are
+    /// additive; existing entries are retained.
+    ///
+    /// IPv6 prefixes are ignored here — v6 SYN-cookie gating is B2.3c (the
+    /// in-kernel fast path is IPv4-only today).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XdpError::Map`] if a map write fails.
+    pub fn set_protected_prefixes(&self, prefixes: &[IpNet]) -> Result<(), XdpError> {
+        self.locked()?.set_protected_prefixes(prefixes)
+    }
+
+    /// Install the configured deception ports into `PROTECT_PORT`.
+    ///
+    /// The in-kernel SYN-cookie fast path answers a SYN only if its destination
+    /// TCP port is one of these (and its destination IP matches a protected
+    /// prefix). Ports are the host-native `u16` values, matching the numeric
+    /// port the eBPF program reads from the packet. Entries are additive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XdpError::Map`] if a map write fails.
+    pub fn set_protected_ports(&self, ports: &[u16]) -> Result<(), XdpError> {
+        self.locked()?.set_protected_ports(ports)
     }
 
     /// Snapshot the per-CPU stats counters and current map occupancy.
@@ -360,6 +402,34 @@ impl DataplaneMaps {
         self.cookie_key
             .insert(COOKIE_KEY_SLOT, CookieKeyPod(encode_cookie_key(key)), 0)
             .map_err(map_err)
+    }
+
+    /// Insert each IPv4 prefix into the `PROTECT_V4` trie (v6 prefixes ignored;
+    /// v6 gating is B2.3c). Reuses the shared `lpm_key` encoding so the key
+    /// layout is byte-identical to the blocklist trie.
+    fn set_protected_prefixes(&mut self, prefixes: &[IpNet]) -> Result<(), XdpError> {
+        for &net in prefixes {
+            match lpm_key(net) {
+                LpmKey::V4(k) => self
+                    .protect_v4
+                    .insert(&Key::new(k.prefixlen, k.addr), 1, 0)
+                    .map_err(map_err)?,
+                // B2.3c: IPv6 deception-prefix gating (the fast path is v4-only).
+                LpmKey::V6(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert each deception port into the `PROTECT_PORT` set. The key is the
+    /// host-native `u16` value, matching the numeric destination port the eBPF
+    /// program reads via its big-endian packet load; the stored `1u8` value is
+    /// an ignored presence marker.
+    fn set_protected_ports(&mut self, ports: &[u16]) -> Result<(), XdpError> {
+        for &port in ports {
+            self.protect_port.insert(port, 1_u8, 0).map_err(map_err)?;
+        }
+        Ok(())
     }
 
     /// Sum the per-CPU counters and count the blocklist/rate map entries.
