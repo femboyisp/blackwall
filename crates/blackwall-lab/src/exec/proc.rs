@@ -106,35 +106,6 @@ pub(crate) fn kill_pidfiles(run_dir: &str) {
     }
 }
 
-/// SIGKILL orphaned lab-spawned processes, scoped to lab-owned command
-/// signatures (#137).
-///
-/// The runner's per-run [`crate::exec::runner`] `Teardown` reaps by namespace
-/// membership (`ip netns pids`), which is precise but blind to an orphan whose
-/// namespace *name* was already deleted: a run force-killed before its `Drop`
-/// ran (the CLI watchdog's `process::exit`, or CI's outer `timeout` SIGKILL)
-/// can leave a daemon/run alive in an anonymous namespace — invisible to an
-/// `ip netns list` sweep yet still holding ports/sockets that wedge the next
-/// gate. `lab down` is the explicit whole-host sweep, so it additionally kills
-/// any process whose command line names a lab-owned path: a run scratch dir, a
-/// lab-test interop binary, or the trafficgen binary. Each pattern is specific
-/// to this checkout's lab tooling and cannot match an unrelated process (the
-/// `lab` binary itself — `target/debug/lab` — matches none of them). This is
-/// NOT used by the per-run `Teardown`, whose namespace-scoped reap must never
-/// touch a concurrent run's processes. Best-effort; a missing `pkill` is a
-/// harmless no-op.
-pub(crate) fn reap_orphan_lab_procs() {
-    for pattern in [
-        "/run/blackwall-lab/",
-        "target/debug/lab-tests/",
-        "target/debug/trafficgen",
-    ] {
-        let _ = Command::new("pkill")
-            .args(["-KILL", "-f", pattern])
-            .status();
-    }
-}
-
 /// Write config and launch BIRD inside `ns` for this run.
 ///
 /// Creates `/run/blackwall-lab/<run_id>/` if absent, writes `<node>.conf`,
