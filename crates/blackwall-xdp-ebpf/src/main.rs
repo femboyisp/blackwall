@@ -72,12 +72,12 @@ use aya_ebpf::bindings::xdp_action;
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray};
+use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, XskMap};
 use aya_ebpf::programs::XdpContext;
 use blackwall_cookie::make_cookie_raw;
 use blackwall_xdp_common::{
     CookieKeyValue, RateBucket, Stat, REASON_BLOCKLIST, REASON_COUNT, REASON_PASS,
-    REASON_RATELIMIT, REASON_SYNCOOKIE,
+    REASON_RATELIMIT, REASON_REDIRECT, REASON_SYNCOOKIE,
 };
 use core::mem;
 use network_types::eth::{EthHdr, EtherType};
@@ -121,6 +121,24 @@ static PROTECT_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(65536, 1);
 /// until userspace installs ports.
 #[map]
 static PROTECT_PORT: HashMap<u16, u8> = HashMap::with_max_entries(65536, 0);
+/// AF_XDP socket array (sub-project B3.1): one entry per RX queue, populated
+/// from userspace ([`blackwall_xdp::AfXdpReceiver`]) with a bound `AF_XDP`
+/// socket's fd. The redirect fast path hands a matching frame to the socket
+/// bound at the frame's own `rx_queue_index`. Empty until userspace registers a
+/// socket, so an unconfigured box redirects nothing (the `redirect` fallback
+/// action is `XDP_PASS`).
+#[map]
+static XSKS: XskMap = XskMap::with_max_entries(64, 0);
+/// UDP **destination** ports whose IPv4 datagrams are redirected to the `AF_XDP`
+/// socket in [`XSKS`] (sub-project B3.1). A `HashMap` used as a set (value is an
+/// ignored `1u8`), keyed by the host-native numeric `u16` port — userspace
+/// inserts the same numeric value the eBPF side reads via [`load_be16`]. Empty
+/// until userspace installs a port, so no traffic is diverted by default.
+///
+/// B3.2: the real deception-tier use case will replace this simple port set with
+/// the actual redirect condition (e.g. per-flow / per-prefix marks).
+#[map]
+static REDIRECT_PORT: HashMap<u16, u8> = HashMap::with_max_entries(65536, 0);
 
 // Absolute packet offsets for the Ethernet + IPv4 (IHL 5) + TCP layout the
 // SYN-cookie fast path operates on. Every access is still `ptr_at`
@@ -143,6 +161,10 @@ const OFF_TCP: usize = OFF_IP + Ipv4Hdr::LEN;
 const OFF_TCP_SRCPORT: usize = OFF_TCP;
 /// TCP destination port.
 const OFF_TCP_DSTPORT: usize = OFF_TCP + 2;
+/// UDP destination port (same byte position as the TCP destination port for the
+/// fixed Ethernet + IPv4(IHL 5) + L4 layout: the L4 header starts at [`OFF_TCP`]
+/// and both TCP and UDP carry the destination port at header offset 2).
+const OFF_UDP_DSTPORT: usize = OFF_TCP + 2;
 /// TCP sequence number.
 const OFF_TCP_SEQ: usize = OFF_TCP + 4;
 /// TCP acknowledgment number.
@@ -300,6 +322,14 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
             if over_rate(key16) {
                 count(REASON_RATELIMIT, frame_len);
                 return Ok(xdp_action::XDP_DROP);
+            }
+            // B3.1: divert IPv4 UDP datagrams whose destination port is in the
+            // userspace-populated REDIRECT_PORT set to the AF_XDP socket in XSKS.
+            // A miss (non-UDP, IP options present, port not configured) bails and
+            // falls through to the SYN-cookie/PASS behavior below.
+            if let Ok(action) = try_redirect_udp_v4(ctx) {
+                count(REASON_REDIRECT, frame_len);
+                return Ok(action);
             }
             // Absorb a TCP SYN in-kernel with a SipHash-cookie SYN-ACK
             // (`XDP_TX`); anything else (non-TCP, non-SYN, malformed options)
@@ -490,6 +520,56 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     store_be16(ctx, OFF_TCP_CHECK, tcp_check)?;
 
     Ok(xdp_action::XDP_TX)
+}
+
+/// Attempt the B3.1 `AF_XDP` redirect on an IPv4 packet.
+///
+/// Returns `Ok(action)` — the result of [`XskMap::redirect`], i.e.
+/// `XDP_REDIRECT` on success or the `XDP_PASS` fallback when no socket is bound
+/// at the frame's RX queue — if the packet is an IPv4 (IHL 5) **UDP** datagram
+/// whose destination port is present in the userspace-populated [`REDIRECT_PORT`]
+/// set. Returns `Err(())` for anything else (non-UDP, IP options present, port
+/// not configured), so the caller falls through to the SYN-cookie/`XDP_PASS`
+/// path unchanged.
+///
+/// The redirect targets the socket bound at this frame's own `rx_queue_index`:
+/// `XskMap::redirect` only delivers to a socket bound on the same RX queue the
+/// packet arrived on, so the map index must be that queue id.
+fn try_redirect_udp_v4(ctx: &XdpContext) -> Result<u32, ()> {
+    let ip: *const Ipv4Hdr = ptr_at(ctx, OFF_IP)?;
+    // SAFETY: `ptr_at` bounds-checked the 20-byte IPv4 header.
+    let ihl = unsafe { (*ip).ihl() };
+    // SAFETY: same bounds-checked header.
+    let proto = unsafe { (*ip).proto };
+    // Only the fixed IHL-5 layout is handled: with IP options the L4 header (and
+    // thus the UDP destination port) would not sit at `OFF_UDP_DSTPORT`.
+    if ihl != 5 || proto != IpProto::Udp {
+        return Err(());
+    }
+    // `load_be16` bounds-checks the two destination-port bytes against `data_end`.
+    let dst_port = load_be16(ctx, OFF_UDP_DSTPORT)?;
+    if !redirect_port(dst_port) {
+        return Err(());
+    }
+    // SAFETY: `ctx.ctx` is the verifier-provided `*mut xdp_md`, valid for the
+    // duration of the program; `rx_queue_index` is a plain `u32` field.
+    let queue_id = unsafe { (*ctx.ctx).rx_queue_index };
+    // The low two bits of the flags are the fallback return code used when no
+    // socket is bound at `queue_id`; `XDP_PASS` lets such a frame reach the stack
+    // instead of being dropped.
+    Ok(XSKS
+        .redirect(queue_id, u64::from(xdp_action::XDP_PASS))
+        .unwrap_or(xdp_action::XDP_PASS))
+}
+
+/// True if `port` (a UDP datagram's destination port) is a configured redirect
+/// port in [`REDIRECT_PORT`]. An empty map matches nothing, so an unconfigured
+/// box diverts no traffic.
+fn redirect_port(port: u16) -> bool {
+    // SAFETY: `REDIRECT_PORT` is only ever read; the returned reference is dropped
+    // (converted to a bool) before any map mutation, of which this program
+    // performs none on `REDIRECT_PORT`.
+    unsafe { REDIRECT_PORT.get(&port) }.is_some()
 }
 
 /// Read the SipHash `(k0, k1)` cookie secret from the [`COOKIE_KEY`] map.

@@ -16,6 +16,13 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 # aya added in Task 4 (dataplane):
 aya = "0.13.1"
+# AF_XDP socket/UMEM/ring layer (sub-project B3.1). aya provides only the
+# XSKMAP (`aya::maps::XskMap`), not the AF_XDP socket + UMEM + fill/completion/RX
+# rings. `xdpilone` is a pure-Rust AF_XDP implementation (no libbpf/libxdp-sys C
+# build dependency — only libc + spin), exact-pinned for the zero-copy/copy-mode
+# receiver. Socket I/O is coverage-excluded (see scripts/coverage.sh).
+xdpilone = "=1.3.0"
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

@@ -12,6 +12,7 @@
 #   - blackwall-lab/src/{exec/*,cli,bin/lab}.rs   netns/process orchestration (needs CAP_NET_ADMIN)
 #   - blackwall-trafficgen/src/{io/*,bin/*}.rs    AF_PACKET send/recv sockets (needs CAP_NET_RAW + netns)
 #   - blackwall-xdp/src/dataplane.rs   aya load/attach + live eBPF map I/O (needs CAP_NET_ADMIN + kernel)
+#   - blackwall-xdp/src/afxdp.rs       AF_XDP socket/UMEM/ring I/O (needs CAP_NET_ADMIN/RAW + a live iface)
 # Every one of these is a thin adapter; all of its non-trivial pure logic lives
 # in unit-tested helpers (e.g. transport/packet.rs, render.rs, *_parse.rs).
 #
@@ -26,6 +27,6 @@
 # Extra args are forwarded to cargo llvm-cov (e.g. --html, --summary-only).
 set -euo pipefail
 
-EXCLUDE='(transport/(tproxy|nfqueue)\.rs|blackwall-nft/src/apply\.rs|blackwalld/src/(main|metrics)\.rs|discovery/src/incus_client\.rs|discovery/src/proc_io\.rs|speedtest/src/providers/.*_net\.rs|shaper/src/apply\.rs|dns/src/send_net\.rs|flow/src/collector_net\.rs|bgp/src/session_net\.rs|blackwall-lab/src/exec/.*\.rs|blackwall-lab/src/cli\.rs|blackwall-lab/src/bin/lab\.rs|blackwall-trafficgen/src/io/.*\.rs|blackwall-trafficgen/src/bin/.*\.rs|blackwall-xdp/src/dataplane\.rs)'
+EXCLUDE='(transport/(tproxy|nfqueue)\.rs|blackwall-nft/src/apply\.rs|blackwalld/src/(main|metrics)\.rs|discovery/src/incus_client\.rs|discovery/src/proc_io\.rs|speedtest/src/providers/.*_net\.rs|shaper/src/apply\.rs|dns/src/send_net\.rs|flow/src/collector_net\.rs|bgp/src/session_net\.rs|blackwall-lab/src/exec/.*\.rs|blackwall-lab/src/cli\.rs|blackwall-lab/src/bin/lab\.rs|blackwall-trafficgen/src/io/.*\.rs|blackwall-trafficgen/src/bin/.*\.rs|blackwall-xdp/src/dataplane\.rs|blackwall-xdp/src/afxdp\.rs)'
 
 exec cargo llvm-cov --workspace --fail-under-lines 90 --ignore-filename-regex "$EXCLUDE" "$@"

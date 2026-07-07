@@ -26,6 +26,33 @@ const XDP_PASS: u32 = 2;
 /// `XDP_TX` action code (bounce the (rewritten) frame back out the ingress
 /// interface).
 const XDP_TX: u32 = 3;
+/// `STATS` per-CPU array index for redirect decisions
+/// (`blackwall_xdp_common::REASON_REDIRECT`, sub-project B3.1).
+const REASON_REDIRECT: u32 = 4;
+
+/// A `STATS` per-CPU counter entry, byte-identical to
+/// `blackwall_xdp_common::Stat`. Declared locally so the test can give it an
+/// [`aya::Pod`] impl.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct StatPod {
+    packets: u64,
+    bytes: u64,
+}
+
+// SAFETY: `#[repr(C)]` `Copy` plain-old-data of two `u64`s — a valid, fixed
+// 16-byte per-CPU BPF map value with no padding or pointers.
+unsafe impl aya::Pod for StatPod {}
+
+/// Sum the per-CPU `STATS` packet counter at `reason` across all CPUs.
+fn stat_packets(bpf: &mut Ebpf, reason: u32) -> u64 {
+    use aya::maps::PerCpuArray;
+    let stats: PerCpuArray<_, StatPod> =
+        PerCpuArray::try_from(bpf.map_mut("STATS").expect("STATS map present"))
+            .expect("STATS is a PerCpuArray");
+    let values = stats.get(&reason, 0).expect("read STATS reason");
+    values.iter().map(|v| v.packets).sum()
+}
 
 /// Test SYN-cookie secret installed into the `COOKIE_KEY` map before the run
 /// (B2.3a: the key is no longer baked into the eBPF program — it is delivered
@@ -88,6 +115,17 @@ fn install_protect_prefix(bpf: &mut Ebpf, prefixlen: u32, addr: [u8; 4]) {
             .expect("PROTECT_V4 is an LpmTrie");
     map.insert(&Key::new(prefixlen, addr), 1, 0)
         .expect("insert protected prefix");
+}
+
+/// Install a UDP destination port into `REDIRECT_PORT` (B3.1): an IPv4 UDP
+/// datagram to this port is redirected to the `AF_XDP` socket in `XSKS`.
+fn install_redirect_port(bpf: &mut Ebpf, port: u16) {
+    let mut map: HashMap<_, u16, u8> = HashMap::try_from(
+        bpf.map_mut("REDIRECT_PORT")
+            .expect("REDIRECT_PORT map present"),
+    )
+    .expect("REDIRECT_PORT is a HashMap");
+    map.insert(port, 1u8, 0).expect("insert redirect port");
 }
 
 /// Install a protected TCP destination port into `PROTECT_PORT` (B2.3b gating):
@@ -273,6 +311,84 @@ fn eth_ipv4_tcp_syn(
     p[TCP + 21] = 4;
     p[TCP + 22..TCP + 24].copy_from_slice(&mss.to_be_bytes());
     p
+}
+
+/// Build an `Ethernet + IPv4 + UDP` frame (8-byte UDP header, no payload)
+/// carrying the given destination port — used to exercise the B3.1 redirect
+/// fast path.
+fn eth_ipv4_udp(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut p = vec![0u8; 14 + 20 + 8];
+    p[0..6].copy_from_slice(&SERVER_MAC);
+    p[6..12].copy_from_slice(&CLIENT_MAC);
+    p[12] = 0x08;
+    p[13] = 0x00;
+    // IPv4 header (IHL 5).
+    p[IP] = 0x45;
+    let tot_len = u16::try_from(20 + 8).expect("tot_len fits in u16");
+    p[IP + 2..IP + 4].copy_from_slice(&tot_len.to_be_bytes());
+    p[IP + 8] = 64; // TTL
+    p[IP + 9] = 17; // protocol = UDP
+    p[IP + 12..IP + 16].copy_from_slice(&src_ip);
+    p[IP + 16..IP + 20].copy_from_slice(&dst_ip);
+    // UDP header: src port, dst port, length, checksum(0).
+    p[TCP..TCP + 2].copy_from_slice(&src_port.to_be_bytes());
+    p[TCP + 2..TCP + 4].copy_from_slice(&dst_port.to_be_bytes());
+    p[TCP + 4..TCP + 6].copy_from_slice(&8u16.to_be_bytes());
+    p
+}
+
+/// B3.1: a UDP datagram whose destination port is in `REDIRECT_PORT` takes the
+/// `XskMap` redirect fast path (bumping the `REASON_REDIRECT` counter); a
+/// datagram to any other port is not diverted and passes through unchanged.
+///
+/// The `XSKS` map is left empty (no bound socket). For an `XSKMAP`,
+/// `bpf_redirect_map` on an empty slot returns the *fallback* action
+/// immediately, so the program returns the `XDP_PASS` fallback rather than
+/// `XDP_REDIRECT` — the retval alone therefore cannot distinguish the redirect
+/// branch from a plain pass. The definitive evidence that the branch executed is
+/// the per-CPU `REASON_REDIRECT` stat, which `BPF_PROG_TEST_RUN` updates. The
+/// live end-to-end redirect (a real bound socket actually receiving the frame)
+/// is covered by the `afxdp_redirect` veth integration test.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn udp_to_redirect_port_takes_the_xsk_redirect_branch() {
+    let redirect_port = 9999u16;
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    install_redirect_port(&mut bpf, redirect_port);
+    let prog_fd = {
+        let prog: &mut Xdp = bpf
+            .program_mut("xdp_filter")
+            .expect("xdp_filter program present")
+            .try_into()
+            .expect("program is an Xdp");
+        prog.load().expect("verify + load xdp_filter");
+        prog.fd().expect("program fd").as_fd().as_raw_fd()
+    };
+
+    let hit = eth_ipv4_udp([203, 0, 113, 7], [198, 51, 100, 1], 40_000, redirect_port);
+    run_xdp(prog_fd, &hit);
+    assert_eq!(
+        stat_packets(&mut bpf, REASON_REDIRECT),
+        1,
+        "a UDP datagram to a redirect port must take the XSK redirect branch"
+    );
+
+    let miss = eth_ipv4_udp([203, 0, 113, 7], [198, 51, 100, 1], 40_000, 1234);
+    let (miss_action, miss_out) = run_xdp_out(prog_fd, &miss);
+    assert_eq!(
+        miss_action, XDP_PASS,
+        "a UDP datagram to a non-redirect port must pass through"
+    );
+    assert_eq!(
+        miss_out, miss,
+        "a passed UDP datagram must be byte-for-byte unchanged"
+    );
+    assert_eq!(
+        stat_packets(&mut bpf, REASON_REDIRECT),
+        1,
+        "a non-redirect UDP datagram must not bump the redirect counter"
+    );
 }
 
 /// Build an `Ethernet + IPv4 + TCP ACK` frame (no SYN, one MSS option) — the

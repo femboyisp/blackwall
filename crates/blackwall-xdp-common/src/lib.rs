@@ -17,8 +17,12 @@ pub const REASON_RATELIMIT: u32 = 2;
 /// Answered in-kernel with a SipHash-cookie SYN-ACK bounced out via `XDP_TX`
 /// (sub-project B2.2). Counts SYNs absorbed at the driver level ahead of nft.
 pub const REASON_SYNCOOKIE: u32 = 3;
+/// Redirected to a userspace `AF_XDP` socket via the `XSKS` [`BPF_MAP_TYPE_XSKMAP`]
+/// (sub-project B3.1). Counts frames matching the redirect condition that were
+/// handed to the zero-copy/copy-mode `AF_XDP` receiver ahead of the kernel stack.
+pub const REASON_REDIRECT: u32 = 4;
 /// Number of reason codes (stats array length).
-pub const REASON_COUNT: u32 = 4;
+pub const REASON_COUNT: u32 = 5;
 
 /// LPM-trie key for the IPv4 source blocklist (`bpf_lpm_trie_key` layout).
 #[repr(C)]

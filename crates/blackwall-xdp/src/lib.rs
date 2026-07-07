@@ -1,10 +1,12 @@
 //! Userspace control plane for the Blackwall XDP data plane.
+pub mod afxdp;
 pub mod control;
 pub mod dataplane;
 pub mod keys;
 pub mod manager;
 pub mod sink;
 
+pub use afxdp::{AfXdpError, AfXdpReceiver};
 pub use control::{XdpAction, XdpController, XdpOrigin};
 pub use dataplane::{XdpDataplane, XdpError, XdpStats};
 pub use manager::{
