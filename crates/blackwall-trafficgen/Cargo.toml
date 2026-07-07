@@ -13,7 +13,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ipnet = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = [
+    "time",
+    "net",
+    "io-util",
+    "rt-multi-thread",
+    "macros",
+] }
 
 [lints]
 workspace = true
