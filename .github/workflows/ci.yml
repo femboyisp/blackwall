@@ -206,6 +206,19 @@ jobs:
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-auto-bird.kdl lab-junit-flowspec-auto.xml
+      - name: Run the lab gate (xdp AF_XDP redirect)
+        # B3.1: end-to-end AF_XDP redirect on a veth pair (attach xdp_filter, bind
+        # an AF_XDP socket into XSKS, inject a UDP frame, assert it lands on the
+        # socket). Requires CONFIG_XDP_SOCKETS + CAP_NET_ADMIN/RAW; copy-mode.
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Build the test binary as the normal user (needs nightly+bpf-linker for the eBPF build.rs).
+          BIN=$(cargo test -p blackwall-xdp --test afxdp_redirect --no-run --message-format=json \
+            | grep -o '"executable":"[^"]*afxdp_redirect[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
+          echo "test binary: $BIN"
+          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture
       - name: Run the lab gate (xdp prog-test-run)
         timeout-minutes: 6
         run: |

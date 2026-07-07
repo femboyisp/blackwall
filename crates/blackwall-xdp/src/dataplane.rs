@@ -18,16 +18,17 @@ use crate::manager::{XdpExecError, XdpExecutor};
 use crate::XdpAction;
 use async_trait::async_trait;
 use aya::maps::lpm_trie::Key;
-use aya::maps::{HashMap, LpmTrie, MapData, PerCpuArray};
+use aya::maps::{HashMap, LpmTrie, MapData, PerCpuArray, XskMap};
 use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
 use blackwall_core::XdpMode;
 use blackwall_xdp_common::{
     CookieKeyValue, RateBucket, Stat, REASON_BLOCKLIST, REASON_PASS, REASON_RATELIMIT,
-    REASON_SYNCOOKIE,
+    REASON_REDIRECT, REASON_SYNCOOKIE,
 };
 use ipnet::IpNet;
 use std::net::IpAddr;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::Mutex;
 
 /// A loaded, attached `xdp_filter` program together with typed handles to its
@@ -66,6 +67,13 @@ struct DataplaneMaps {
     /// `u16` port value; the fast path answers a SYN only if its destination
     /// port is present here (B2.3b gating).
     protect_port: HashMap<MapData, u16, u8>,
+    /// AF_XDP socket array (B3.1), indexed by RX queue id; a bound `AF_XDP`
+    /// socket's fd is registered here so the in-kernel redirect fast path can
+    /// hand matching frames to userspace.
+    xsks: XskMap<MapData>,
+    /// UDP destination ports whose IPv4 datagrams are redirected to the `AF_XDP`
+    /// socket (B3.1), keyed by the host-native `u16` port value.
+    redirect_port: HashMap<MapData, u16, u8>,
 }
 
 /// Fixed map key of the sole `COOKIE_KEY` entry (mirrors the eBPF
@@ -118,6 +126,9 @@ pub struct XdpStats {
     /// Packets/bytes answered in-kernel with a SipHash-cookie SYN-ACK via
     /// `XDP_TX` (`REASON_SYNCOOKIE`, B2.2/B2.3c).
     pub syn_cookies_sent: Stat,
+    /// Packets/bytes redirected to a userspace `AF_XDP` socket via `XSKS`
+    /// (`REASON_REDIRECT`, B3.1).
+    pub redirected: Stat,
     /// Number of blocklist entries (`BLOCK_V4` + `BLOCK_V6`).
     pub blocked_entries: u64,
     /// Number of rate-limit entries (`RATE`).
@@ -223,6 +234,8 @@ impl XdpDataplane {
             cookie_key: take_map(&mut ebpf, "COOKIE_KEY")?,
             protect_v4: take_map(&mut ebpf, "PROTECT_V4")?,
             protect_port: take_map(&mut ebpf, "PROTECT_PORT")?,
+            xsks: take_map(&mut ebpf, "XSKS")?,
+            redirect_port: take_map(&mut ebpf, "REDIRECT_PORT")?,
         };
 
         Ok(Self {
@@ -315,6 +328,43 @@ impl XdpDataplane {
     /// Returns [`XdpError::Map`] if a map write fails.
     pub fn set_protected_ports(&self, ports: &[u16]) -> Result<(), XdpError> {
         self.locked()?.set_protected_ports(ports)
+    }
+
+    /// Install the UDP destination ports whose IPv4 datagrams the in-kernel
+    /// redirect fast path diverts to the `AF_XDP` socket (sub-project B3.1).
+    ///
+    /// Ports are the host-native `u16` values, matching the numeric destination
+    /// port the eBPF program reads from the packet. Until at least one port is
+    /// installed the fast path redirects nothing. Entries are additive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XdpError::Map`] if a map write fails.
+    pub fn set_redirect_ports(&self, ports: &[u16]) -> Result<(), XdpError> {
+        self.locked()?.set_redirect_ports(ports)
+    }
+
+    /// Register a bound `AF_XDP` socket's file descriptor into the `XSKS` map at
+    /// `queue_id`, so the in-kernel redirect fast path can deliver frames that
+    /// arrive on RX queue `queue_id` to that socket (sub-project B3.1).
+    ///
+    /// The socket must already be bound to this interface and RX queue (see
+    /// [`crate::AfXdpReceiver`]); `XskMap` only delivers to a socket bound on the
+    /// same queue the packet was received on.
+    ///
+    /// # Safety
+    ///
+    /// `socket_fd` must be a valid, open `AF_XDP` socket file descriptor that
+    /// stays open for as long as it is registered in the map (the map stores the
+    /// fd, not an owned handle).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XdpError::Map`] if the map write fails.
+    pub unsafe fn register_xsk(&self, queue_id: u32, socket_fd: RawFd) -> Result<(), XdpError> {
+        // SAFETY: forwarded to the caller's contract — `socket_fd` is a valid,
+        // open AF_XDP socket fd that outlives its registration in the map.
+        unsafe { self.locked()?.register_xsk(queue_id, socket_fd) }
     }
 
     /// Snapshot the per-CPU stats counters and current map occupancy.
@@ -436,6 +486,31 @@ impl DataplaneMaps {
         Ok(())
     }
 
+    /// Insert each UDP redirect port into the `REDIRECT_PORT` set (B3.1). The key
+    /// is the host-native `u16` value, matching the numeric destination port the
+    /// eBPF program reads; the stored `1u8` value is an ignored presence marker.
+    fn set_redirect_ports(&mut self, ports: &[u16]) -> Result<(), XdpError> {
+        for &port in ports {
+            self.redirect_port.insert(port, 1_u8, 0).map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// Register a bound `AF_XDP` socket fd into `XSKS` at `queue_id` (B3.1).
+    ///
+    /// # Safety
+    ///
+    /// `socket_fd` must be a valid, open `AF_XDP` socket fd that outlives its
+    /// registration in the map.
+    unsafe fn register_xsk(&mut self, queue_id: u32, socket_fd: RawFd) -> Result<(), XdpError> {
+        // SAFETY: the caller guarantees `socket_fd` is a valid, open fd for the
+        // duration of the borrow (and beyond, per the map-storage contract); the
+        // `BorrowedFd` is used only within this call to satisfy `XskMap::set`'s
+        // `AsRawFd` bound.
+        let fd = unsafe { BorrowedFd::borrow_raw(socket_fd) };
+        self.xsks.set(queue_id, fd, 0).map_err(map_err)
+    }
+
     /// Sum the per-CPU counters and count the blocklist/rate map entries.
     fn stats(&mut self) -> Result<XdpStats, XdpError> {
         Ok(XdpStats {
@@ -443,6 +518,7 @@ impl DataplaneMaps {
             dropped_blocklist: self.sum_reason(REASON_BLOCKLIST)?,
             dropped_ratelimit: self.sum_reason(REASON_RATELIMIT)?,
             syn_cookies_sent: self.sum_reason(REASON_SYNCOOKIE)?,
+            redirected: self.sum_reason(REASON_REDIRECT)?,
             blocked_entries: count_keys(self.block_v4.keys()) + count_keys(self.block_v6.keys()),
             ratelimit_entries: count_keys(self.rate.keys()),
         })
