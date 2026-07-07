@@ -10,7 +10,7 @@ topology "deception-resilience" {
     }
     node "attacker" {
         run "wire-flood" \
-            cmd="cargo run --offline -p blackwall-trafficgen -- send --dst 10.0.0.1 --spec full-set --duration 30"
+            cmd="target/debug/trafficgen send --dst 10.0.0.1 --spec full-set --duration 30"
     }
     link "victim" "attacker" subnet="10.0.0.0/30"
 }
@@ -20,7 +20,7 @@ scenario "engine-survives-and-caps" {
     // Connection flood past the cap; self-asserts served>0 AND dropped+failed>0
     // (engine serving + bounding the flood) while the wire flood runs.
     step assert node="attacker" \
-         cmd="cargo run --offline -p blackwall-trafficgen -- connect-flood --dst 10.0.0.1 --port 22 --concurrency 600 --duration 8" \
+         cmd="target/debug/trafficgen connect-flood --dst 10.0.0.1 --port 22 --concurrency 600 --duration 8" \
          exit="0" timeout="40s"
     // Legit deception still works + the engine survived (still responsive).
     step assert node="attacker" \

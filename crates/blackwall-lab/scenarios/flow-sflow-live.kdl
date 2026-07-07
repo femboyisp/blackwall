@@ -14,7 +14,7 @@ topology "flow-sflow-live" {
 
 scenario "live-sflow-detection" {
     step assert node="attacker" \
-         cmd="cargo run --offline -p blackwall-trafficgen -- send --dst 10.0.0.1 --spec full-set --duration 8" \
+         cmd="target/debug/trafficgen send --dst 10.0.0.1 --spec full-set --duration 8" \
          exit="0" timeout="60s"
     step wait   node="victim" \
          until="file-present:/run/blackwall-lab/flow-live-detected" timeout="40s"
