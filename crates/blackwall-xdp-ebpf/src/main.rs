@@ -19,9 +19,28 @@
 //! SYN floods at the driver level ahead of nft. A legitimate client's
 //! subsequent ACK is **not** validated here — it falls through to `XDP_PASS`
 //! and the existing userspace NFQUEUE tier validates the cookie (with the same
-//! key) and serves the banner. That key-sharing, IPv6, a config-driven
-//! protected-port set, and a real wall-clock time source are B2.3; see the
-//! `// B2.3:` markers below.
+//! key) and serves the banner.
+//!
+//! # Production cookie key + time base (B2.3a)
+//!
+//! The cookie secret is no longer a compile-time constant: it is read from the
+//! single-entry `COOKIE_KEY` BPF map, populated from userspace
+//! ([`blackwall_xdp::XdpDataplane::set_cookie_key`]) with the same 128-bit
+//! secret the NFQUEUE tier validates against. If the map entry is absent (key
+//! never installed) the SYN handler bails to `XDP_PASS` rather than mint a
+//! cookie under a zero/garbage key.
+//!
+//! The cookie time base is now [`bpf_ktime_get_ns`] (nanoseconds since boot,
+//! `CLOCK_MONOTONIC`) divided down to seconds — a real, monotonic clock rather
+//! than a fixed constant. **Cross-tier requirement:** the userspace responder
+//! that validates the returning ACK must slot the cookie against the *same*
+//! clock. It currently reads `SystemTime`/UNIX; B2.3b switches it to
+//! `CLOCK_MONOTONIC` so both tiers agree on the 64-second time slot. Until then
+//! the two tiers do not share a time base — that switch is out of scope here.
+//!
+//! IPv6, the cross-daemon config-driven shared secret, gating on a protected-port
+//! set, the userspace monotonic-clock switch, and metrics are B2.3b; see the
+//! `// B2.3b:` markers below.
 //!
 //! # `as`-cast exemption
 //!
@@ -38,12 +57,12 @@ use aya_ebpf::bindings::xdp_action;
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{LpmTrie, LruHashMap, PerCpuArray};
+use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray};
 use aya_ebpf::programs::XdpContext;
 use blackwall_cookie::make_cookie_raw;
 use blackwall_xdp_common::{
-    RateBucket, Stat, REASON_BLOCKLIST, REASON_COUNT, REASON_PASS, REASON_RATELIMIT,
-    REASON_SYNCOOKIE,
+    CookieKeyValue, RateBucket, Stat, REASON_BLOCKLIST, REASON_COUNT, REASON_PASS,
+    REASON_RATELIMIT, REASON_SYNCOOKIE,
 };
 use core::mem;
 use network_types::eth::{EthHdr, EtherType};
@@ -58,6 +77,17 @@ static BLOCK_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(65536, 1);
 static RATE: LruHashMap<[u8; 16], RateBucket> = LruHashMap::with_max_entries(1_048_576, 0);
 #[map]
 static STATS: PerCpuArray<Stat> = PerCpuArray::with_max_entries(REASON_COUNT, 0);
+/// Single-entry map (key `0`) holding the 128-bit SYN-cookie secret, pre-split
+/// into the SipHash `(k0, k1)` pair (see [`CookieKeyValue`]). Populated from
+/// userspace before the program answers any SYN; an absent entry makes the SYN
+/// handler bail to `XDP_PASS` rather than mint a cookie under a garbage key. A
+/// `HashMap` (not an `Array`) is used precisely so *absence* is observable — a
+/// one-element `Array` would always return a zeroed value, indistinguishable
+/// from an unconfigured key.
+#[map]
+static COOKIE_KEY: HashMap<u32, CookieKeyValue> = HashMap::with_max_entries(1, 0);
+/// Fixed map key of the sole [`COOKIE_KEY`] entry.
+const COOKIE_KEY_SLOT: u32 = 0;
 
 // Absolute packet offsets for the Ethernet + IPv4 (IHL 5) + TCP layout the
 // SYN-cookie fast path operates on. Every access is still `ptr_at`
@@ -113,23 +143,9 @@ const MAX_TCP_OPTS: usize = 40;
 /// than this bail to `XDP_PASS` rather than emit a wrong checksum. B2.2 scope.
 const MAX_TCP_SEG: usize = 64;
 
-// B2.3: fixed SYN-cookie secret key. In B2.3 this becomes a value read from a
-// userspace-populated BPF map, shared with the NFQUEUE tier so the ACK it later
-// receives validates against the same key. For B2.2 it is a compile-time
-// constant matching the golden vector the `BPF_PROG_TEST_RUN` test asserts
-// (bytes 0x00..=0x0f split little-endian into the SipHash (k0, k1) pair, the
-// same split `blackwall_deception::CookieKey::to_u64_pair` performs).
-const COOKIE_KEY: [u8; 16] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-];
-// B2.3: fixed cookie time base (Unix seconds). In B2.3 this becomes a real
-// wall-clock read agreed with the userspace tier (the cookie encodes a coarse
-// 64-second time slot; the validating ACK must land in the same or previous
-// slot). For B2.2 it is a constant so the emitted cookie is deterministic and
-// the test can predict it exactly. `bpf_ktime_get_ns` is imported and used by
-// the rate limiter, but it is boot-monotonic, not wall-clock, so it is *not*
-// the cookie time source.
-const COOKIE_NOW_SECS: u64 = 1_000_000;
+/// Nanoseconds per second, dividing [`bpf_ktime_get_ns`] down to the
+/// seconds-since-boot the cookie core slots (`>> COUNTER_SHIFT`) internally.
+const NS_PER_SEC: u64 = 1_000_000_000;
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
@@ -352,18 +368,19 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     let client_seq = load_be32(ctx, OFF_TCP_SEQ)?;
     let client_mss = parse_mss(ctx)?;
 
+    // Read the secret from the userspace-populated map. Absent (never installed)
+    // => bail to `XDP_PASS`; we never mint a cookie under a zero/garbage key.
+    let (k0, k1) = cookie_keys()?;
+    // Cookie time base: real monotonic seconds-since-boot (`CLOCK_MONOTONIC`).
+    // `make_cookie_raw` slots this with `>> COUNTER_SHIFT` internally.
+    // B2.3b: the userspace responder must slot the returning ACK against this
+    // same monotonic clock (it currently uses `SystemTime`/UNIX); until that
+    // switch the tiers disagree on the slot.
+    // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
+    let now_secs = unsafe { bpf_ktime_get_ns() } / NS_PER_SEC;
     // Compute the stateless SYN-cookie with the shared no_std core.
-    let (k0, k1) = cookie_keys();
-    let (cookie_seq, mss) = make_cookie_raw(
-        k0,
-        k1,
-        &src,
-        src_port,
-        &dst,
-        dst_port,
-        client_mss,
-        COOKIE_NOW_SECS,
-    );
+    let (cookie_seq, mss) =
+        make_cookie_raw(k0, k1, &src, src_port, &dst, dst_port, client_mss, now_secs);
 
     let ack = client_seq.wrapping_add(1);
 
@@ -426,15 +443,20 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_TX)
 }
 
-/// Split the fixed [`COOKIE_KEY`] into the SipHash `(k0, k1)` little-endian
-/// `u64` pair, matching `blackwall_deception::CookieKey::to_u64_pair`.
+/// Read the SipHash `(k0, k1)` cookie secret from the [`COOKIE_KEY`] map.
+///
+/// Returns `Err(())` if the entry is absent (the key was never installed from
+/// userspace), so the caller falls through to `XDP_PASS` instead of minting a
+/// cookie under a zero/garbage key. The `(k0, k1)` split was performed once, in
+/// userspace (`blackwall_xdp::keys::encode_cookie_key`), matching
+/// `blackwall_deception::CookieKey::to_u64_pair`.
 #[inline(always)]
-fn cookie_keys() -> (u64, u64) {
-    let mut k0 = [0u8; 8];
-    let mut k1 = [0u8; 8];
-    k0.copy_from_slice(&COOKIE_KEY[0..8]);
-    k1.copy_from_slice(&COOKIE_KEY[8..16]);
-    (u64::from_le_bytes(k0), u64::from_le_bytes(k1))
+fn cookie_keys() -> Result<(u64, u64), ()> {
+    // SAFETY: `COOKIE_KEY` is a `HashMap` value we only read; the returned
+    // reference is used (copied out) before any further map mutation, of which
+    // this program performs none on `COOKIE_KEY`.
+    let value = unsafe { COOKIE_KEY.get(&COOKIE_KEY_SLOT) }.ok_or(())?;
+    Ok((value.k0, value.k1))
 }
 
 /// Return the client's advertised MSS if the **first** TCP option is an MSS

@@ -12,6 +12,7 @@
 use std::os::fd::{AsFd, AsRawFd};
 
 use aya::maps::lpm_trie::{Key, LpmTrie};
+use aya::maps::HashMap;
 use aya::programs::Xdp;
 use aya::Ebpf;
 
@@ -26,15 +27,57 @@ const XDP_PASS: u32 = 2;
 /// interface).
 const XDP_TX: u32 = 3;
 
-/// The fixed B2.2 SYN-cookie secret key baked into the eBPF program
-/// (`COOKIE_KEY` in `blackwall-xdp-ebpf`): bytes `0x00..=0x0f`.
+/// Test SYN-cookie secret installed into the `COOKIE_KEY` map before the run
+/// (B2.3a: the key is no longer baked into the eBPF program — it is delivered
+/// via the map). Bytes `0x00..=0x0f`, matching the cookie crate's golden-vector
+/// `(k0, k1)`.
 const COOKIE_KEY: [u8; 16] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
 ];
-/// The fixed B2.2 cookie time base baked into the eBPF program
-/// (`COOKIE_NOW_SECS`), in Unix seconds. Pinning this makes the emitted cookie
-/// deterministic so this test can predict it exactly.
-const COOKIE_NOW_SECS: u64 = 1_000_000;
+
+/// `COOKIE_KEY` map value: the pre-split SipHash `(k0, k1)` pair, byte-identical
+/// to `blackwall_xdp_common::CookieKeyValue`. Declared locally so the test can
+/// give it an [`aya::Pod`] impl (the crate's own newtype is private).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CookieKeyValue {
+    k0: u64,
+    k1: u64,
+}
+
+// SAFETY: `#[repr(C)]` `Copy` plain-old-data of two `u64`s — a valid, fixed
+// 16-byte BPF map value with no padding or pointers.
+unsafe impl aya::Pod for CookieKeyValue {}
+
+/// Read `CLOCK_MONOTONIC` seconds-since-boot — the same clock base
+/// `bpf_ktime_get_ns()` uses in-kernel, so the test can reconstruct the cookie
+/// time slot the eBPF program saw.
+fn clock_monotonic_secs() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable `timespec`; `clock_gettime` fills it and
+    // returns 0 on success.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, core::ptr::addr_of_mut!(ts)) };
+    assert_eq!(
+        rc,
+        0,
+        "clock_gettime(CLOCK_MONOTONIC) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    u64::try_from(ts.tv_sec).expect("monotonic seconds are non-negative")
+}
+
+/// Install the test cookie secret into the loaded object's `COOKIE_KEY` map.
+fn install_cookie_key(bpf: &mut Ebpf, key: [u8; 16]) {
+    let (k0, k1) = cookie_keys(key);
+    let mut map: HashMap<_, u32, CookieKeyValue> =
+        HashMap::try_from(bpf.map_mut("COOKIE_KEY").expect("COOKIE_KEY map present"))
+            .expect("COOKIE_KEY is a HashMap");
+    map.insert(0u32, CookieKeyValue { k0, k1 }, 0)
+        .expect("insert cookie key");
+}
 
 /// The `BPF_PROG_TEST_RUN` slice of `union bpf_attr`, matching the kernel layout.
 ///
@@ -262,10 +305,7 @@ fn cookie_keys(key: [u8; 16]) -> (u64, u64) {
 
 #[test]
 #[ignore = "requires root + recent kernel; run in the lab CI job"]
-fn syn_is_answered_with_a_golden_cookie_syn_ack_via_xdp_tx() {
-    // 4-tuple + MSS chosen so the emitted cookie equals the crate's golden
-    // vector (0x09D7DE6F): the cross-check that the in-kernel cookie is
-    // byte-identical to the userspace one.
+fn syn_is_answered_with_a_map_keyed_cookie_syn_ack_via_xdp_tx() {
     let client_ip = [203, 0, 113, 7];
     let server_ip = [198, 51, 100, 1];
     let client_port = 54_321u16;
@@ -273,24 +313,11 @@ fn syn_is_answered_with_a_golden_cookie_syn_ack_via_xdp_tx() {
     let client_seq = 0x1122_3344u32;
     let client_mss = 1460u16;
 
-    // Expected cookie computed with the SAME shared no_std core the eBPF calls.
     let (k0, k1) = cookie_keys(COOKIE_KEY);
-    let (expected_cookie, expected_mss) = blackwall_cookie::make_cookie_raw(
-        k0,
-        k1,
-        &client_ip,
-        client_port,
-        &server_ip,
-        server_port,
-        client_mss,
-        COOKIE_NOW_SECS,
-    );
-    assert_eq!(
-        expected_cookie, 0x09D7_DE6F,
-        "test tuple must reproduce the crate's golden cookie"
-    );
 
     let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    // B2.3a: deliver the cookie secret via the map (no longer a program const).
+    install_cookie_key(&mut bpf, COOKIE_KEY);
     let prog: &mut Xdp = bpf
         .program_mut("xdp_filter")
         .expect("xdp_filter program present")
@@ -310,7 +337,42 @@ fn syn_is_answered_with_a_golden_cookie_syn_ack_via_xdp_tx() {
         client_seq,
         client_mss,
     );
+    // B2.3a: the eBPF cookie time base is `bpf_ktime_get_ns()` (CLOCK_MONOTONIC),
+    // which we cannot pin, so the expected cookie is computed dynamically.
+    // Snapshot the same clock right around the run and accept any of the three
+    // adjacent 64-second slots — one slot of tolerance covers a boundary crossing
+    // between this read and the kernel's ktime read.
+    let now_secs = clock_monotonic_secs();
     let (action, out) = run_xdp_out(prog_fd, &syn);
+    let slot = now_secs >> blackwall_cookie::COUNTER_SHIFT;
+    // MSS is time-independent, so any candidate slot yields the same value.
+    let expected_mss = blackwall_cookie::make_cookie_raw(
+        k0,
+        k1,
+        &client_ip,
+        client_port,
+        &server_ip,
+        server_port,
+        client_mss,
+        slot << blackwall_cookie::COUNTER_SHIFT,
+    )
+    .1;
+    let expected_cookies: Vec<u32> = [slot.wrapping_sub(1), slot, slot + 1]
+        .into_iter()
+        .map(|s| {
+            blackwall_cookie::make_cookie_raw(
+                k0,
+                k1,
+                &client_ip,
+                client_port,
+                &server_ip,
+                server_port,
+                client_mss,
+                s << blackwall_cookie::COUNTER_SHIFT,
+            )
+            .0
+        })
+        .collect();
 
     assert_eq!(action, XDP_TX, "a SYN must be answered via XDP_TX");
     assert_eq!(
@@ -355,10 +417,11 @@ fn syn_is_answered_with_a_golden_cookie_syn_ack_via_xdp_tx() {
         client_port,
         "reply dst port = original src"
     );
-    assert_eq!(
-        be32(&out, TCP + 4),
-        expected_cookie,
-        "reply seq must be the golden SYN-cookie"
+    let actual_cookie = be32(&out, TCP + 4);
+    assert!(
+        expected_cookies.contains(&actual_cookie),
+        "reply seq {actual_cookie:#010x} must be a map-keyed SYN-cookie for an \
+         adjacent monotonic slot (candidates: {expected_cookies:#010x?})"
     );
     assert_eq!(
         be32(&out, TCP + 8),
@@ -416,4 +479,37 @@ fn non_syn_tcp_passes_through_unchanged() {
     let (action, out) = run_xdp_out(prog_fd, &ack);
     assert_eq!(action, XDP_PASS, "a non-SYN TCP segment must pass through");
     assert_eq!(out, ack, "a passed packet must be byte-for-byte unchanged");
+}
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn syn_without_a_cookie_key_passes_through_unchanged() {
+    // B2.3a fallback: with the `COOKIE_KEY` map left empty, the SYN handler must
+    // never mint a cookie under a garbage key — it bails to `XDP_PASS` and the
+    // frame is returned untouched for the userspace tier to handle.
+    let syn = eth_ipv4_tcp_syn(
+        [203, 0, 113, 7],
+        [198, 51, 100, 1],
+        54_321,
+        443,
+        0x1122_3344,
+        1460,
+    );
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    // Deliberately do NOT install a cookie key.
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    let (action, out) = run_xdp_out(prog_fd, &syn);
+    assert_eq!(
+        action, XDP_PASS,
+        "a SYN with no cookie key installed must pass through"
+    );
+    assert_eq!(out, syn, "a passed SYN must be byte-for-byte unchanged");
 }
