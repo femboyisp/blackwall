@@ -764,3 +764,94 @@ fn syn_to_protected_port_but_unprotected_prefix_passes_through_unchanged() {
         "a gated (passed) SYN must be byte-for-byte unchanged"
     );
 }
+
+// --- B4.1: xdpcap-style packet capture ---
+
+/// End-to-end capture: enable the `CAPTURE_ENABLED` flag, run one frame through
+/// the program, and confirm a `CaptureRecord` (verdict + reason + lengths + the
+/// L2 snapshot) lands in the `CAPTURE` ring — the same ring the userspace
+/// `XdpCapture` reader drains and the pure `pcap` encoder serialises.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn enabled_capture_pushes_a_record_for_the_acted_packet() {
+    use aya::maps::RingBuf;
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+
+    // Enable capture (single-entry flag map, key 0 -> 1).
+    {
+        let mut flag: HashMap<_, u32, u8> = HashMap::try_from(
+            bpf.map_mut("CAPTURE_ENABLED")
+                .expect("CAPTURE_ENABLED map present"),
+        )
+        .expect("CAPTURE_ENABLED is a HashMap");
+        flag.insert(0u32, 1u8, 0).expect("enable capture");
+    }
+
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    // A plain (non-blocked, non-SYN) IPv4 frame: falls through to XDP_PASS.
+    let frame = eth_ipv4([203, 0, 113, 5]);
+    let action = run_xdp(prog_fd, &frame);
+    assert_eq!(action, XDP_PASS, "plain frame passes");
+
+    // Drain the ring and parse the single record with the crate's pure parser.
+    let mut ring =
+        RingBuf::try_from(bpf.map_mut("CAPTURE").expect("CAPTURE map present")).expect("ring");
+    let item = ring.next().expect("one capture record present");
+    let parsed = blackwall_xdp::pcap::parse_record(&item).expect("record parses");
+
+    // REASON_PASS == 0, verdict XDP_PASS == 2, original length is the frame len.
+    assert_eq!(parsed.record.reason, 0, "reason = PASS");
+    assert_eq!(parsed.record.verdict, XDP_PASS, "verdict = XDP_PASS");
+    assert_eq!(
+        parsed.record.pkt_len,
+        u32::try_from(frame.len()).unwrap(),
+        "pkt_len = original frame length"
+    );
+    // The 34-byte frame is snapshotted at the 32-byte tier; the bytes match the
+    // head of the frame.
+    assert_eq!(parsed.record.cap_len, 32, "cap_len = 32-byte tier");
+    assert_eq!(parsed.data.len(), 32);
+    assert_eq!(&parsed.data[..], &frame[..32], "snapshot = frame head");
+    assert!(parsed.record.timestamp_ns > 0, "timestamp recorded");
+
+    drop(item);
+    assert!(ring.next().is_none(), "exactly one record was captured");
+}
+
+/// With capture **disabled** (the default — flag absent), running frames pushes
+/// nothing into the ring: the zero-overhead-when-off guarantee.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn disabled_capture_pushes_nothing() {
+    use aya::maps::RingBuf;
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    // Never touch CAPTURE_ENABLED: capture is off.
+    for _ in 0..4 {
+        run_xdp(prog_fd, &eth_ipv4([203, 0, 113, 5]));
+    }
+
+    let mut ring =
+        RingBuf::try_from(bpf.map_mut("CAPTURE").expect("CAPTURE map present")).expect("ring");
+    assert!(
+        ring.next().is_none(),
+        "capture disabled: the ring must stay empty"
+    );
+}

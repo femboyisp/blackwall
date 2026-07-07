@@ -13,6 +13,7 @@
 //! to the eBPF side (v4 zero-padded into the low four bytes) so rate-limit
 //! lookups actually match — see the `rate_key` helper.
 
+use crate::capture::{CAPTURE_ENABLED_PIN, CAPTURE_RING_PIN, DEFAULT_CAPTURE_PIN_DIR};
 use crate::keys::{encode_cookie_key, lpm_key, LpmKey};
 use crate::manager::{XdpExecError, XdpExecutor};
 use crate::XdpAction;
@@ -29,6 +30,7 @@ use blackwall_xdp_common::{
 use ipnet::IpNet;
 use std::net::IpAddr;
 use std::os::fd::{BorrowedFd, RawFd};
+use std::path::Path;
 use std::sync::Mutex;
 
 /// A loaded, attached `xdp_filter` program together with typed handles to its
@@ -238,6 +240,16 @@ impl XdpDataplane {
             redirect_port: take_map(&mut ebpf, "REDIRECT_PORT")?,
         };
 
+        // B4.1: pin the capture ring + flag to bpffs so a separate
+        // `blackwalld xdp capture` process can open the same ring. Best-effort:
+        // a pinning failure (no bpffs, permissions) only makes `xdp capture`
+        // unavailable; it never aborts the attach. The `CAPTURE`/`CAPTURE_ENABLED`
+        // maps are left in `ebpf` (never `take_map`'d), so they stay alive with
+        // the retained program and the pins reference them.
+        if let Err(err) = pin_capture_maps(&ebpf, Path::new(DEFAULT_CAPTURE_PIN_DIR)) {
+            tracing::warn!(%err, "XDP: capture-map pinning failed; `xdp capture` unavailable");
+        }
+
         Ok(Self {
             _ebpf: ebpf,
             maps: Mutex::new(maps),
@@ -391,6 +403,32 @@ impl XdpDataplane {
             .lock()
             .map_err(|_| XdpError::Map("dataplane maps mutex poisoned".to_owned()))
     }
+}
+
+/// Pin the `CAPTURE` ring and `CAPTURE_ENABLED` flag maps to bpffs under `dir`
+/// (sub-project B4.1) so a separate `blackwalld xdp capture` process can open
+/// the same ring the attached program writes to.
+///
+/// Creates `dir` if needed and removes any stale pin from a previous daemon
+/// instance first (a pin syscall fails if the path already exists). The maps
+/// must still be present in `ebpf` (not yet `take_map`'d).
+fn pin_capture_maps(ebpf: &Ebpf, dir: &Path) -> Result<(), XdpError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| XdpError::Map(format!("create pin dir {}: {e}", dir.display())))?;
+    for (name, pin) in [
+        ("CAPTURE", CAPTURE_RING_PIN),
+        ("CAPTURE_ENABLED", CAPTURE_ENABLED_PIN),
+    ] {
+        let path = dir.join(pin);
+        // Drop any stale pin from a prior instance so the fresh map can pin.
+        let _ = std::fs::remove_file(&path);
+        let map = ebpf
+            .map(name)
+            .ok_or_else(|| XdpError::Load(format!("map {name} missing for pinning")))?;
+        map.pin(&path)
+            .map_err(|e| XdpError::Map(format!("pin {name} -> {}: {e}", path.display())))?;
+    }
+    Ok(())
 }
 
 /// Take a map out of `ebpf` by `name` and convert it into an owned typed handle.
