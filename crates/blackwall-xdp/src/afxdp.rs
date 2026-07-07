@@ -1,13 +1,20 @@
-//! AF_XDP zero-copy/copy-mode receiver (sub-project B3.1).
+//! AF_XDP zero-copy/copy-mode socket (sub-projects B3.1 RX + B3.2 TX).
 //!
-//! This is the userspace half of the B3.1 spike: it owns a UMEM region and the
-//! four AF_XDP rings (fill / completion / RX / TX) for one `(interface, RX
+//! This is the userspace half of the AF_XDP fast path: it owns a UMEM region and
+//! the four AF_XDP rings (fill / completion / RX / TX) for one `(interface, RX
 //! queue)`, binds an `AF_XDP` socket to that queue, and exposes the socket's fd
 //! so it can be registered into the eBPF `XSKS` [`XskMap`](aya::maps::XskMap) via
 //! [`crate::XdpDataplane::register_xsk`]. Once registered, the in-kernel
 //! `xdp_filter` redirect fast path (packets whose UDP destination port is in
-//! `REDIRECT_PORT`) hands matching frames straight to this receiver, ahead of
-//! the kernel network stack.
+//! `REDIRECT_PORT`) hands matching frames straight to this socket, ahead of the
+//! kernel network stack.
+//!
+//! B3.1 gave this an RX path ([`AfXdpSocket::recv_one`]); B3.2 adds the
+//! symmetric **TX** path ([`AfXdpSocket::send`]) so the flow daemon's UDP
+//! responder can transmit a reply frame **zero-copy** through the *same* UMEM,
+//! bypassing the kernel stack in both directions. RX chunks are the low half of
+//! the UMEM (primed into the fill ring); TX chunks are a disjoint high half,
+//! recycled through the completion ring after the kernel has sent them.
 //!
 //! aya 0.13 provides only the `XSKMAP` binding, not the socket/UMEM/ring
 //! machinery; that comes from the pure-Rust [`xdpilone`] crate (no
@@ -20,23 +27,32 @@
 //!
 //! The socket binds in **copy mode** ([`SocketConfig::XDP_BIND_COPY`]): veth (and
 //! most virtual devices) do not support AF_XDP zero-copy, and copy mode is the
-//! portable foundation. B3.2 can opt a real NIC into zero-copy by dropping that
-//! bind flag where the driver supports `XDP_SETUP_XSK_POOL`.
+//! portable foundation. A follow-up can opt a real NIC into zero-copy by
+//! dropping that bind flag where the driver supports `XDP_SETUP_XSK_POOL`.
 
 use core::ffi::CStr;
 use std::num::NonZeroU32;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 
-use xdpilone::{DeviceQueue, IfInfo, RingRx, Socket, SocketConfig, Umem, UmemConfig, User};
+use xdpilone::xdp::XdpDesc;
+use xdpilone::{DeviceQueue, IfInfo, RingRx, RingTx, Socket, SocketConfig, Umem, UmemConfig, User};
 
 /// Frame (chunk) size in the UMEM, in bytes. A power of two comfortably larger
 /// than a 1500-byte MTU frame; also the kernel's per-chunk stride.
 const FRAME_SIZE: u32 = 4096;
-/// Number of frames (chunks) carved out of the UMEM region.
+/// Number of frames (chunks) carved out of the UMEM region. The low
+/// [`RING_SIZE`] frames back the RX fill ring; the next [`RING_SIZE`] frames
+/// back the TX pool (see [`TX_FRAME_BASE`]).
 const FRAME_COUNT: u32 = 64;
-/// Fill / completion / RX ring depth (must be a power of two per the kernel).
+/// Fill / completion / RX / TX ring depth (must be a power of two per the
+/// kernel).
 const RING_SIZE: u32 = 32;
+/// Index of the first UMEM frame reserved for **TX**. RX fill uses frames
+/// `0..RING_SIZE`; TX uses `RING_SIZE..FRAME_COUNT`, a disjoint range so a
+/// reply being transmitted never aliases a chunk the kernel may overwrite with
+/// received data.
+const TX_FRAME_BASE: u32 = RING_SIZE;
 
 /// An error setting up or receiving on the AF_XDP socket.
 #[derive(Debug, thiserror::Error)]
@@ -53,12 +69,16 @@ pub enum AfXdpError {
     /// A `poll`/receive syscall failed.
     #[error("AF_XDP receive error: {0}")]
     Receive(String),
+    /// A reply frame could not be transmitted (oversized, or the TX ring/frame
+    /// pool was exhausted).
+    #[error("AF_XDP transmit error: {0}")]
+    Transmit(String),
 }
 
 /// A page-aligned anonymous `mmap` region backing the UMEM.
 ///
 /// Owns the mapping and `munmap`s it on drop. Placed **last** in
-/// [`AfXdpReceiver`]'s field order so the rings and socket (which point into this
+/// [`AfXdpSocket`]'s field order so the rings and socket (which point into this
 /// memory) are torn down before the mapping is released.
 struct UmemRegion {
     ptr: NonNull<u8>,
@@ -107,32 +127,42 @@ impl Drop for UmemRegion {
     }
 }
 
-/// A bound AF_XDP receiver for one `(interface, RX queue)`.
+/// A bound AF_XDP RX+TX socket for one `(interface, RX queue)`.
 ///
-/// Construct with [`AfXdpReceiver::bind`], register its [`raw_fd`](Self::raw_fd)
-/// into the eBPF `XSKS` map, then drain redirected frames with
-/// [`recv_one`](Self::recv_one).
-pub struct AfXdpReceiver {
+/// Construct with [`AfXdpSocket::bind`], register its [`raw_fd`](Self::raw_fd)
+/// into the eBPF `XSKS` map, drain redirected frames with
+/// [`recv_one`](Self::recv_one), and transmit reply frames zero-copy with
+/// [`send`](Self::send).
+pub struct AfXdpSocket {
     /// RX queue id this socket is bound to (the `XSKS` map index to register at).
     queue_id: u32,
     /// UMEM handle, retained so its socket-fd / registration stays alive for the
     /// lifetime of the derived rings.
     _umem: Umem,
-    /// The fill/completion device queue; also drives RX wakeups.
+    /// The fill/completion device queue; drives RX wakeups and reaps sent TX
+    /// chunks from the completion ring.
     device: DeviceQueue,
     /// The mapped RX ring; source of received descriptors and the socket fd.
     rx: RingRx,
+    /// The mapped TX ring; sink for reply descriptors (B3.2).
+    tx: RingTx,
     /// Retained so the bound rx/tx socket configuration stays alive.
     _user: User,
-    /// Cached UMEM base pointer for reading received frame bytes directly.
+    /// Cached UMEM base pointer for reading received frame bytes and writing
+    /// reply frame bytes directly.
     base: NonNull<u8>,
+    /// Free-list of TX chunk byte offsets (into the UMEM) available to hold the
+    /// next reply frame. Drained as replies are queued and refilled from the
+    /// completion ring once the kernel has transmitted them (see [`Self::send`]).
+    tx_free: Vec<u64>,
     /// Backing mapping; dropped last so the rings unmap cleanly (see field order).
     _region: UmemRegion,
 }
 
-impl AfXdpReceiver {
-    /// Bind an `AF_XDP` socket to `ifname`'s RX queue `queue_id` in copy mode and
-    /// prime its fill ring, ready to receive redirected frames.
+impl AfXdpSocket {
+    /// Bind an `AF_XDP` socket to `ifname`'s RX queue `queue_id` in copy mode,
+    /// map its RX and TX rings, and prime its fill ring, ready to receive
+    /// redirected frames and transmit replies.
     ///
     /// # Errors
     ///
@@ -176,7 +206,7 @@ impl AfXdpReceiver {
                 &sock,
                 &SocketConfig {
                     rx_size: NonZeroU32::new(RING_SIZE),
-                    tx_size: None,
+                    tx_size: NonZeroU32::new(RING_SIZE),
                     bind_flags: SocketConfig::XDP_BIND_COPY | SocketConfig::XDP_BIND_NEED_WAKEUP,
                 },
             )
@@ -185,21 +215,32 @@ impl AfXdpReceiver {
         let rx = user
             .map_rx()
             .map_err(|e| AfXdpError::Setup(e.to_string()))?;
+        let tx = user
+            .map_tx()
+            .map_err(|e| AfXdpError::Setup(e.to_string()))?;
         umem.bind(&user)
             .map_err(|e| AfXdpError::Setup(e.to_string()))?;
 
+        // TX frame pool: the high half of the UMEM (disjoint from the RX fill
+        // frames), byte offsets, most-recently-freed reused first.
+        let tx_free = (TX_FRAME_BASE..FRAME_COUNT)
+            .map(|i| u64::from(i) * u64::from(FRAME_SIZE))
+            .collect();
+
         let base = region.ptr;
-        let mut receiver = Self {
+        let mut socket = Self {
             queue_id,
             _umem: umem,
             device,
             rx,
+            tx,
             _user: user,
             base,
+            tx_free,
             _region: region,
         };
-        receiver.prime_fill_ring();
-        Ok(receiver)
+        socket.prime_fill_ring();
+        Ok(socket)
     }
 
     /// The RX queue id this socket is bound to (register it into `XSKS` at this
@@ -283,5 +324,86 @@ impl AfXdpReceiver {
             }
             None => Ok(false),
         }
+    }
+
+    /// Transmit `frame` (a complete layer-2 Ethernet frame) zero-copy through
+    /// the TX ring: copy it into a free TX chunk of the shared UMEM, enqueue a
+    /// descriptor pointing at that chunk, and wake the kernel to send it.
+    ///
+    /// Sent chunks are reclaimed from the completion ring on entry to each call,
+    /// so a steady send/recv loop recycles its handful of TX frames
+    /// indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AfXdpError::Transmit`] if `frame` is larger than a UMEM chunk,
+    /// if the TX frame pool is momentarily exhausted (all chunks still in flight
+    /// in the kernel), or if the descriptor could not be enqueued.
+    pub fn send(&mut self, frame: &[u8]) -> Result<(), AfXdpError> {
+        if frame.len() > usize::try_from(FRAME_SIZE).unwrap_or(usize::MAX) {
+            return Err(AfXdpError::Transmit(format!(
+                "reply frame {} bytes exceeds UMEM chunk size {FRAME_SIZE}",
+                frame.len()
+            )));
+        }
+
+        // Reclaim any chunks the kernel has finished transmitting back into the
+        // free-list before we try to grab one.
+        self.reap_completions();
+
+        let offset = self
+            .tx_free
+            .pop()
+            .ok_or_else(|| AfXdpError::Transmit("TX frame pool exhausted".to_owned()))?;
+
+        // SAFETY: `offset` is a TX chunk byte offset from our own pool, so
+        // `[offset, offset + FRAME_SIZE)` lies within the mapped UMEM region;
+        // `frame.len() <= FRAME_SIZE` (checked above), the source and
+        // destination do not overlap (distinct allocations), and both are byte
+        // pointers so alignment is trivially satisfied.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                frame.as_ptr(),
+                self.base
+                    .as_ptr()
+                    .add(usize::try_from(offset).unwrap_or(usize::MAX)),
+                frame.len(),
+            );
+        }
+
+        let len = u32::try_from(frame.len()).unwrap_or(FRAME_SIZE);
+        let desc = XdpDesc {
+            addr: offset,
+            len,
+            options: 0,
+        };
+        let queued = {
+            let mut writer = self.tx.transmit(1);
+            let ok = writer.insert_once(desc);
+            writer.commit();
+            ok
+        };
+        if !queued {
+            // Ring was full; hand the chunk back so it is not leaked.
+            self.tx_free.push(offset);
+            return Err(AfXdpError::Transmit("TX ring full".to_owned()));
+        }
+
+        // Copy mode + NEED_WAKEUP: nudge the kernel to pick up the descriptor.
+        if self.tx.needs_wakeup() {
+            self.tx.wake();
+        }
+        Ok(())
+    }
+
+    /// Drain the completion ring, returning every reclaimed TX chunk (rounded to
+    /// its frame boundary) to the free-list so it can back a future reply.
+    fn reap_completions(&mut self) {
+        let mut comp = self.device.complete(RING_SIZE);
+        while let Some(addr) = comp.read() {
+            let frame_start = addr - (addr % u64::from(FRAME_SIZE));
+            self.tx_free.push(frame_start);
+        }
+        comp.release();
     }
 }

@@ -31,6 +31,11 @@ libc = { workspace = true }
 # shared no_std core (B2.2): the eBPF program and this test compute the cookie
 # from the identical code, so an in-kernel == userspace mismatch fails the test.
 blackwall-cookie = { path = "../blackwall-cookie" }
+# The AF_XDP round-trip gate (B3.2) drives the real responder pipeline, so it
+# reuses the deception tier's reflection-safe `udp_l2_response` builder rather
+# than reimplementing it. dev-only: no crate-layering cycle (blackwall-deception
+# does not depend on blackwall-xdp).
+blackwall-deception = { path = "../blackwall-deception" }
 
 [lints]
 workspace = true

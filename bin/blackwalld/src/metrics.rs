@@ -26,6 +26,9 @@ pub(crate) struct MetricsSources {
     /// Stateless SYN-cookie / UDP responder counters; `None` outside the
     /// deception engine (e.g. the `flow` daemon, which has no responder).
     pub stateless: Option<Arc<blackwall_deception::transport::StatelessMetrics>>,
+    /// AF_XDP UDP responder replies-sent counter (sub-project B3.2); `None`
+    /// when the AF_XDP UDP responder is disabled (`afxdp-udp-ports` empty).
+    pub afxdp_udp_responses: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -90,6 +93,14 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
     }
     if let Some(stateless) = &sources.stateless {
         m.extend(stateless_metrics(stateless));
+    }
+    if let Some(afxdp_udp) = &sources.afxdp_udp_responses {
+        m.push(Metric {
+            name: "blackwall_xdp_udp_responses_total",
+            help: "AF_XDP UDP responder replies sent (reflection-safe, B3.2)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(afxdp_udp.load(std::sync::atomic::Ordering::Relaxed)),
+        });
     }
 
     let s = &sources.store;
