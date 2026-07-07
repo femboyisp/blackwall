@@ -6,7 +6,7 @@ pub mod keys;
 pub mod manager;
 pub mod sink;
 
-pub use afxdp::{AfXdpError, AfXdpReceiver};
+pub use afxdp::{AfXdpError, AfXdpSocket};
 pub use control::{XdpAction, XdpController, XdpOrigin};
 pub use dataplane::{XdpDataplane, XdpError, XdpStats};
 pub use manager::{
