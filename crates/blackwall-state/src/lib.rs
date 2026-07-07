@@ -2,6 +2,7 @@
 //! the audit log, and flow-based attack detections.
 
 mod audit;
+mod cookie;
 mod error;
 mod flowspec;
 mod rtbh;
