@@ -24,6 +24,7 @@ use aya::Ebpf;
 use blackwall_core::XdpMode;
 use blackwall_xdp_common::{
     CookieKeyValue, RateBucket, Stat, REASON_BLOCKLIST, REASON_PASS, REASON_RATELIMIT,
+    REASON_SYNCOOKIE,
 };
 use ipnet::IpNet;
 use std::net::IpAddr;
@@ -114,6 +115,9 @@ pub struct XdpStats {
     pub dropped_blocklist: Stat,
     /// Packets/bytes dropped by the rate limiter (`REASON_RATELIMIT`).
     pub dropped_ratelimit: Stat,
+    /// Packets/bytes answered in-kernel with a SipHash-cookie SYN-ACK via
+    /// `XDP_TX` (`REASON_SYNCOOKIE`, B2.2/B2.3c).
+    pub syn_cookies_sent: Stat,
     /// Number of blocklist entries (`BLOCK_V4` + `BLOCK_V6`).
     pub blocked_entries: u64,
     /// Number of rate-limit entries (`RATE`).
@@ -438,6 +442,7 @@ impl DataplaneMaps {
             passed: self.sum_reason(REASON_PASS)?,
             dropped_blocklist: self.sum_reason(REASON_BLOCKLIST)?,
             dropped_ratelimit: self.sum_reason(REASON_RATELIMIT)?,
+            syn_cookies_sent: self.sum_reason(REASON_SYNCOOKIE)?,
             blocked_entries: count_keys(self.block_v4.keys()) + count_keys(self.block_v6.keys()),
             ratelimit_entries: count_keys(self.rate.keys()),
         })

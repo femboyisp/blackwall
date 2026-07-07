@@ -1332,7 +1332,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         sink
                     }
-                    Ok(dataplane) => {
+                    Ok(mut dataplane) => {
+                        // XDP SYN-cookie fast path: only activated when
+                        // `cookie-ports` is configured (empty leaves the fast
+                        // path inert; the eBPF SYN handler falls through to
+                        // `XDP_PASS`, per B2.3a/b's fail-closed design). Uses
+                        // the SAME Postgres-shared secret as the userspace
+                        // deception tier (`store.cookie_secret()`, B2.3c-1),
+                        // so a cookie minted by either tier validates in the
+                        // other, and the box's own managed prefixes as the
+                        // protected space. NON-FATAL like the rest of this
+                        // attach path: a failure logs a warning and leaves the
+                        // fast path inert rather than aborting the daemon.
+                        if !xdp_cfg.cookie_ports.is_empty() {
+                            match store.cookie_secret().await {
+                                Ok(secret) => {
+                                    let activated = dataplane
+                                        .set_cookie_key(secret)
+                                        .and_then(|()| {
+                                            dataplane.set_protected_prefixes(&policy.prefixes)
+                                        })
+                                        .and_then(|()| {
+                                            dataplane.set_protected_ports(&xdp_cfg.cookie_ports)
+                                        });
+                                    match activated {
+                                        Ok(()) => tracing::info!(
+                                            ports = xdp_cfg.cookie_ports.len(),
+                                            prefixes = policy.prefixes.len(),
+                                            "XDP: SYN-cookie fast path activated"
+                                        ),
+                                        Err(err) => tracing::warn!(
+                                            %err,
+                                            "XDP: SYN-cookie map load failed; continuing \
+                                             with fast path inert"
+                                        ),
+                                    }
+                                }
+                                Err(err) => tracing::warn!(
+                                    %err,
+                                    "XDP: failed to load SYN-cookie secret; continuing \
+                                     with fast path inert"
+                                ),
+                            }
+                        }
+
                         let dataplane = Arc::new(dataplane);
                         xdp_for_metrics = Some(dataplane.clone());
                         // `None` default-rate-limit means "no auto mitigation":

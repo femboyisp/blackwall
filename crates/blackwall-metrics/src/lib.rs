@@ -97,6 +97,9 @@ pub struct XdpMetrics {
     pub dropped_blocklist_packets: f64,
     /// Packets dropped by the rate limiter (`REASON_RATELIMIT`).
     pub dropped_ratelimit_packets: f64,
+    /// Packets answered in-kernel with a SipHash-cookie SYN-ACK via `XDP_TX`
+    /// (`REASON_SYNCOOKIE`, B2.3c).
+    pub syn_cookies_sent_packets: f64,
     /// Number of active blocklist entries (`BLOCK_V4` + `BLOCK_V6`).
     pub blocked_entries: f64,
     /// Number of active rate-limit entries (`RATE`).
@@ -138,6 +141,17 @@ pub fn render_xdp_metrics(m: &XdpMetrics) -> String {
         out,
         "blackwall_xdp_packets_passed_total {}",
         format_value(m.passed_packets)
+    );
+    let _ = writeln!(
+        out,
+        "\n# HELP blackwall_xdp_syn_cookies_sent_total SYN-ACKs answered in-kernel with a \
+         SipHash SYN cookie"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_xdp_syn_cookies_sent_total counter");
+    let _ = writeln!(
+        out,
+        "blackwall_xdp_syn_cookies_sent_total {}",
+        format_value(m.syn_cookies_sent_packets)
     );
     let _ = writeln!(
         out,
@@ -270,6 +284,7 @@ blackwall_bgp_reconnects_total 0
             passed_packets: 1000.0,
             dropped_blocklist_packets: 42.0,
             dropped_ratelimit_packets: 7.0,
+            syn_cookies_sent_packets: 9.0,
             blocked_entries: 3.0,
             ratelimit_entries: 5.0,
         };
@@ -282,6 +297,10 @@ blackwall_xdp_packets_dropped_total{reason=\"ratelimit\"} 7
 # HELP blackwall_xdp_packets_passed_total Packets passed by the XDP data plane
 # TYPE blackwall_xdp_packets_passed_total counter
 blackwall_xdp_packets_passed_total 1000
+
+# HELP blackwall_xdp_syn_cookies_sent_total SYN-ACKs answered in-kernel with a SipHash SYN cookie
+# TYPE blackwall_xdp_syn_cookies_sent_total counter
+blackwall_xdp_syn_cookies_sent_total 9
 
 # HELP blackwall_xdp_blocked_entries Active XDP source-blocklist entries
 # TYPE blackwall_xdp_blocked_entries gauge
@@ -307,6 +326,7 @@ blackwall_xdp_ratelimit_entries 5
             passed_packets: 0.0,
             dropped_blocklist_packets: 0.0,
             dropped_ratelimit_packets: 0.0,
+            syn_cookies_sent_packets: 0.0,
             blocked_entries: 0.0,
             ratelimit_entries: 0.0,
         });
