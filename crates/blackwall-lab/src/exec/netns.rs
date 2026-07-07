@@ -132,9 +132,86 @@ pub(crate) fn netns_add(ns: &str) -> Result<(), LabError> {
 }
 
 /// `ip netns del <ns>` (idempotent: ignores absence).
+///
+/// Bounded by [`CMD_TIMEOUT`] via [`run`], so a wedged `ip netns del` can never
+/// hang teardown indefinitely (#137).
 pub(crate) fn netns_del(ns: &str) -> Result<(), LabError> {
     let _ = run(Command::new("ip").args(["netns", "del", ns]))?;
     Ok(())
+}
+
+/// Parse the PID list `ip netns pids` prints (one decimal PID per line).
+///
+/// Pure so it can be unit-tested without a namespace; non-numeric or blank
+/// lines are skipped.
+fn parse_netns_pids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// PIDs of every process still attached to `ns` (best-effort; empty on error).
+fn netns_pids(ns: &str) -> Vec<u32> {
+    match run(Command::new("ip").args(["netns", "pids", ns])) {
+        Ok(c) => parse_netns_pids(&c.stdout),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// SIGKILL every process still attached to `ns` (best-effort, bounded).
+///
+/// A scoped, final-reap belt-and-suspenders (#137): after the runner's
+/// per-child process-group and pidfile kills, anything *still* running inside
+/// this run's namespace — a daemon that re-parented out of its process group, a
+/// grandchild the group kill missed — is enumerated by `ip netns pids` and
+/// killed by PID. This is inherently scoped to THIS run: the namespace name is
+/// unique per run, so it can never touch an unrelated host process. Must run
+/// BEFORE [`netns_del`]: a process holding a socket in the namespace keeps the
+/// namespace (and its dataplane state) alive after its name is removed.
+pub(crate) fn kill_netns_procs(ns: &str) {
+    for pid in netns_pids(ns) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Blackwall's fixed host-dataplane object names (must mirror `blackwall-nft`'s
+/// `apply`/`teardown`): the nft table, the TPROXY `fwmark`, and its policy-route
+/// table.
+const HOST_NFT_TABLE: &str = "blackwall";
+const HOST_TPROXY_MARK: &str = "0x1";
+const HOST_TPROXY_TABLE: &str = "100";
+
+/// Best-effort, idempotent teardown of any Blackwall dataplane state left in the
+/// *host* network namespace (#137).
+///
+/// A scenario's engine installs its nft table / `fwmark` ip-rule / policy-route
+/// inside its own node namespace, so [`netns_del`] removes it. This is the
+/// safety net for the case that state ever lands in the host namespace, where
+/// `netns_del` cannot reach it: a leftover `inet blackwall` table (with its
+/// TPROXY policy-route) would divert or black-hole the next gate's traffic and
+/// wedge it. Only the fixed-named objects are removed; every step is a harmless
+/// no-op when they are absent, and each shell-out is bounded via [`run`].
+pub(crate) fn clear_host_dataplane() {
+    let _ = run(Command::new("nft").args(["delete", "table", "inet", HOST_NFT_TABLE]));
+    for family in [&[][..], &["-6"][..]] {
+        let _ = run(Command::new("ip").args(family).args([
+            "rule",
+            "del",
+            "fwmark",
+            HOST_TPROXY_MARK,
+            "lookup",
+            HOST_TPROXY_TABLE,
+        ]));
+        let _ = run(Command::new("ip").args(family).args([
+            "route",
+            "flush",
+            "table",
+            HOST_TPROXY_TABLE,
+        ]));
+    }
 }
 
 /// `ip netns exec <ns> <argv...>` capturing output.
@@ -236,6 +313,14 @@ mod tests {
         assert_eq!(c.stdout, "hello");
         assert_eq!(c.stderr, "oops");
         assert_eq!(c.exit, 3);
+    }
+
+    #[test]
+    fn parse_netns_pids_extracts_decimal_pids_and_skips_noise() {
+        // `ip netns pids` prints one PID per line; tolerate blank/garbage lines.
+        let out = "123\n4567\n\n  89  \nnot-a-pid\n";
+        assert_eq!(parse_netns_pids(out), vec![123, 4567, 89]);
+        assert!(parse_netns_pids("").is_empty());
     }
 
     #[test]
