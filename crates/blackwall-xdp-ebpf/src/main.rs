@@ -34,13 +34,27 @@
 //! `CLOCK_MONOTONIC`) divided down to seconds — a real, monotonic clock rather
 //! than a fixed constant. **Cross-tier requirement:** the userspace responder
 //! that validates the returning ACK must slot the cookie against the *same*
-//! clock. It currently reads `SystemTime`/UNIX; B2.3b switches it to
+//! clock. It currently reads `SystemTime`/UNIX; B2.3c switches it to
 //! `CLOCK_MONOTONIC` so both tiers agree on the 64-second time slot. Until then
 //! the two tiers do not share a time base — that switch is out of scope here.
 //!
-//! IPv6, the cross-daemon config-driven shared secret, gating on a protected-port
-//! set, the userspace monotonic-clock switch, and metrics are B2.3b; see the
-//! `// B2.3b:` markers below.
+//! # Protected-prefix + protected-port gating (B2.3b)
+//!
+//! The SYN-cookie fast path is **safety-gated**: [`try_synack_v4`] mints a
+//! SYN-ACK only when the SYN's *destination* IP LPM-matches a protected
+//! deception prefix in the userspace-populated [`PROTECT_V4`] trie **and** its
+//! *destination* TCP port is present in [`PROTECT_PORT`]. Either miss falls
+//! through to `XDP_PASS`, leaving real services on non-deception prefixes and
+//! ports untouched — critical, because once a cookie key is loaded an ungated
+//! handler would hijack every inbound TCP connection on the box. Both maps are
+//! empty until userspace installs entries
+//! (`blackwall_xdp::XdpDataplane::set_protected_prefixes` /
+//! `set_protected_ports`), so before configuration the fast path answers
+//! nothing — even with a cookie key present.
+//!
+//! IPv6 gating, the cross-daemon config-driven shared secret, the userspace
+//! monotonic-clock switch, and metrics are B2.3c; see the `// B2.3c:` markers
+//! below.
 //!
 //! # `as`-cast exemption
 //!
@@ -88,6 +102,24 @@ static STATS: PerCpuArray<Stat> = PerCpuArray::with_max_entries(REASON_COUNT, 0)
 static COOKIE_KEY: HashMap<u32, CookieKeyValue> = HashMap::with_max_entries(1, 0);
 /// Fixed map key of the sole [`COOKIE_KEY`] entry.
 const COOKIE_KEY_SLOT: u32 = 0;
+/// Protected IPv4 deception prefixes (the box's *own* addresses that run the
+/// deception tier). The SYN-cookie fast path answers a SYN only if its
+/// **destination** IP LPM-matches an entry here; a miss falls through to
+/// `XDP_PASS` so real services on non-deception prefixes are never hijacked.
+/// Mirrors [`BLOCK_V4`]'s `{prefixlen:u32, addr:[u8;4]}` LPM-key layout, but is
+/// a *destination* allowlist rather than a source blocklist. Empty until
+/// userspace installs prefixes, so an unconfigured box answers no SYNs.
+#[map]
+static PROTECT_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(65536, 1);
+/// Protected TCP **destination** ports (the configured deception ports). The
+/// SYN-cookie fast path answers a SYN only if its destination TCP port is
+/// present here. A `HashMap` used as a set (value is an ignored `1u8`); keyed
+/// by the port's host-native `u16` value — the eBPF side reads the destination
+/// port with [`load_be16`] (yielding the numeric port), and userspace inserts
+/// the same numeric `u16`, so both agree without any extra byte-swap. Empty
+/// until userspace installs ports.
+#[map]
+static PROTECT_PORT: HashMap<u16, u8> = HashMap::with_max_entries(65536, 0);
 
 // Absolute packet offsets for the Ethernet + IPv4 (IHL 5) + TCP layout the
 // SYN-cookie fast path operates on. Every access is still `ptr_at`
@@ -298,11 +330,13 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
 /// Attempt the B2.2 in-kernel SYN-cookie transform on an IPv4 packet.
 ///
 /// Returns `Ok(XDP_TX)` if the packet was an IPv4 (IHL 5) TCP SYN (ACK clear)
-/// with room in its options for a 4-byte MSS option, and was rewritten in place
-/// — same byte length — into a SipHash-cookie SYN-ACK ready to bounce back out
-/// the ingress interface. Returns `Err(())` for anything else (non-TCP, IP
-/// options present, not a SYN, no options room, or a segment larger than
-/// [`MAX_TCP_SEG`]); the caller then falls through to `XDP_PASS`.
+/// **destined for a protected deception prefix + port** (the B2.3b gate) with
+/// room in its options for a 4-byte MSS option, and was rewritten in place —
+/// same byte length — into a SipHash-cookie SYN-ACK ready to bounce back out the
+/// ingress interface. Returns `Err(())` for anything else (non-TCP, IP options
+/// present, not a SYN, destination not in [`PROTECT_V4`]/[`PROTECT_PORT`], no
+/// options room, or a segment larger than [`MAX_TCP_SEG`]); the caller then
+/// falls through to `XDP_PASS`.
 ///
 /// All bounds are validated *before* any mutation, so a bail can never leave a
 /// half-rewritten packet on the wire.
@@ -326,6 +360,26 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     if !is_syn || is_ack {
         return Err(());
     }
+
+    // B2.3b gating (SAFETY-CRITICAL): only answer a SYN destined for one of the
+    // box's own protected deception prefixes AND a configured deception port.
+    // Read the destination IP + port (both in already-bounds-checked headers)
+    // and require BOTH the O(1) port-set membership and the LPM prefix match;
+    // either miss bails to `XDP_PASS` (frame untouched) so real services on
+    // non-deception ports/prefixes pass straight through. Without this an
+    // ungated handler would mint a SYN-ACK for every inbound TCP SYN once a
+    // cookie key is loaded, hijacking the whole box.
+    let dst = [
+        load_u8(ctx, OFF_IP_DST)?,
+        load_u8(ctx, OFF_IP_DST + 1)?,
+        load_u8(ctx, OFF_IP_DST + 2)?,
+        load_u8(ctx, OFF_IP_DST + 3)?,
+    ];
+    let dst_port = load_be16(ctx, OFF_TCP_DSTPORT)?;
+    if !protected_port(dst_port) || !protected_v4(dst) {
+        return Err(());
+    }
+
     // SAFETY: same bounds-checked header.
     let doff = usize::from(unsafe { (*tcp).doff() });
     if doff < 5 {
@@ -357,14 +411,8 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
         load_u8(ctx, OFF_IP_SRC + 2)?,
         load_u8(ctx, OFF_IP_SRC + 3)?,
     ];
-    let dst = [
-        load_u8(ctx, OFF_IP_DST)?,
-        load_u8(ctx, OFF_IP_DST + 1)?,
-        load_u8(ctx, OFF_IP_DST + 2)?,
-        load_u8(ctx, OFF_IP_DST + 3)?,
-    ];
+    // `dst` and `dst_port` were already read above for the B2.3b gating.
     let src_port = load_be16(ctx, OFF_TCP_SRCPORT)?;
-    let dst_port = load_be16(ctx, OFF_TCP_DSTPORT)?;
     let client_seq = load_be32(ctx, OFF_TCP_SEQ)?;
     let client_mss = parse_mss(ctx)?;
 
@@ -517,6 +565,24 @@ fn ipv4_checksum(ctx: &XdpContext) -> Result<u16, ()> {
 fn blocked_v4(addr: [u8; 4]) -> bool {
     let key = Key::new(32, addr);
     BLOCK_V4.get(&key).is_some()
+}
+
+/// True if `dst` (a SYN's destination IPv4) LPM-matches a protected deception
+/// prefix in [`PROTECT_V4`]. Looked up with a full 32-bit key so the trie
+/// returns the longest matching configured prefix. An empty trie matches
+/// nothing, so an unconfigured box gates every SYN to `XDP_PASS`.
+fn protected_v4(dst: [u8; 4]) -> bool {
+    let key = Key::new(32, dst);
+    PROTECT_V4.get(&key).is_some()
+}
+
+/// True if `port` (a SYN's destination TCP port) is a configured deception port
+/// in [`PROTECT_PORT`]. An empty map matches nothing.
+fn protected_port(port: u16) -> bool {
+    // SAFETY: `PROTECT_PORT` is only ever read; the returned reference is dropped
+    // (converted to a bool) before any map mutation, of which this program
+    // performs none on `PROTECT_PORT`.
+    unsafe { PROTECT_PORT.get(&port) }.is_some()
 }
 
 fn blocked_v6(addr: [u8; 16]) -> bool {

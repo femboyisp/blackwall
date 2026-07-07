@@ -103,6 +103,18 @@ mod tests {
     }
 
     #[test]
+    fn protected_prefix_key_reuses_lpm_encoding() {
+        // B2.3b protected deception prefixes go through the same `lpm_key`
+        // encoding as the blocklist, so a `/24` protected prefix keys the trie
+        // with prefixlen 24 and the network's big-endian octets.
+        let LpmKey::V4(k) = lpm_key("10.0.0.0/24".parse().unwrap()) else {
+            panic!("expected v4");
+        };
+        assert_eq!(k.prefixlen, 24);
+        assert_eq!(k.addr, [10, 0, 0, 0]);
+    }
+
+    #[test]
     fn cookie_key_zero_and_max_round_trip() {
         assert_eq!(
             encode_cookie_key([0u8; 16]),

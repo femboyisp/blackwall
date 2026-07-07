@@ -79,6 +79,29 @@ fn install_cookie_key(bpf: &mut Ebpf, key: [u8; 16]) {
         .expect("insert cookie key");
 }
 
+/// Install a protected IPv4 deception prefix into `PROTECT_V4` (B2.3b gating):
+/// the SYN's destination IP must LPM-match one of these for the fast path to
+/// answer it.
+fn install_protect_prefix(bpf: &mut Ebpf, prefixlen: u32, addr: [u8; 4]) {
+    let mut map: LpmTrie<_, [u8; 4], u8> =
+        LpmTrie::try_from(bpf.map_mut("PROTECT_V4").expect("PROTECT_V4 map present"))
+            .expect("PROTECT_V4 is an LpmTrie");
+    map.insert(&Key::new(prefixlen, addr), 1, 0)
+        .expect("insert protected prefix");
+}
+
+/// Install a protected TCP destination port into `PROTECT_PORT` (B2.3b gating):
+/// the SYN's destination port must be present here for the fast path to answer
+/// it. Keyed by the host-native numeric port `u16`, matching the eBPF read.
+fn install_protect_port(bpf: &mut Ebpf, port: u16) {
+    let mut map: HashMap<_, u16, u8> = HashMap::try_from(
+        bpf.map_mut("PROTECT_PORT")
+            .expect("PROTECT_PORT map present"),
+    )
+    .expect("PROTECT_PORT is a HashMap");
+    map.insert(port, 1u8, 0).expect("insert protected port");
+}
+
 /// The `BPF_PROG_TEST_RUN` slice of `union bpf_attr`, matching the kernel layout.
 ///
 /// The trailing [`BpfProgTestRun::_pad`] is **load-bearing**: the struct's 8-byte
@@ -318,6 +341,10 @@ fn syn_is_answered_with_a_map_keyed_cookie_syn_ack_via_xdp_tx() {
     let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
     // B2.3a: deliver the cookie secret via the map (no longer a program const).
     install_cookie_key(&mut bpf, COOKIE_KEY);
+    // B2.3b: the SYN's dst (198.51.100.1:443) must match a protected prefix AND
+    // a protected port for the fast path to answer it.
+    install_protect_prefix(&mut bpf, 24, [198, 51, 100, 0]);
+    install_protect_port(&mut bpf, server_port);
     let prog: &mut Xdp = bpf
         .program_mut("xdp_filter")
         .expect("xdp_filter program present")
@@ -497,6 +524,11 @@ fn syn_without_a_cookie_key_passes_through_unchanged() {
     );
 
     let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    // Install the protected prefix + port so the SYN clears the B2.3b gate; the
+    // *only* reason it must still pass through is the deliberately-absent cookie
+    // key (B2.3a guard), isolating that guard from the gating.
+    install_protect_prefix(&mut bpf, 24, [198, 51, 100, 0]);
+    install_protect_port(&mut bpf, 443);
     // Deliberately do NOT install a cookie key.
     let prog: &mut Xdp = bpf
         .program_mut("xdp_filter")
@@ -512,4 +544,107 @@ fn syn_without_a_cookie_key_passes_through_unchanged() {
         "a SYN with no cookie key installed must pass through"
     );
     assert_eq!(out, syn, "a passed SYN must be byte-for-byte unchanged");
+}
+
+// --- B2.3b: protected-prefix + protected-port gating ---
+
+/// The protected deception prefix + port the gating tests install: a SYN's
+/// destination must match BOTH for the fast path to answer it.
+const PROTECT_PREFIX: [u8; 4] = [10, 0, 0, 0];
+/// Protected deception port used by the gating tests.
+const PROTECT_TCP_PORT: u16 = 8080;
+
+/// Load `xdp_filter` from `bpf` with a valid cookie key **and** the protected
+/// prefix `10.0.0.0/24` + port `8080` installed, returning the program fd. The
+/// caller keeps `bpf` alive so the fd (and its maps) stay valid.
+fn load_with_cookie_and_gate(bpf: &mut Ebpf) -> i32 {
+    install_cookie_key(bpf, COOKIE_KEY);
+    install_protect_prefix(bpf, 24, PROTECT_PREFIX);
+    install_protect_port(bpf, PROTECT_TCP_PORT);
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    prog.fd().expect("program fd").as_fd().as_raw_fd()
+}
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn syn_to_protected_prefix_and_port_is_answered_via_xdp_tx() {
+    // Destination 10.0.0.1:8080 matches BOTH the protected prefix and port, so
+    // (with a valid cookie key) the SYN is answered in-kernel via XDP_TX.
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+    let syn = eth_ipv4_tcp_syn(
+        [203, 0, 113, 7],
+        [10, 0, 0, 1],
+        54_321,
+        PROTECT_TCP_PORT,
+        0x1122_3344,
+        1460,
+    );
+    let action = run_xdp(prog_fd, &syn);
+    assert_eq!(
+        action, XDP_TX,
+        "a SYN to a protected prefix + port must be answered via XDP_TX"
+    );
+}
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn syn_to_protected_prefix_but_unprotected_port_passes_through_unchanged() {
+    // Destination 10.0.0.1:22 — dst IP is in the protected prefix, but port 22
+    // is NOT a protected deception port, so the gate must let it pass untouched
+    // (a real SSH service on the box must never be hijacked by the fast path).
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+    let syn = eth_ipv4_tcp_syn(
+        [203, 0, 113, 7],
+        [10, 0, 0, 1],
+        54_321,
+        22,
+        0x1122_3344,
+        1460,
+    );
+    let (action, out) = run_xdp_out(prog_fd, &syn);
+    assert_eq!(
+        action, XDP_PASS,
+        "a SYN to a protected prefix on an unprotected port must pass through"
+    );
+    assert_eq!(
+        out, syn,
+        "a gated (passed) SYN must be byte-for-byte unchanged"
+    );
+}
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn syn_to_protected_port_but_unprotected_prefix_passes_through_unchanged() {
+    // Destination 192.168.1.1:8080 — port 8080 is protected, but the dst IP is
+    // NOT in any protected prefix, so the gate must let it pass untouched (a
+    // real service on a non-deception address must never be hijacked).
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+    let syn = eth_ipv4_tcp_syn(
+        [203, 0, 113, 7],
+        [192, 168, 1, 1],
+        54_321,
+        PROTECT_TCP_PORT,
+        0x1122_3344,
+        1460,
+    );
+    let (action, out) = run_xdp_out(prog_fd, &syn);
+    assert_eq!(
+        action, XDP_PASS,
+        "a SYN to a protected port on an unprotected prefix must pass through"
+    );
+    assert_eq!(
+        out, syn,
+        "a gated (passed) SYN must be byte-for-byte unchanged"
+    );
 }
