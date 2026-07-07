@@ -1117,20 +1117,6 @@ async fn apply_xdp_request(
     }
 }
 
-/// Generate a fresh, process-local 128-bit SYN-cookie secret from the
-/// kernel's CSPRNG (`/dev/urandom`), avoiding a new `rand`/`getrandom`
-/// dependency for a single 16-byte read.
-///
-/// The key is never persisted: a restart rotates it, which invalidates any
-/// cookies in flight (acceptable — clients retransmit) exactly as described
-/// in the stateless SYN-cookie design's key-rotation note.
-fn random_cookie_key() -> std::io::Result<CookieKey> {
-    use std::io::Read;
-    let mut bytes = [0_u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(CookieKey::new(bytes))
-}
-
 /// Core dispatch logic; returns `Err` on any failure.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -1554,12 +1540,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let registry = std::sync::Arc::new(default_registry(shared.clone()));
 
-            // Stateless SYN-cookie tier wiring: a fresh per-process cookie
-            // secret, and a banner lookup that serves the same banner store
-            // the interactive tier uses, keyed by destination port. Inert
-            // until the nft classifier routes deception TCP here (C2c
-            // follow-on); built eagerly so the responder is ready when it is.
-            let cookie_key = random_cookie_key()?;
+            // Stateless SYN-cookie tier wiring: the cookie secret is shared
+            // (via Postgres) with the in-XDP fast path (`blackwalld flow`),
+            // so a cookie minted by either tier validates in the other. A
+            // banner lookup serves the same banner store the interactive
+            // tier uses, keyed by destination port. Inert until the nft
+            // classifier routes deception TCP here (C2c follow-on); built
+            // eagerly so the responder is ready when it is.
+            let secret = store.cookie_secret().await?;
+            tracing::info!("SYN-cookie secret loaded from shared store");
+            let cookie_key = CookieKey::new(secret);
             let banners_for_nfqueue = shared.clone();
             let banner_lookup: BannerLookup =
                 Box::new(move |port: u16| banners_for_nfqueue.current().banner_for(port).to_vec());
