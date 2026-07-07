@@ -86,6 +86,59 @@ pub struct CookieKeyValue {
     pub k1: u64,
 }
 
+/// Number of packet bytes snapshotted into a [`CaptureFrame`] (sub-project
+/// B4.1). A fixed cap keeps the ring record a compile-time-sized POD the eBPF
+/// side can `reserve`; 96 bytes covers Ethernet + IPv4/IPv6 + TCP/UDP headers
+/// (enough to identify a flow) while staying small. The eBPF program stores
+/// `cap_len = min(frame_len, CAP_SNAP_LEN)` actual bytes; userspace reads only
+/// the first `cap_len`.
+pub const CAP_SNAP_LEN: usize = 96;
+
+/// Fixed header the eBPF capture path writes ahead of the packet snapshot in
+/// each [`CaptureFrame`] ring record (sub-project B4.1), parsed by the
+/// userspace pcap encoder.
+///
+/// `#[repr(C)]` with the `u64` first and four `u32`s after it, so the layout is
+/// exactly 24 bytes with no interior or trailing padding — the byte contract
+/// shared between the in-kernel writer and the userspace reader. All fields are
+/// stored in host-native byte order (the eBPF program and userspace reader
+/// share the machine's endianness, exactly as [`RateBucket`]/[`CookieKeyValue`]
+/// already do).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureRecord {
+    /// `bpf_ktime_get_ns()` at the decision — nanoseconds since boot
+    /// (`CLOCK_MONOTONIC`), not wall-clock epoch time.
+    pub timestamp_ns: u64,
+    /// The `REASON_*` code of the decision that acted on this packet.
+    pub reason: u32,
+    /// The `XDP_*` verdict the program returned for this packet (the raw
+    /// `xdp_action` value: `XDP_DROP`/`XDP_PASS`/`XDP_TX`/`XDP_REDIRECT`).
+    pub verdict: u32,
+    /// Original frame length in bytes (may exceed [`CAP_SNAP_LEN`]).
+    pub pkt_len: u32,
+    /// Number of packet bytes actually snapshotted into the frame
+    /// (`min(pkt_len, CAP_SNAP_LEN)`); the reader ignores bytes past this.
+    pub cap_len: u32,
+}
+
+/// One ring-buffer record: the fixed [`CaptureRecord`] header immediately
+/// followed by a fixed [`CAP_SNAP_LEN`]-byte snapshot buffer (sub-project
+/// B4.1).
+///
+/// A compile-time-sized `#[repr(C)]` POD (24 + 96 = 120 bytes, 8-byte aligned)
+/// so the eBPF side can `RingBuf::reserve::<CaptureFrame>()` it in one shot. The
+/// snapshot buffer is fixed-length for the verifier's sake; only the header's
+/// `cap_len` bytes are meaningful, the tail is unspecified.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CaptureFrame {
+    /// The record header.
+    pub header: CaptureRecord,
+    /// Packet snapshot; only `header.cap_len` leading bytes are valid.
+    pub data: [u8; CAP_SNAP_LEN],
+}
+
 /// Build an IPv4 LPM key.
 #[must_use]
 pub fn lpm_key_v4(prefixlen: u8, addr: [u8; 4]) -> LpmKeyV4 {
@@ -128,6 +181,22 @@ mod tests {
     fn rate_bucket_and_stat_are_pod() {
         assert_eq!(core::mem::size_of::<RateBucket>(), 32);
         assert_eq!(core::mem::size_of::<Stat>(), 16);
+    }
+
+    #[test]
+    fn capture_record_layout_is_24_bytes_no_padding() {
+        // The header contract: u64 timestamp + four u32s, 8-byte aligned, no
+        // interior or trailing padding — 24 bytes exactly.
+        assert_eq!(core::mem::size_of::<CaptureRecord>(), 24);
+        assert_eq!(core::mem::align_of::<CaptureRecord>(), 8);
+    }
+
+    #[test]
+    fn capture_frame_is_header_plus_snapshot() {
+        // 24-byte header + 96-byte snapshot, 8-byte aligned (so the eBPF ring
+        // `reserve` alignment assertion `8 % align == 0` holds).
+        assert_eq!(core::mem::size_of::<CaptureFrame>(), 24 + CAP_SNAP_LEN);
+        assert_eq!(core::mem::align_of::<CaptureFrame>(), 8);
     }
 
     #[test]

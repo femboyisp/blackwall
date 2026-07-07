@@ -69,15 +69,15 @@
 #![no_main]
 
 use aya_ebpf::bindings::xdp_action;
-use aya_ebpf::helpers::bpf_ktime_get_ns;
+use aya_ebpf::helpers::{bpf_ktime_get_ns, bpf_xdp_load_bytes};
 use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, XskMap};
+use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, XskMap};
 use aya_ebpf::programs::XdpContext;
 use blackwall_cookie::make_cookie_raw;
 use blackwall_xdp_common::{
-    CookieKeyValue, RateBucket, Stat, REASON_BLOCKLIST, REASON_COUNT, REASON_PASS,
-    REASON_RATELIMIT, REASON_REDIRECT, REASON_SYNCOOKIE,
+    CaptureFrame, CaptureRecord, CookieKeyValue, RateBucket, Stat, CAP_SNAP_LEN, REASON_BLOCKLIST,
+    REASON_COUNT, REASON_PASS, REASON_RATELIMIT, REASON_REDIRECT, REASON_SYNCOOKIE,
 };
 use core::mem;
 use network_types::eth::{EthHdr, EtherType};
@@ -139,6 +139,25 @@ static XSKS: XskMap = XskMap::with_max_entries(64, 0);
 /// the actual redirect condition (e.g. per-flow / per-prefix marks).
 #[map]
 static REDIRECT_PORT: HashMap<u16, u8> = HashMap::with_max_entries(65536, 0);
+/// xdpcap-style packet-capture ring (sub-project B4.1): when capture is enabled
+/// the decision path pushes a [`CaptureFrame`] (fixed [`CaptureRecord`] header +
+/// up to [`CAP_SNAP_LEN`] snapshot bytes) here for the userspace reader
+/// ([`blackwall_xdp::XdpCapture`]) to drain and emit as pcap. 256 KiB (a
+/// power-of-2 page multiple, as the kernel requires). The daemon pins this map
+/// to bpffs so a separate `blackwalld xdp capture` process can open the same
+/// ring. When [`CAPTURE_ENABLED`] is unset the decision path never touches this
+/// ring, so an idle box pays only a single flag lookup — no ring work.
+#[map]
+static CAPTURE: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+/// Single-entry (key `0`) capture on/off flag (sub-project B4.1), mirroring
+/// [`COOKIE_KEY`]'s single-flag-map pattern: absent or `0` means capture is
+/// disabled, `1` means enabled. Userspace sets it before draining and clears it
+/// on stop/drop. A `HashMap` (not an `Array`) so *absence* is the natural
+/// disabled state. The daemon pins this map to bpffs alongside [`CAPTURE`].
+#[map]
+static CAPTURE_ENABLED: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
+/// Fixed map key of the sole [`CAPTURE_ENABLED`] entry.
+const CAPTURE_ENABLED_SLOT: u32 = 0;
 
 // Absolute packet offsets for the Ethernet + IPv4 (IHL 5) + TCP layout the
 // SYN-cookie fast path operates on. Every access is still `ptr_at`
@@ -298,6 +317,98 @@ fn count(reason: u32, bytes: u64) {
     }
 }
 
+/// True if userspace has enabled packet capture (the [`CAPTURE_ENABLED`] flag
+/// entry is present and non-zero). This is the short-circuit that keeps capture
+/// zero-cost beyond a single map lookup when disabled.
+#[inline(always)]
+fn capture_enabled() -> bool {
+    // SAFETY: `CAPTURE_ENABLED` is only ever read here; the returned reference is
+    // consumed (copied to a bool) before any map mutation, of which this program
+    // performs none on it.
+    matches!(unsafe { CAPTURE_ENABLED.get(&CAPTURE_ENABLED_SLOT) }, Some(&v) if v != 0)
+}
+
+/// Copy exactly `N` bytes from the packet at offset 0 (Ethernet L2) into `dst`
+/// with `bpf_xdp_load_bytes`, returning `true` on success.
+///
+/// `N` is a compile-time constant, so the verifier sees a nonzero, in-range
+/// length — a runtime `min(frame_len, CAP_SNAP_LEN)` is rejected as a
+/// possibly-zero-sized read. The helper bounds-checks the packet read itself and
+/// returns non-zero (→ `false`) when the frame is shorter than `N`, so the caller
+/// can fall to a smaller tier. `dst` must have room for at least `N` bytes.
+#[inline(always)]
+fn snapshot_bytes<const N: usize>(ctx: &XdpContext, dst: *mut core::ffi::c_void) -> bool {
+    // SAFETY: `dst` is the reserved ring slot's `CAP_SNAP_LEN`-byte snapshot
+    // buffer (`CAP_SNAP_LEN >= N`), and `bpf_xdp_load_bytes` bounds-checks the
+    // packet read against the frame length, returning an error for a short frame.
+    unsafe { bpf_xdp_load_bytes(ctx.ctx, 0, dst, N as u32) == 0 }
+}
+
+/// Record the decision `(reason, verdict)` for `ctx` into the [`CAPTURE`] ring
+/// when capture is enabled (sub-project B4.1). No-op — a single flag lookup and
+/// return — when disabled, so it is safe to call on every verdict.
+///
+/// Reserves one fixed [`CaptureFrame`] slot, writes the header, snapshots up to
+/// [`CAP_SNAP_LEN`] bytes of the frame from offset 0 (Ethernet L2) with the
+/// bounds-checking `bpf_xdp_load_bytes` helper, and submits it. If the ring is
+/// full (`reserve` returns `None`) or the snapshot copy fails the sample is
+/// dropped silently — capture never affects the verdict.
+#[inline(always)]
+fn capture(ctx: &XdpContext, reason: u32, verdict: u32, frame_len: u64) {
+    if !capture_enabled() {
+        return;
+    }
+    let Some(mut entry) = CAPTURE.reserve::<CaptureFrame>(0) else {
+        // Ring full: drop this sample rather than block or fail the verdict.
+        return;
+    };
+    let frame = entry.as_mut_ptr();
+    // SAFETY: `frame` is the reserved ring slot; `data` is its `CAP_SNAP_LEN`-byte
+    // snapshot buffer, valid to hand to the snapshot helper as the destination.
+    let dst = unsafe { (*frame).data.as_mut_ptr() } as *mut core::ffi::c_void;
+    // Snapshot from offset 0 (Ethernet L2) in descending fixed-size tiers. Each
+    // `snapshot_bytes` call passes a *compile-time constant* length, so the
+    // verifier sees a nonzero, in-range size (a runtime `min(frame_len,
+    // CAP_SNAP_LEN)` is rejected as a possibly-zero-sized read, and a per-byte
+    // copy loop trips the verifier's coalesced `data_end` guards — see
+    // `ipv4_checksum`). The largest tier the frame can satisfy wins; a frame too
+    // short even for the smallest tier is dropped. Short frames are truncated to
+    // the largest tier they fit (fine for header inspection).
+    let cap_len = if snapshot_bytes::<{ CAP_SNAP_LEN }>(ctx, dst) {
+        CAP_SNAP_LEN as u32
+    } else if snapshot_bytes::<64>(ctx, dst) {
+        64
+    } else if snapshot_bytes::<32>(ctx, dst) {
+        32
+    } else if snapshot_bytes::<20>(ctx, dst) {
+        20
+    } else if snapshot_bytes::<14>(ctx, dst) {
+        14
+    } else {
+        0
+    };
+    if cap_len == 0 {
+        // Frame shorter than the smallest tier: discard so the reader never sees
+        // a header-only record.
+        entry.discard(0);
+        return;
+    }
+    // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    // SAFETY: `frame` is the reserved, writable ring slot; writing the header
+    // initialises the record the reader parses.
+    unsafe {
+        (*frame).header = CaptureRecord {
+            timestamp_ns,
+            reason,
+            verdict,
+            pkt_len: frame_len as u32,
+            cap_len,
+        };
+    }
+    entry.submit(0);
+}
+
 #[xdp]
 pub fn xdp_filter(ctx: XdpContext) -> u32 {
     try_filter(&ctx).unwrap_or(xdp_action::XDP_PASS)
@@ -315,12 +426,14 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
             let src = unsafe { (*ip).src_addr() }.octets();
             if blocked_v4(src) {
                 count(REASON_BLOCKLIST, frame_len);
+                capture(ctx, REASON_BLOCKLIST, xdp_action::XDP_DROP, frame_len);
                 return Ok(xdp_action::XDP_DROP);
             }
             let mut key16 = [0u8; 16];
             key16[..4].copy_from_slice(&src);
             if over_rate(key16) {
                 count(REASON_RATELIMIT, frame_len);
+                capture(ctx, REASON_RATELIMIT, xdp_action::XDP_DROP, frame_len);
                 return Ok(xdp_action::XDP_DROP);
             }
             // B3.1: divert IPv4 UDP datagrams whose destination port is in the
@@ -329,6 +442,7 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
             // falls through to the SYN-cookie/PASS behavior below.
             if let Ok(action) = try_redirect_udp_v4(ctx) {
                 count(REASON_REDIRECT, frame_len);
+                capture(ctx, REASON_REDIRECT, action, frame_len);
                 return Ok(action);
             }
             // Absorb a TCP SYN in-kernel with a SipHash-cookie SYN-ACK
@@ -336,6 +450,9 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
             // bails out of this fast path and falls through to `XDP_PASS`.
             if let Ok(action) = try_synack_v4(ctx) {
                 count(REASON_SYNCOOKIE, frame_len);
+                // Snapshot before the in-place SYN->SYN-ACK rewrite has left the
+                // reply on the wire; the frame now holds the rewritten SYN-ACK.
+                capture(ctx, REASON_SYNCOOKIE, action, frame_len);
                 return Ok(action);
             }
         }
@@ -345,16 +462,19 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
             let src = unsafe { (*ip).src_addr() }.octets();
             if blocked_v6(src) {
                 count(REASON_BLOCKLIST, frame_len);
+                capture(ctx, REASON_BLOCKLIST, xdp_action::XDP_DROP, frame_len);
                 return Ok(xdp_action::XDP_DROP);
             }
             if over_rate(src) {
                 count(REASON_RATELIMIT, frame_len);
+                capture(ctx, REASON_RATELIMIT, xdp_action::XDP_DROP, frame_len);
                 return Ok(xdp_action::XDP_DROP);
             }
         }
         _ => {}
     }
     count(REASON_PASS, frame_len);
+    capture(ctx, REASON_PASS, xdp_action::XDP_PASS, frame_len);
     Ok(xdp_action::XDP_PASS)
 }
 
