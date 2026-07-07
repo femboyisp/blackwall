@@ -161,11 +161,15 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/trafficgen-foundation.kdl lab-junit-trafficgen.xml
       - name: Run the lab gate (flow-live)
-        # RE-ENABLED (#137): the hsflowd-teardown wedge that starved the job is
-        # fixed — hsflowd's stdio is redirected off the step's pipe (#88) and the
-        # runner now scoped-reaps every process still attached to the run's
-        # namespaces at teardown, plus a pre-gate `lab down` sweep below clears
-        # any residue a prior gate left.
+        # STILL DISABLED (#88): re-enabling it under #137 showed it STILL wedges
+        # in CI (~25min on a 6min step) — a DIFFERENT mechanism from the #137
+        # cross-gate orphan residue (which is fixed): flow-live's hsflowd holds
+        # the CI step's stdout pipe open in-step past GitHub's timeout, so the
+        # step never finalizes. Passes locally (no wedge). Needs a dedicated #88
+        # fix (ensure hsflowd cannot inherit/hold the runner pipe). The other
+        # three #137 gates below (deception-resilience, flowspec, flowspec-auto)
+        # ARE re-enabled — their wedge was the cross-gate orphan residue #137 fixes.
+        if: false
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
