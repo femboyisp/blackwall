@@ -74,6 +74,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/bgp-bird.kdl lab-junit.xml
@@ -82,6 +87,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/bgp-bird-md5.kdl lab-junit-bgp-md5.xml
@@ -90,6 +100,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/dns-knot.kdl lab-junit-dns.xml
@@ -98,6 +113,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/shaper-cake.kdl lab-junit-shaper.xml
@@ -106,6 +126,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flow-sflow.kdl lab-junit-flow.xml
@@ -114,6 +139,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/deception-nft.kdl lab-junit-deception.xml
@@ -122,39 +152,47 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/trafficgen-foundation.kdl lab-junit-trafficgen.xml
       - name: Run the lab gate (flow-live)
-        # DISABLED in CI (blackwall#88): this live-sFlow gate wedges HARD — its
-        # `hsflowd` daemon inherits the step's redirected stdout and keeps the
-        # step alive past even GitHub's `timeout-minutes` kill, so it hung the
-        # whole lab job (cancelled at the job cap) on consecutive main runs,
-        # starving every gate after it. `continue-on-error` can't help a step
-        # that never terminates. Skipped here until the daemon-teardown hang is
-        # fixed; the scenario still runs locally/manually (`lab test
-        # crates/blackwall-lab/scenarios/flow-sflow-live.kdl`). Re-enable in #88.
-        if: false
+        # RE-ENABLED (#137): the hsflowd-teardown wedge that starved the job is
+        # fixed — hsflowd's stdio is redirected off the step's pipe (#88) and the
+        # runner now scoped-reaps every process still attached to the run's
+        # namespaces at teardown, plus a pre-gate `lab down` sweep below clears
+        # any residue a prior gate left.
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flow-sflow-live.kdl lab-junit-flow-live.xml
       - name: Run the lab gate (deception-resilience)
-        # DISABLED in CI pending investigation (#136): after switching the
-        # scenario off in-netns `cargo run` to the pre-built trafficgen binary,
-        # this gate still hangs at the connect-flood step (600 concurrent conns
-        # under a background wire flood) — it does not terminate within the
-        # gate timeout locally either. Separate from the cargo-run hang and
-        # from #88. Skipped so it can't starve the rest of the suite; the
-        # single-connection `deception` gate above still exercises the engine.
-        if: false
+        # RE-ENABLED (#137): the connect-flood hang is bounded by its deadline
+        # (#136), and the residue this gate's teardown used to leave — which
+        # wedged the gate that ran after it — is now reaped (scoped per-namespace
+        # process kill + host-dataplane sweep at teardown, plus the pre-gate
+        # `lab down` below).
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/deception-resilience.kdl lab-junit-deception-resilience.xml
@@ -163,6 +201,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/deception-syncookie.kdl lab-junit-syncookie.xml
@@ -171,6 +214,11 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/deception-syncookie-v6.kdl lab-junit-syncookie-v6.xml
@@ -179,30 +227,41 @@ jobs:
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/rtbh-bird.kdl lab-junit-rtbh.xml
       - name: Run the lab gate (flowspec)
-        # DISABLED pending the systemic lab-gate-wedge fix (#137): this gate
-        # hangs (BIRD orphaned when the scenario's lab test is killed), holding
-        # the CI step past its timeout. Latent until now because flow-live
-        # wedged earlier and cancelled the job first. Re-enable via #137.
-        if: false
+        # RE-ENABLED (#137): the orphaned-BIRD wedge is fixed — teardown reaps
+        # BIRD by pidfile AND scoped-reaps anything still attached to the run's
+        # namespaces, and the pre-gate `lab down` below clears prior residue.
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-bird.kdl lab-junit-flowspec.xml
       - name: Run the lab gate (flowspec-auto)
-        # DISABLED pending the systemic lab-gate-wedge fix (#137), same cause
-        # as the flowspec gate above. Re-enable via #137.
-        if: false
+        # RE-ENABLED (#137): same fix as the flowspec gate above.
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
           exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Pre-gate sweep (#137): clear any residue a prior gate's teardown
+          # missed (stale bw-* namespaces, processes still attached to them, a
+          # leftover host `inet blackwall` nft table / TPROXY policy-route) so it
+          # can never wedge this gate. Idempotent no-op on a clean box.
+          sudo ./target/debug/lab down || true
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-auto-bird.kdl lab-junit-flowspec-auto.xml
