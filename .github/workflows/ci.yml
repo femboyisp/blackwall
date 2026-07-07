@@ -225,6 +225,26 @@ jobs:
           # AF_XDP socket on it; run in parallel they race over shared net state
           # and flake. Serial execution is deterministic.
           sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture --test-threads=1
+      - name: Run the lab gate (xdp ddos-drop)
+        # B4.2: DDoS-lab gate. Floods the real xdp_filter over a veth pair and
+        # asserts the two source-keyed mitigations engage under live kernel
+        # traffic: a blocklisted source's flood is DROPped (a clean source
+        # passes), and a rate-limited source under sustained load admits a burst
+        # then drops the excess. The token bucket is time/rate-dependent and
+        # cannot be tested by BPF_PROG_TEST_RUN (single-shot). Requires
+        # CAP_NET_ADMIN/RAW.
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          # Build the test binary as the normal user (needs nightly+bpf-linker for the eBPF build.rs).
+          BIN=$(cargo test -p blackwall-xdp --test ddos_drop --no-run --message-format=json \
+            | grep -o '"executable":"[^"]*ddos_drop[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
+          echo "test binary: $BIN"
+          # --test-threads=1: each test sets up a veth pair and floods it; run in
+          # parallel they race over shared net state and flake. Serial is
+          # deterministic (mirrors the AF_XDP gate above).
+          sudo timeout --kill-after=15s 120s "$BIN" --ignored --nocapture --test-threads=1
       - name: Run the lab gate (xdp prog-test-run)
         timeout-minutes: 6
         run: |
