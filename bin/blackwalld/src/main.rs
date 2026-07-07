@@ -206,6 +206,34 @@ enum XdpCmd {
     /// daemon's Prometheus `/metrics` endpoint, not here — the CLI has no handle
     /// to the attached maps.
     Stats,
+    /// Capture the packets the XDP program acted on, writing a pcap stream.
+    ///
+    /// Opens the running `flow` daemon's pinned capture ring (`CAPTURE`),
+    /// switches capture on, drains up to `--count` records (or for `--duration`
+    /// seconds, default 10 s), and writes them as a classic-format pcap to
+    /// `--out` (or stdout). Each packet carries the up-to-96-byte L2 snapshot the
+    /// program saw; the verdict/reason are recorded in the daemon's `/metrics`
+    /// totals. Capture is switched back off automatically on exit.
+    ///
+    /// Requires a `blackwalld flow` daemon with XDP attached (it pins the ring);
+    /// run this as root so it can open the pinned bpffs maps. Link-type is
+    /// Ethernet, so the output opens directly in `tcpdump -r`/`wireshark`.
+    Capture {
+        /// Stop after capturing this many packets (mutually exclusive with
+        /// `--duration`).
+        #[arg(long, conflicts_with = "duration")]
+        count: Option<usize>,
+        /// Capture for this many seconds (mutually exclusive with `--count`;
+        /// defaults to 10 s when neither is given).
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Write the pcap here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// bpffs directory the daemon pinned the capture maps under.
+        #[arg(long, default_value = blackwall_xdp::DEFAULT_CAPTURE_PIN_DIR)]
+        pin_dir: PathBuf,
+    },
 }
 
 /// Operator actions for the `rtbh` subcommand.
@@ -2232,6 +2260,12 @@ async fn run_xdp(action: XdpCmd) -> Result<(), Box<dyn std::error::Error>> {
         XdpCmd::ClearRate { ip } => xdp_clear_rate(ip).await,
         XdpCmd::List => xdp_list().await,
         XdpCmd::Stats => xdp_stats().await,
+        XdpCmd::Capture {
+            count,
+            duration,
+            out,
+            pin_dir,
+        } => xdp_capture(count, duration, out, &pin_dir).await,
     }
 }
 
@@ -2398,5 +2432,68 @@ async fn xdp_stats() -> Result<(), Box<dyn std::error::Error>> {
         "(live per-CPU packet counters — dropped/passed — are exported by the \
          running daemon's /metrics endpoint)"
     );
+    Ok(())
+}
+
+/// `xdp capture`: open the running daemon's pinned capture ring, drain up to
+/// `count` records (or for `duration` seconds, default 10 s), and write them as
+/// pcap to `out` (or stdout). Capture is switched on when the ring is opened and
+/// off again when the [`blackwall_xdp::XdpCapture`] handle drops on return.
+///
+/// The ring is drained in a poll loop (the ring read is non-blocking); records
+/// that parse are collected until the count or duration limit is reached, then
+/// serialised with the pure [`blackwall_xdp::to_pcap`] encoder.
+async fn xdp_capture(
+    count: Option<usize>,
+    duration: Option<u64>,
+    out: Option<PathBuf>,
+    pin_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    use std::time::{Duration, Instant};
+
+    // Default to a 10 s capture window when neither bound is given.
+    let deadline = match (count, duration) {
+        (Some(_), _) => None,
+        (None, Some(secs)) => Some(Instant::now() + Duration::from_secs(secs)),
+        (None, None) => Some(Instant::now() + Duration::from_secs(10)),
+    };
+
+    let mut capture = blackwall_xdp::XdpCapture::open(pin_dir).map_err(|e| {
+        format!(
+            "opening capture ring under {}: {e} (is a `blackwalld flow` daemon with XDP running?)",
+            pin_dir.display()
+        )
+    })?;
+
+    let mut packets: Vec<blackwall_xdp::CapturedPacket> = Vec::new();
+    loop {
+        capture.drain(&mut packets);
+        if let Some(n) = count {
+            if packets.len() >= n {
+                packets.truncate(n);
+                break;
+            }
+        }
+        if let Some(when) = deadline {
+            if Instant::now() >= when {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let pcap = blackwall_xdp::to_pcap(&packets);
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &pcap)?;
+            eprintln!("captured {} packets -> {}", packets.len(), path.display());
+        }
+        None => {
+            std::io::stdout().write_all(&pcap)?;
+            std::io::stdout().flush()?;
+            eprintln!("captured {} packets (pcap on stdout)", packets.len());
+        }
+    }
     Ok(())
 }
