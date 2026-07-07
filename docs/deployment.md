@@ -83,9 +83,12 @@ Then follow the two runbooks for the hands-on first-run procedure:
 ## Observe
 Set `metrics listen=127.0.0.1:9100` in the config and scrape `GET /metrics`:
 - `flow`: BGP session state + reconnects, sFlow datagrams/decode-errors, active
-  RTBH/FlowSpec counts, pending queue depths, detection/session/audit totals.
+  RTBH/FlowSpec counts, pending queue depths, detection/session/audit totals,
+  and (with `cookie-ports=` set) `blackwall_xdp_syn_cookies_sent_total`.
 - `run`: `blackwall_deception_sessions_active` (live in-flight) + session/audit
-  totals.
+  totals, and (with `stateless-tcp ports=` set) `blackwall_stateless_syn_cookies_sent_total`,
+  `blackwall_stateless_acks_validated_total`, `blackwall_stateless_acks_rejected_total`,
+  and `blackwall_stateless_udp_responses_total`.
 Also: Postgres tables (`detections`, `rtbh_blackholes`, `flowspec_rules`, the
 `*_requests` intent logs) and `birdc`/your router.
 
@@ -125,14 +128,60 @@ xdp interface=eth0 mode=auto default-rate-limit=1000
   and falls back to generic (skb) mode with a warning, so it works on veth/less
   capable NICs too. Attach is **non-fatal** — if XDP can't load, the daemon logs
   a warning and continues on the nft slow path.
+- **Cookie fast path:** add `cookie-ports=` to the same `xdp` directive (see
+  below) to also answer SYNs in-kernel, ahead of the drop/rate-limit path.
 - **Metrics:** `blackwall_xdp_packets_dropped_total{reason}`, `_passed_total`,
   `_blocked_entries`, `_ratelimit_entries` on `/metrics`.
 
+## Stateless SYN-cookie tier (optional)
+Two independent, interoperating opt-ins turn on stateless deception: a
+userspace responder on the deception (`run`) side and an in-kernel fast path
+on the `flow` side. Both use the same keyed **SipHash-2-4** cookie construction
+and **the same secret**, shared via Postgres (get-or-create in a singleton
+`cookie_secret` row) — so a connection that gets its cookie SYN-ACK from the
+in-XDP fast path still validates when its ACK reaches the userspace responder.
+**Both daemons must point at the same Postgres DB** (they already do per the
+install steps above) for this to work.
+
+- **Userspace stateless TCP responder** — add `stateless-tcp ports=…` to the
+  deception (`run`) config to route those ports to the NFQUEUE stateless
+  responder instead of the interactive TPROXY tier:
+  ```
+  stateless-tcp ports=22,80,443
+  ```
+  A SYN to one of these ports gets a keyed SYN-ACK cookie carrying no
+  connection state; a client that completes the handshake gets the port's
+  banner (PSH|ACK|FIN) and the connection closes immediately — a spoofed-source
+  SYN flood against these ports creates no state on the box. Dual-stack (IPv4 +
+  IPv6, v6 replies go via a raw socket + `IPV6_PKTINFO`). Deception UDP on
+  these paths is answered by a reflection-safe responder whose reply is never
+  longer than the request (amplification factor ≤ 1 — it can't be used as a
+  UDP reflector).
+- **In-XDP SYN-cookie fast path** — add `cookie-ports=` to the `xdp` directive
+  in the `flow` config:
+  ```
+  xdp interface=eth0 mode=auto default-rate-limit=1000 cookie-ports=8080,443
+  ```
+  A SYN to a configured cookie-port is answered **in-kernel** via `XDP_TX`,
+  driver-level and ahead of nftables — the flood never reaches userspace. It's
+  gated fail-closed: only SYNs to the box's own deception prefixes *and* a
+  configured cookie-port are answered; everything else (including real
+  services) passes through untouched. A legitimate client's follow-up ACK falls
+  through (`XDP_PASS`) to the userspace stateless responder above, which
+  validates the byte-identical cookie and serves the banner.
+- **Metrics:** `blackwall_stateless_syn_cookies_sent_total`,
+  `blackwall_stateless_acks_validated_total`,
+  `blackwall_stateless_acks_rejected_total`, and
+  `blackwall_stateless_udp_responses_total` on the `run` daemon's `/metrics`;
+  `blackwall_xdp_syn_cookies_sent_total` on the `flow` daemon's `/metrics`.
+
 ## Not yet implemented (know before you rely on it)
-- **No SYN-cookie / AF_XDP acceleration yet.** B1 ships XDP source-drop +
-  rate-limit; in-XDP SYN cookies and a zero-copy AF_XDP userspace path are
-  B2–B3 (sub-project B). The nftables flowtable (`flowtable devices=…`) offloads
-  established forwarded real-service flows, but there is no kernel-bypass offload
-  for the deception/inspection path yet. Fine for moderate rates and on-box
-  source-drop; line-rate volumetric attack traffic is still best pushed to your
-  router via BGP mitigation.
+- **No AF_XDP zero-copy path yet.** B1 (XDP source-drop + rate-limit) and B2
+  (stateless SYN cookies, both the userspace tier and the in-XDP fast path
+  above) are shipped; a zero-copy AF_XDP userspace path (B3) and xdpcap
+  observability + a DDoS-lab XDP gate (B4) are the remaining sub-project B
+  work. The nftables flowtable (`flowtable devices=…`) offloads established
+  forwarded real-service flows, but there is no kernel-bypass offload for the
+  deception/inspection path yet. Fine for moderate rates and on-box
+  source-drop/SYN-cookie absorption; line-rate volumetric attack traffic is
+  still best pushed to your router via BGP mitigation.
