@@ -143,14 +143,12 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flow-sflow-live.kdl lab-junit-flow-live.xml
       - name: Run the lab gate (deception-resilience)
-        # DISABLED in CI pending investigation (#136): after switching the
-        # scenario off in-netns `cargo run` to the pre-built trafficgen binary,
-        # this gate still hangs at the connect-flood step (600 concurrent conns
-        # under a background wire flood) — it does not terminate within the
-        # gate timeout locally either. Separate from the cargo-run hang and
-        # from #88. Skipped so it can't starve the rest of the suite; the
-        # single-connection `deception` gate above still exercises the engine.
-        if: false
+        # Re-enabled (#136): the connect-flood step is now bounded by its
+        # deadline (bounded connect/read + a select! race), so it always
+        # terminates and can no longer wedge the job — worst case it fails
+        # cleanly. Couldn't be verified locally (this dev box's kernel has
+        # non-functional TPROXY divert); CI runners have working tproxy (the
+        # deception gates pass here), so CI is the verification.
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
