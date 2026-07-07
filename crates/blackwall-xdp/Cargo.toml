@@ -20,6 +20,10 @@ aya = "0.13.1"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 libc = { workspace = true }
+# The BPF_PROG_TEST_RUN gate cross-checks the in-kernel SYN-cookie against the
+# shared no_std core (B2.2): the eBPF program and this test compute the cookie
+# from the identical code, so an in-kernel == userspace mismatch fails the test.
+blackwall-cookie = { path = "../blackwall-cookie" }
 
 [lints]
 workspace = true

@@ -14,8 +14,11 @@ pub const REASON_PASS: u32 = 0;
 pub const REASON_BLOCKLIST: u32 = 1;
 /// Dropped by the per-source rate limiter.
 pub const REASON_RATELIMIT: u32 = 2;
+/// Answered in-kernel with a SipHash-cookie SYN-ACK bounced out via `XDP_TX`
+/// (sub-project B2.2). Counts SYNs absorbed at the driver level ahead of nft.
+pub const REASON_SYNCOOKIE: u32 = 3;
 /// Number of reason codes (stats array length).
-pub const REASON_COUNT: u32 = 3;
+pub const REASON_COUNT: u32 = 4;
 
 /// LPM-trie key for the IPv4 source blocklist (`bpf_lpm_trie_key` layout).
 #[repr(C)]
