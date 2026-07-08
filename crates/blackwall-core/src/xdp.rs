@@ -42,4 +42,12 @@ pub struct XdpConfig {
     /// eBPF redirect handler passes every UDP datagram through to the kernel
     /// stack (B3.1 fail-closed behavior).
     pub afxdp_udp_ports: Vec<u16>,
+    /// Banner bytes the AF_XDP UDP responder reflects to `afxdp_udp_ports`
+    /// (`afxdp-udp-banner=` directive), decoded from the config string with
+    /// `\n`/`\r`/`\t`/`\s`/`\\` escapes (config is whitespace-tokenized, so a
+    /// space must be written `\s` — e.g. `220\sready\r\n`). `None` (the
+    /// default) uses the built-in placeholder. The reflection-safe builder
+    /// still truncates the banner to at most the request's payload length, so
+    /// this can never amplify.
+    pub afxdp_udp_banner: Option<String>,
 }
