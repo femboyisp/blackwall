@@ -25,6 +25,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
+      # Cache the cargo registry, target dir, and ~/.cargo/bin (so the pinned
+      # bpf-linker install below is a warm-cache hit instead of a from-source
+      # rebuild). Placed before the install/build steps so it restores first.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: check
       - name: Install pinned nightly (blackwall-xdp-ebpf build.rs)
         run: rustup toolchain install nightly-2026-06-29 --component rust-src --profile minimal
       - name: Install bpf-linker
@@ -55,6 +61,13 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      # Cache cargo registry, target dir, and ~/.cargo/bin (warms the pinned
+      # bpf-linker install + the lab/interop/eBPF crate build — the dominant
+      # cost in this job's cold ~18min build). Separate key from the `check`
+      # job so the two caches don't clobber each other.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: lab
       - name: Install pinned nightly (blackwall-xdp-ebpf build.rs)
         run: rustup toolchain install nightly-2026-06-29 --component rust-src --profile minimal
       - name: Install bpf-linker
