@@ -563,6 +563,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     default_rate_limit_pps: None,
                     cookie_ports: Vec::new(),
                     afxdp_udp_ports: Vec::new(),
+                    afxdp_udp_banner: None,
                 };
                 for tok in &line.words[1..] {
                     let (k, v) = tok
@@ -610,6 +611,9 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                                 }
                                 cfg.afxdp_udp_ports.push(n);
                             }
+                        }
+                        "afxdp-udp-banner" => {
+                            cfg.afxdp_udp_banner = Some(decode_banner_escapes(v));
                         }
                         other => return Err(bad("xdp key", other)),
                     }
@@ -684,6 +688,35 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         xdp,
         stateless_tcp_ports,
     })
+}
+
+/// Decode a one-line config banner value, expanding the escapes `\n`, `\r`,
+/// `\t`, `\s` (space), and `\\`. Config lines are whitespace-tokenized, so a
+/// banner containing spaces must use `\s` (e.g. `220\sSMTP\sready\r\n`
+/// decodes to `220 SMTP ready\r\n`). An unrecognized escape is left verbatim
+/// (both characters kept), and a trailing lone backslash is kept as-is.
+fn decode_banner_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('s') => out.push(' '),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn parse_tenant(lines: &[Line], start: usize) -> Result<(Tenant, usize), ConfigError> {
@@ -1694,6 +1727,31 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
             parse_text("interface wan eth0\nxdp interface=eth0 afxdp-udp-ports=53,123\n").unwrap();
         let x = p.xdp.expect("xdp set");
         assert_eq!(x.afxdp_udp_ports, vec![53, 123]);
+    }
+
+    #[test]
+    fn parses_xdp_afxdp_udp_banner() {
+        let p = parse_text(
+            "interface wan eth0\nxdp interface=eth0 afxdp-udp-ports=53 afxdp-udp-banner=220\\sready\\r\\n\n",
+        )
+        .unwrap();
+        let x = p.xdp.expect("xdp set");
+        assert_eq!(x.afxdp_udp_banner.as_deref(), Some("220 ready\r\n"));
+    }
+
+    #[test]
+    fn xdp_afxdp_udp_banner_absent_is_none() {
+        let p = parse_text("interface wan eth0\nxdp afxdp-udp-ports=53\n").unwrap();
+        assert_eq!(p.xdp.expect("xdp set").afxdp_udp_banner, None);
+    }
+
+    #[test]
+    fn decode_banner_escapes_expands_known_and_preserves_unknown() {
+        assert_eq!(decode_banner_escapes("a\\sb\\r\\n\\t\\\\c"), "a b\r\n\t\\c");
+        // Unknown escape kept verbatim; trailing lone backslash kept.
+        assert_eq!(decode_banner_escapes("x\\qy\\"), "x\\qy\\");
+        // No escapes: identity.
+        assert_eq!(decode_banner_escapes("plain"), "plain");
     }
 
     #[test]

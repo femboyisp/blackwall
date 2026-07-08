@@ -1094,6 +1094,7 @@ fn afxdp_udp_responder_loop(
     iface: &str,
     dataplane: &Arc<blackwall_xdp::XdpDataplane>,
     ports: &[u16],
+    banner: &[u8],
     responses: &std::sync::atomic::AtomicU64,
     stop: &std::sync::atomic::AtomicBool,
 ) {
@@ -1134,8 +1135,7 @@ fn afxdp_udp_responder_loop(
                 // Reflection-safe reply (IPv4 UDP only). `None` = not IPv4 UDP,
                 // or the reflection guard declined (empty request payload) —
                 // drop silently.
-                if let Some(reply) =
-                    blackwall_deception::transport::udp_l2_response(&frame, AFXDP_UDP_BANNER)
+                if let Some(reply) = blackwall_deception::transport::udp_l2_response(&frame, banner)
                 {
                     match sock.send(&reply) {
                         Ok(()) => {
@@ -1523,11 +1523,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let ports_t = xdp_cfg.afxdp_udp_ports.clone();
                             let counter_t = counter.clone();
                             let stop_t = stop.clone();
+                            // Operator-configured banner (`afxdp-udp-banner=`),
+                            // falling back to the built-in placeholder. Owned so
+                            // the responder thread can outlive `xdp_cfg`.
+                            let banner_t: Vec<u8> =
+                                xdp_cfg.afxdp_udp_banner.as_deref().map_or_else(
+                                    || AFXDP_UDP_BANNER.to_vec(),
+                                    |s| s.as_bytes().to_vec(),
+                                );
                             match std::thread::Builder::new()
                                 .name("afxdp-udp-responder".to_owned())
                                 .spawn(move || {
                                     afxdp_udp_responder_loop(
-                                        &iface_t, &dp, &ports_t, &counter_t, &stop_t,
+                                        &iface_t, &dp, &ports_t, &banner_t, &counter_t, &stop_t,
                                     );
                                 }) {
                                 Ok(handle) => {
