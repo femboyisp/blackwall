@@ -65,6 +65,11 @@ struct DataplaneMaps {
     /// key); the SYN-cookie fast path answers a SYN only if its destination IP
     /// LPM-matches an entry here (B2.3b gating).
     protect_v4: LpmTrie<MapData, [u8; 4], u8>,
+    /// Protected IPv6 deception prefixes (`{prefixlen:u32, addr:[u8;16]}` LPM
+    /// key); the SYN-cookie fast path answers an IPv6 SYN only if its destination
+    /// IP LPM-matches an entry here (B2.3c gating). The IPv6 counterpart of
+    /// [`DataplaneMaps::protect_v4`].
+    protect_v6: LpmTrie<MapData, [u8; 16], u8>,
     /// Protected TCP destination (deception) ports, keyed by the host-native
     /// `u16` port value; the fast path answers a SYN only if its destination
     /// port is present here (B2.3b gating).
@@ -235,6 +240,7 @@ impl XdpDataplane {
             stats: take_map(&mut ebpf, "STATS")?,
             cookie_key: take_map(&mut ebpf, "COOKIE_KEY")?,
             protect_v4: take_map(&mut ebpf, "PROTECT_V4")?,
+            protect_v6: take_map(&mut ebpf, "PROTECT_V6")?,
             protect_port: take_map(&mut ebpf, "PROTECT_PORT")?,
             xsks: take_map(&mut ebpf, "XSKS")?,
             redirect_port: take_map(&mut ebpf, "REDIRECT_PORT")?,
@@ -310,16 +316,15 @@ impl XdpDataplane {
         self.locked()?.set_cookie_key(key)
     }
 
-    /// Install the box's own protected deception prefixes into `PROTECT_V4`.
+    /// Install the box's own protected deception prefixes into `PROTECT_V4`
+    /// (IPv4) and `PROTECT_V6` (IPv6), routing each prefix to the map for its
+    /// family.
     ///
     /// The in-kernel SYN-cookie fast path answers a SYN only if its destination
     /// IP LPM-matches one of these prefixes (and its destination port is a
     /// protected port). Until at least one prefix is installed the fast path
     /// answers no SYNs at all, so real services are never hijacked. Entries are
     /// additive; existing entries are retained.
-    ///
-    /// IPv6 prefixes are ignored here — v6 SYN-cookie gating is B2.3c (the
-    /// in-kernel fast path is IPv4-only today).
     ///
     /// # Errors
     ///
@@ -496,9 +501,9 @@ impl DataplaneMaps {
             .map_err(map_err)
     }
 
-    /// Insert each IPv4 prefix into the `PROTECT_V4` trie (v6 prefixes ignored;
-    /// v6 gating is B2.3c). Reuses the shared `lpm_key` encoding so the key
-    /// layout is byte-identical to the blocklist trie.
+    /// Insert each prefix into the `PROTECT_V4` (IPv4) or `PROTECT_V6` (IPv6)
+    /// trie by family. Reuses the shared `lpm_key` encoding so each key layout is
+    /// byte-identical to the corresponding blocklist trie.
     fn set_protected_prefixes(&mut self, prefixes: &[IpNet]) -> Result<(), XdpError> {
         for &net in prefixes {
             match lpm_key(net) {
@@ -506,8 +511,10 @@ impl DataplaneMaps {
                     .protect_v4
                     .insert(&Key::new(k.prefixlen, k.addr), 1, 0)
                     .map_err(map_err)?,
-                // B2.3c: IPv6 deception-prefix gating (the fast path is v4-only).
-                LpmKey::V6(_) => {}
+                LpmKey::V6(k) => self
+                    .protect_v6
+                    .insert(&Key::new(k.prefixlen, k.addr), 1, 0)
+                    .map_err(map_err)?,
             }
         }
         Ok(())

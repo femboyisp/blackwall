@@ -117,6 +117,17 @@ fn install_protect_prefix(bpf: &mut Ebpf, prefixlen: u32, addr: [u8; 4]) {
         .expect("insert protected prefix");
 }
 
+/// Install a protected IPv6 deception prefix into `PROTECT_V6` (B2.3c gating):
+/// the IPv6 SYN's destination address must LPM-match one of these for the fast
+/// path to answer it.
+fn install_protect_prefix_v6(bpf: &mut Ebpf, prefixlen: u32, addr: [u8; 16]) {
+    let mut map: LpmTrie<_, [u8; 16], u8> =
+        LpmTrie::try_from(bpf.map_mut("PROTECT_V6").expect("PROTECT_V6 map present"))
+            .expect("PROTECT_V6 is an LpmTrie");
+    map.insert(&Key::new(prefixlen, addr), 1, 0)
+        .expect("insert protected v6 prefix");
+}
+
 /// Install a UDP destination port into `REDIRECT_PORT` (B3.1): an IPv4 UDP
 /// datagram to this port is redirected to the `AF_XDP` socket in `XSKS`.
 fn install_redirect_port(bpf: &mut Ebpf, port: u16) {
@@ -274,6 +285,10 @@ const SERVER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 const IP: usize = 14;
 const TCP: usize = 34;
 
+/// Byte offsets into an `Ethernet + IPv6(40) + TCP` frame (mirrors the eBPF).
+const IP6: usize = 14;
+const TCP6: usize = 54;
+
 /// Build an `Ethernet + IPv4 + TCP SYN` frame carrying a single 4-byte MSS
 /// option (TCP data-offset 6). Input header checksums are left zero: the eBPF
 /// program never validates them, it only *recomputes* the reply's checksums.
@@ -310,6 +325,47 @@ fn eth_ipv4_tcp_syn(
     p[TCP + 20] = 2;
     p[TCP + 21] = 4;
     p[TCP + 22..TCP + 24].copy_from_slice(&mss.to_be_bytes());
+    p
+}
+
+/// Build an `Ethernet + IPv6 + TCP SYN` frame carrying a single 4-byte MSS
+/// option (TCP data-offset 6). The IPv6 fixed header is 40 bytes, next-header
+/// TCP, payload length = the 24-byte TCP segment. No L3 checksum exists in IPv6;
+/// the eBPF program only recomputes the reply's TCP checksum.
+fn eth_ipv6_tcp_syn(
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    mss: u16,
+) -> Vec<u8> {
+    let mut p = vec![0u8; 14 + 40 + 24];
+    // Ethernet: dst = server, src = client, EtherType IPv6 (0x86DD).
+    p[0..6].copy_from_slice(&SERVER_MAC);
+    p[6..12].copy_from_slice(&CLIENT_MAC);
+    p[12] = 0x86;
+    p[13] = 0xDD;
+    // IPv6 header: version 6 in the high nibble of the first byte.
+    p[IP6] = 0x60;
+    // Payload length = the TCP segment length (header + options, no data).
+    let payload_len = u16::try_from(24).expect("payload_len fits in u16");
+    p[IP6 + 4..IP6 + 6].copy_from_slice(&payload_len.to_be_bytes());
+    p[IP6 + 6] = 6; // next header = TCP
+    p[IP6 + 7] = 64; // hop limit
+    p[IP6 + 8..IP6 + 24].copy_from_slice(&src_ip);
+    p[IP6 + 24..IP6 + 40].copy_from_slice(&dst_ip);
+    // TCP header.
+    p[TCP6..TCP6 + 2].copy_from_slice(&src_port.to_be_bytes());
+    p[TCP6 + 2..TCP6 + 4].copy_from_slice(&dst_port.to_be_bytes());
+    p[TCP6 + 4..TCP6 + 8].copy_from_slice(&seq.to_be_bytes());
+    p[TCP6 + 12] = 6 << 4; // data offset = 6 words (24 bytes), reserved 0
+    p[TCP6 + 13] = 0x02; // SYN
+    p[TCP6 + 14..TCP6 + 16].copy_from_slice(&64_240u16.to_be_bytes()); // window
+                                                                       // Options: MSS (kind 2, len 4).
+    p[TCP6 + 20] = 2;
+    p[TCP6 + 21] = 4;
+    p[TCP6 + 22..TCP6 + 24].copy_from_slice(&mss.to_be_bytes());
     p
 }
 
@@ -762,6 +818,207 @@ fn syn_to_protected_port_but_unprotected_prefix_passes_through_unchanged() {
     assert_eq!(
         out, syn,
         "a gated (passed) SYN must be byte-for-byte unchanged"
+    );
+}
+
+// --- B2.3c: in-kernel IPv6 SipHash-cookie SYN-ACK via XDP_TX ---
+
+/// Client IPv6 address in the crafted v6 SYN (`2001:db8::7`).
+const CLIENT_IP6: [u8; 16] = [
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x07,
+];
+/// Server (deception) IPv6 address in the crafted v6 SYN (`2001:db8:0:1::1`),
+/// inside the protected `2001:db8::/32` prefix.
+const SERVER_IP6: [u8; 16] = [
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0x01,
+];
+/// Protected IPv6 deception prefix (`2001:db8::/32`) the v6 gating tests install.
+const PROTECT_PREFIX6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn syn_is_answered_with_a_golden_cookie_syn_ack_via_xdp_tx_v6() {
+    let client_port = 54_321u16;
+    let server_port = 443u16;
+    let client_seq = 0x1122_3344u32;
+    let client_mss = 1460u16;
+
+    let (k0, k1) = cookie_keys(COOKIE_KEY);
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    // B2.3a: deliver the cookie secret via the map (shared with the v4 path).
+    install_cookie_key(&mut bpf, COOKIE_KEY);
+    // B2.3c: the SYN's dst ([2001:db8:0:1::1]:443) must match a protected v6
+    // prefix AND a protected port (the port set is shared across families).
+    install_protect_prefix_v6(&mut bpf, 32, PROTECT_PREFIX6);
+    install_protect_port(&mut bpf, server_port);
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    let syn = eth_ipv6_tcp_syn(
+        CLIENT_IP6,
+        SERVER_IP6,
+        client_port,
+        server_port,
+        client_seq,
+        client_mss,
+    );
+    // The eBPF cookie time base is `bpf_ktime_get_ns()` (CLOCK_MONOTONIC), which
+    // we cannot pin, so accept any of the three adjacent 64-second slots.
+    let now_secs = clock_monotonic_secs();
+    let (action, out) = run_xdp_out(prog_fd, &syn);
+    let slot = now_secs >> blackwall_cookie::COUNTER_SHIFT;
+    let expected_mss = blackwall_cookie::make_cookie_raw(
+        k0,
+        k1,
+        &CLIENT_IP6,
+        client_port,
+        &SERVER_IP6,
+        server_port,
+        client_mss,
+        slot << blackwall_cookie::COUNTER_SHIFT,
+    )
+    .1;
+    // Cross-check: the in-kernel cookie (over the 16-byte v6 addresses) must
+    // equal the userspace `make_cookie_raw` computed here with the same tuple.
+    let expected_cookies: Vec<u32> = [slot.wrapping_sub(1), slot, slot + 1]
+        .into_iter()
+        .map(|s| {
+            blackwall_cookie::make_cookie_raw(
+                k0,
+                k1,
+                &CLIENT_IP6,
+                client_port,
+                &SERVER_IP6,
+                server_port,
+                client_mss,
+                s << blackwall_cookie::COUNTER_SHIFT,
+            )
+            .0
+        })
+        .collect();
+
+    assert_eq!(action, XDP_TX, "a v6 SYN must be answered via XDP_TX");
+    assert_eq!(
+        out.len(),
+        syn.len(),
+        "the reply must be the same byte length"
+    );
+
+    // Ethernet: MACs swapped.
+    assert_eq!(&out[0..6], &CLIENT_MAC, "reply dst MAC = original src");
+    assert_eq!(&out[6..12], &SERVER_MAC, "reply src MAC = original dst");
+    assert_eq!(&out[12..14], &[0x86, 0xDD], "still EtherType IPv6");
+
+    // IPv6: addresses swapped, still next-header TCP.
+    assert_eq!(
+        &out[IP6 + 8..IP6 + 24],
+        &SERVER_IP6,
+        "reply src IP = original dst"
+    );
+    assert_eq!(
+        &out[IP6 + 24..IP6 + 40],
+        &CLIENT_IP6,
+        "reply dst IP = original src"
+    );
+    assert_eq!(out[IP6 + 6], 6, "still next-header TCP");
+
+    // TCP: ports swapped, seq = cookie, ack = client_seq + 1, SYN|ACK only.
+    assert_eq!(
+        be16(&out, TCP6),
+        server_port,
+        "reply src port = original dst"
+    );
+    assert_eq!(
+        be16(&out, TCP6 + 2),
+        client_port,
+        "reply dst port = original src"
+    );
+    let actual_cookie = be32(&out, TCP6 + 4);
+    assert!(
+        expected_cookies.contains(&actual_cookie),
+        "reply seq {actual_cookie:#010x} must be a v6 SYN-cookie for an adjacent \
+         monotonic slot (candidates: {expected_cookies:#010x?})"
+    );
+    assert_eq!(
+        be32(&out, TCP6 + 8),
+        client_seq.wrapping_add(1),
+        "reply ack must be client_seq + 1"
+    );
+    assert_eq!(out[TCP6 + 13], 0x12, "flags must be SYN|ACK only");
+    assert_eq!(
+        be16(&out, TCP6 + 14),
+        65535,
+        "window must be the fixed value"
+    );
+
+    // MSS option echoed back in the reply.
+    assert_eq!(out[TCP6 + 20], 2, "first option is MSS (kind 2)");
+    assert_eq!(out[TCP6 + 21], 4, "MSS option length 4");
+    assert_eq!(
+        be16(&out, TCP6 + 22),
+        expected_mss,
+        "MSS echoes the cookie's MSS"
+    );
+
+    // TCP checksum valid over the IPv6 pseudo-header (16-byte src + dst
+    // addresses, next-header 6, 32-bit TCP length) + the TCP segment.
+    let seg_len = out.len() - TCP6;
+    let mut tcp_sum = 0u32;
+    tcp_sum += ones_sum(&out, IP6 + 8, 16); // source addr
+    tcp_sum += ones_sum(&out, IP6 + 24, 16); // dest addr
+    tcp_sum += u32::from(6u16); // next header
+    tcp_sum += u32::from(u16::try_from(seg_len).expect("seg len fits in u16")); // TCP length
+    tcp_sum += ones_sum(&out, TCP6, seg_len);
+    assert_eq!(
+        fold(tcp_sum),
+        0xFFFF,
+        "TCP checksum over the IPv6 pseudo-header must be valid"
+    );
+}
+
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn v6_syn_to_unprotected_prefix_or_port_passes_through_unchanged() {
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    install_cookie_key(&mut bpf, COOKIE_KEY);
+    // Only 2001:db8::/32 + port 443 are protected.
+    install_protect_prefix_v6(&mut bpf, 32, PROTECT_PREFIX6);
+    install_protect_port(&mut bpf, 443);
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    // Protected prefix but unprotected port (22) must pass through untouched.
+    let wrong_port = eth_ipv6_tcp_syn(CLIENT_IP6, SERVER_IP6, 54_321, 22, 0x1122_3344, 1460);
+    let (action, out) = run_xdp_out(prog_fd, &wrong_port);
+    assert_eq!(
+        action, XDP_PASS,
+        "a v6 SYN to a protected prefix on an unprotected port must pass"
+    );
+    assert_eq!(out, wrong_port, "a gated (passed) v6 SYN must be unchanged");
+
+    // Protected port but the dst is outside any protected prefix (2001:db9::1).
+    let mut off_prefix_ip = SERVER_IP6;
+    off_prefix_ip[3] = 0xb9; // 2001:db9:... — outside 2001:db8::/32
+    let wrong_prefix = eth_ipv6_tcp_syn(CLIENT_IP6, off_prefix_ip, 54_321, 443, 0x1122_3344, 1460);
+    let (action, out) = run_xdp_out(prog_fd, &wrong_prefix);
+    assert_eq!(
+        action, XDP_PASS,
+        "a v6 SYN to a protected port on an unprotected prefix must pass"
+    );
+    assert_eq!(
+        out, wrong_prefix,
+        "a gated (passed) v6 SYN must be unchanged"
     );
 }
 
