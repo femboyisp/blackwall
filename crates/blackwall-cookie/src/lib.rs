@@ -69,6 +69,13 @@ fn decode_mss_index(cookie: u32) -> u8 {
     clippy::too_many_arguments,
     reason = "raw tuple fields, no std/alloc struct available in this no_std core"
 )]
+// `#[inline(always)]`: in the eBPF data plane (`blackwall-xdp-ebpf`) this is
+// reached from two call sites (the IPv4 and IPv6 SYN-cookie fast paths). With
+// more than one caller the BPF backend would otherwise emit it out-of-line, and
+// its lowered >5-argument signature is rejected by the BPF calling convention
+// ("stack arguments are not supported"). Forcing inlining keeps every call a
+// leaf within the XDP program, as it already was for the single-caller v4 path.
+#[inline(always)]
 fn cookie_for_slot(
     key_k0: u64,
     key_k1: u64,
@@ -128,6 +135,11 @@ fn cookie_for_slot(
     clippy::too_many_arguments,
     reason = "raw tuple fields, no std/alloc struct available in this no_std core"
 )]
+// `#[inline(always)]`: forced inlining so the BPF backend never outlines this
+// >5-argument function (its stack-argument calling convention is unsupported on
+// BPF). It is called from both the IPv4 and IPv6 in-kernel SYN-cookie fast
+// paths in `blackwall-xdp-ebpf`; see the note on [`cookie_for_slot`].
+#[inline(always)]
 #[must_use]
 pub fn make_cookie_raw(
     key_k0: u64,
