@@ -2,9 +2,10 @@
 //!
 //! Parses `Ethernet -> IPv4/IPv6` with explicit bounds checks, then applies, in
 //! order, per source address: (1) an LPM blocklist drop, (2) a per-source LRU
-//! token-bucket rate-limit drop, (3) — for an IPv4 TCP **SYN** (ACK clear) — an
-//! in-kernel SipHash-cookie **SYN-ACK** answered via `XDP_TX` (sub-project
-//! B2.2), and otherwise (4) pass. Every decision bumps a per-CPU stats counter
+//! token-bucket rate-limit drop, (3) — for an IPv4 **or IPv6** TCP **SYN** (ACK
+//! clear) — an in-kernel SipHash-cookie **SYN-ACK** answered via `XDP_TX`
+//! (sub-project B2.2 for IPv4, B2.3c for IPv6), and otherwise (4) pass. Every
+//! decision bumps a per-CPU stats counter
 //! keyed by reason code. Map names (`BLOCK_V4`, `BLOCK_V6`, `RATE`, `STATS`)
 //! and the shared POD layouts in `blackwall-xdp-common` form the contract
 //! consumed by the userspace loader.
@@ -53,9 +54,15 @@
 //! `set_protected_ports`), so before configuration the fast path answers
 //! nothing — even with a cookie key present.
 //!
-//! IPv6 gating, the cross-daemon config-driven shared secret, the userspace
-//! monotonic-clock switch, and metrics are B2.3c; see the `// B2.3c:` markers
-//! below.
+//! # IPv6 fast path (B2.3c)
+//!
+//! [`try_synack_v6`] is the IPv6 mirror of [`try_synack_v4`]: it answers an IPv6
+//! TCP SYN whose destination LPM-matches the [`PROTECT_V6`] trie and whose port
+//! is in the shared [`PROTECT_PORT`] set, rewriting the frame in place into a
+//! SYN-ACK carrying the same stateless SipHash cookie (computed over the 16-byte
+//! v6 addresses) and bouncing it with `XDP_TX`. IPv6 has no L3 header checksum,
+//! and the TCP checksum's pseudo-header covers the 16-byte addresses + 32-bit
+//! TCP length + next-header byte — the two structural differences from v4.
 //!
 //! # `as`-cast exemption
 //!
@@ -112,6 +119,15 @@ const COOKIE_KEY_SLOT: u32 = 0;
 /// userspace installs prefixes, so an unconfigured box answers no SYNs.
 #[map]
 static PROTECT_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(65536, 1);
+/// Protected IPv6 deception prefixes — the IPv6 counterpart of [`PROTECT_V4`]
+/// (sub-project B2.3c). The SYN-cookie fast path answers an IPv6 SYN only if its
+/// **destination** address LPM-matches an entry here; a miss falls through to
+/// `XDP_PASS`. Mirrors [`BLOCK_V6`]'s `{prefixlen:u32, addr:[u8;16]}` LPM-key
+/// layout, but is a *destination* allowlist rather than a source blocklist.
+/// Empty until userspace installs prefixes, so an unconfigured box answers no
+/// IPv6 SYNs.
+#[map]
+static PROTECT_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(65536, 1);
 /// Protected TCP **destination** ports (the configured deception ports). The
 /// SYN-cookie fast path answers a SYN only if its destination TCP port is
 /// present here. A `HashMap` used as a set (value is an ignored `1u8`); keyed
@@ -201,6 +217,39 @@ const OFF_TCP_URG: usize = OFF_TCP + 18;
 /// TCP options region (after the fixed 20-byte TCP header).
 const OFF_TCP_OPTS: usize = OFF_TCP + 20;
 
+// Absolute packet offsets for the Ethernet + IPv6 (fixed 40-byte header) + TCP
+// layout the IPv6 SYN-cookie fast path operates on. IPv6 has no IHL and no
+// header checksum; the fixed header is always 40 bytes, so TCP begins at
+// `EthHdr::LEN + 40`. Every access is still `ptr_at` bounds-checked.
+/// IPv6 header start (after the Ethernet header; same position as [`OFF_IP`]).
+const OFF_IP6: usize = EthHdr::LEN;
+/// IPv6 source address (16 bytes at header offset 8).
+const OFF_IP6_SRC: usize = OFF_IP6 + 8;
+/// IPv6 destination address (16 bytes at header offset 24).
+const OFF_IP6_DST: usize = OFF_IP6 + 24;
+/// TCP header start (Ethernet + 40-byte fixed IPv6 header).
+const OFF_TCP6: usize = OFF_IP6 + Ipv6Hdr::LEN;
+/// TCP source port (IPv6).
+const OFF_TCP6_SRCPORT: usize = OFF_TCP6;
+/// TCP destination port (IPv6).
+const OFF_TCP6_DSTPORT: usize = OFF_TCP6 + 2;
+/// TCP sequence number (IPv6).
+const OFF_TCP6_SEQ: usize = OFF_TCP6 + 4;
+/// TCP acknowledgment number (IPv6).
+const OFF_TCP6_ACK: usize = OFF_TCP6 + 8;
+/// TCP data-offset byte (IPv6).
+const OFF_TCP6_DATAOFF: usize = OFF_TCP6 + 12;
+/// TCP flags byte (IPv6).
+const OFF_TCP6_FLAGS: usize = OFF_TCP6 + 13;
+/// TCP window field (IPv6).
+const OFF_TCP6_WINDOW: usize = OFF_TCP6 + 14;
+/// TCP checksum field (IPv6).
+const OFF_TCP6_CHECK: usize = OFF_TCP6 + 16;
+/// TCP urgent-pointer field (IPv6).
+const OFF_TCP6_URG: usize = OFF_TCP6 + 18;
+/// TCP options region (IPv6; after the fixed 20-byte TCP header).
+const OFF_TCP6_OPTS: usize = OFF_TCP6 + 20;
+
 /// TCP flags for a bare SYN-ACK: ACK (0x10) | SYN (0x02), all others clear.
 const TCP_FLAGS_SYN_ACK: u8 = 0x12;
 /// Advertised window in the SYN-ACK; mirrors the userspace tier's
@@ -281,6 +330,31 @@ fn load_be32(ctx: &XdpContext, offset: usize) -> Result<u32, ()> {
 fn store_be32(ctx: &XdpContext, offset: usize, value: u32) -> Result<(), ()> {
     store_be16(ctx, offset, (value >> 16) as u16)?;
     store_be16(ctx, offset + 2, (value & 0xffff) as u16)
+}
+
+/// Load a 16-byte address from the packet at `offset` with a **single**
+/// bounds-checked read, returned as a stack array. Used for the IPv6 src/dst
+/// addresses: reading all 16 bytes in one `ptr_at` (as [`ipv4_checksum`] does
+/// for the 20-byte IPv4 header) keeps the verifier happy, whereas a per-byte
+/// loop summed against `data_end` is rejected after bpf-linker coalesces the
+/// guards.
+#[inline(always)]
+fn load_addr16(ctx: &XdpContext, offset: usize) -> Result<[u8; 16], ()> {
+    let p: *const [u8; 16] = ptr_at(ctx, offset)?;
+    // SAFETY: `ptr_at` bounds-checked all 16 bytes at `offset` against `data_end`.
+    Ok(unsafe { *p })
+}
+
+/// Ones-complement partial sum of a 16-byte address as eight big-endian 16-bit
+/// words — the IPv6 TCP-checksum pseudo-header contribution of one address.
+/// Returned as a `u32` accumulator the caller folds with the rest of the sum.
+#[inline(always)]
+fn sum_addr16(addr: &[u8; 16]) -> u32 {
+    let mut sum: u32 = 0;
+    for k in 0..8 {
+        sum += u32::from(u16::from_be_bytes([addr[k * 2], addr[k * 2 + 1]]));
+    }
+    sum
 }
 
 /// Swap `N` consecutive bytes at `a` with the `N` at `b` (constant `N` keeps
@@ -470,12 +544,58 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 capture(ctx, REASON_RATELIMIT, xdp_action::XDP_DROP, frame_len);
                 return Ok(xdp_action::XDP_DROP);
             }
+            // Absorb an IPv6 TCP SYN in-kernel with a SipHash-cookie SYN-ACK
+            // (`XDP_TX`); anything else (non-TCP next-header, non-SYN, malformed
+            // options, unprotected dst) bails out of this fast path and falls
+            // through to `XDP_PASS`. Mirrors the IPv4 `try_synack_v4` call.
+            if let Ok(action) = try_synack_v6(ctx) {
+                count(REASON_SYNCOOKIE, frame_len);
+                // Snapshot after the in-place SYN->SYN-ACK rewrite: the frame now
+                // holds the rewritten SYN-ACK about to leave on the wire.
+                capture(ctx, REASON_SYNCOOKIE, action, frame_len);
+                return Ok(action);
+            }
         }
         _ => {}
     }
     count(REASON_PASS, frame_len);
     capture(ctx, REASON_PASS, xdp_action::XDP_PASS, frame_len);
     Ok(xdp_action::XDP_PASS)
+}
+
+/// Mint the stateless SipHash SYN-cookie for the packet's IPv6 connection tuple,
+/// reading the (pre-swap) tuple straight from the packet at the v6 header
+/// offsets. Returns `(cookie_seq, mss_used)`, or `Err(())` when the cookie key
+/// is absent (never installed) — the caller **must** invoke this before any
+/// packet mutation so that a bail leaves the frame untouched.
+///
+/// `#[inline(never)]`: this is deliberately its own bpf-to-bpf subprogram, so
+/// the SipHash scratch buffer (bigger for v6's 16-byte addresses) and the call
+/// into the `siphasher` hash routine live on *this* frame rather than inflating
+/// [`try_synack_v6`]. That splits the IPv6 cookie chain into
+/// `xdp_filter` → `try_synack_v6` → `compute_cookie_v6` → `siphasher::hash`,
+/// four small frames whose sizes sum under the 512-byte `MAX_BPF_STACK` limit —
+/// a single self-contained v6 synack subprogram (like the v4 one) would exceed
+/// it. The v4 path keeps its cookie inline because its 4-byte-address scratch is
+/// small enough to fit self-contained.
+#[inline(never)]
+fn compute_cookie_v6(ctx: &XdpContext) -> Result<(u32, u16), ()> {
+    // Read the secret from the userspace-populated map. Absent => bail so the
+    // caller falls through to `XDP_PASS`; never mint under a zero/garbage key.
+    let (k0, k1) = cookie_keys()?;
+    // Cookie time base: real monotonic seconds-since-boot (`CLOCK_MONOTONIC`);
+    // `make_cookie_raw` slots it with `>> COUNTER_SHIFT` internally. The
+    // userspace responder validates the returning ACK against the same clock.
+    // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
+    let now_secs = unsafe { bpf_ktime_get_ns() } / NS_PER_SEC;
+    let src = load_addr16(ctx, OFF_IP6_SRC)?;
+    let dst = load_addr16(ctx, OFF_IP6_DST)?;
+    let src_port = load_be16(ctx, OFF_TCP6_SRCPORT)?;
+    let dst_port = load_be16(ctx, OFF_TCP6_DSTPORT)?;
+    let client_mss = parse_mss(ctx, OFF_TCP6_OPTS)?;
+    Ok(make_cookie_raw(
+        k0, k1, &src, src_port, &dst, dst_port, client_mss, now_secs,
+    ))
 }
 
 /// Attempt the B2.2 in-kernel SYN-cookie transform on an IPv4 packet.
@@ -491,6 +611,14 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
 ///
 /// All bounds are validated *before* any mutation, so a bail can never leave a
 /// half-rewritten packet on the wire.
+///
+/// `#[inline(never)]`: emitted as its own bpf-to-bpf subprogram, self-contained
+/// (the SipHash cookie is minted inline here). Its deepest chain is `xdp_filter`
+/// → `try_synack_v4` → `siphasher::hash`, well under the 512-byte
+/// `MAX_BPF_STACK` budget. The IPv6 twin instead offloads the cookie to the
+/// [`compute_cookie_v6`] subprogram, because the larger 16-byte-address scratch
+/// would otherwise bust the budget (see [`try_synack_v6`]).
+#[inline(never)]
 fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     let ip: *const Ipv4Hdr = ptr_at(ctx, OFF_IP)?;
     // SAFETY: `ptr_at` bounds-checked the 20-byte IPv4 header.
@@ -565,16 +693,13 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     // `dst` and `dst_port` were already read above for the B2.3b gating.
     let src_port = load_be16(ctx, OFF_TCP_SRCPORT)?;
     let client_seq = load_be32(ctx, OFF_TCP_SEQ)?;
-    let client_mss = parse_mss(ctx)?;
+    let client_mss = parse_mss(ctx, OFF_TCP_OPTS)?;
 
     // Read the secret from the userspace-populated map. Absent (never installed)
     // => bail to `XDP_PASS`; we never mint a cookie under a zero/garbage key.
     let (k0, k1) = cookie_keys()?;
-    // Cookie time base: real monotonic seconds-since-boot (`CLOCK_MONOTONIC`).
-    // `make_cookie_raw` slots this with `>> COUNTER_SHIFT` internally.
-    // B2.3b: the userspace responder must slot the returning ACK against this
-    // same monotonic clock (it currently uses `SystemTime`/UNIX); until that
-    // switch the tiers disagree on the slot.
+    // Cookie time base: real monotonic seconds-since-boot (`CLOCK_MONOTONIC`);
+    // `make_cookie_raw` slots it with `>> COUNTER_SHIFT` internally.
     // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
     let now_secs = unsafe { bpf_ktime_get_ns() } / NS_PER_SEC;
     // Compute the stateless SYN-cookie with the shared no_std core.
@@ -599,7 +724,7 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     // Rewrite the options region in place: one 4-byte MSS option, NOP-padded to
     // the original options length so the data-offset and total length are
     // unchanged (no resize).
-    write_mss_option(ctx, options_len, mss)?;
+    write_mss_option(ctx, OFF_TCP_OPTS, options_len, mss)?;
 
     // IPv4 header checksum: recomputed over the fixed 20-byte header.
     store_be16(ctx, OFF_IP_CHECK, 0)?;
@@ -638,6 +763,158 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     sum += (nop_words as u32) * 0x0101;
     let tcp_check = fold_checksum(sum);
     store_be16(ctx, OFF_TCP_CHECK, tcp_check)?;
+
+    Ok(xdp_action::XDP_TX)
+}
+
+/// Attempt the B2.3c in-kernel SYN-cookie transform on an **IPv6** packet — the
+/// IPv6 mirror of [`try_synack_v4`].
+///
+/// Returns `Ok(XDP_TX)` if the packet was an IPv6 TCP SYN (ACK clear) whose
+/// next-header is TCP (no extension-header chain) **destined for a protected
+/// deception prefix + port** (the [`PROTECT_V6`] / [`PROTECT_PORT`] gate) with
+/// room in its options for a 4-byte MSS option, rewritten in place — same byte
+/// length — into a SipHash-cookie SYN-ACK ready to bounce back out. Returns
+/// `Err(())` for anything else (next-header ≠ TCP, not a SYN, destination not in
+/// [`PROTECT_V6`]/[`PROTECT_PORT`], no options room, a segment larger than
+/// [`MAX_TCP_SEG`], or a payload present); the caller then falls through to
+/// `XDP_PASS`.
+///
+/// Key differences from the IPv4 path:
+/// - The IPv6 header is a fixed 40 bytes (no IHL); only a `next_hdr == TCP`
+///   packet is handled — any extension header bails to `XDP_PASS`.
+/// - IPv6 has **no** header checksum, so none is recomputed.
+/// - The TCP checksum's pseudo-header covers the 16-byte v6 src/dst addresses,
+///   the 32-bit TCP length, and the next-header byte (6) — differing from v4's
+///   4-byte-address pseudo-header.
+///
+/// All bounds are validated *before* any mutation, so a bail can never leave a
+/// half-rewritten packet on the wire.
+///
+/// `#[inline(never)]`, and — unlike the self-contained [`try_synack_v4`] — the
+/// SipHash cookie is offloaded to the dedicated [`compute_cookie_v6`] subprogram
+/// so this frame stays small. The deepest chain `xdp_filter` → `try_synack_v6` →
+/// `compute_cookie_v6` → `siphasher::hash` then fits the 512-byte `MAX_BPF_STACK`
+/// budget, which a self-contained v6 synack (16-byte-address scratch) would not.
+#[inline(never)]
+fn try_synack_v6(ctx: &XdpContext) -> Result<u32, ()> {
+    let ip: *const Ipv6Hdr = ptr_at(ctx, OFF_IP6)?;
+    // SAFETY: `ptr_at` bounds-checked the fixed 40-byte IPv6 header.
+    let next_hdr = unsafe { (*ip).next_hdr };
+    // Only bare TCP is handled: an extension-header chain would push the TCP
+    // header past OFF_TCP6, so anything but next-header TCP bails to `XDP_PASS`.
+    if next_hdr != IpProto::Tcp {
+        return Err(());
+    }
+    // SAFETY: same bounds-checked header; `payload_len` is stored big-endian.
+    // With no extension headers this equals the TCP segment length.
+    let payload_len = usize::from(u16::from_be(unsafe { (*ip).payload_len }));
+
+    let tcp: *const TcpHdr = ptr_at(ctx, OFF_TCP6)?;
+    // SAFETY: `ptr_at` bounds-checked the fixed 20-byte TCP header.
+    let is_syn = unsafe { (*tcp).syn() } == 1;
+    // SAFETY: same bounds-checked header.
+    let is_ack = unsafe { (*tcp).ack() } == 1;
+    if !is_syn || is_ack {
+        return Err(());
+    }
+
+    // B2.3c gating (SAFETY-CRITICAL): only answer a SYN destined for one of the
+    // box's own protected IPv6 deception prefixes AND a configured deception
+    // port (ports are family-agnostic, so the same [`PROTECT_PORT`] set is
+    // reused). Either miss bails to `XDP_PASS` (frame untouched). The addresses
+    // are re-read after the swap for the checksum (below) rather than kept live
+    // across `compute_cookie_v6` — keeping them off this frame across that call is a
+    // `MAX_BPF_STACK` economy (see [`try_synack_v4`]).
+    let dst_port = load_be16(ctx, OFF_TCP6_DSTPORT)?;
+    if !protected_port(dst_port) || !protected_v6(load_addr16(ctx, OFF_IP6_DST)?) {
+        return Err(());
+    }
+
+    // SAFETY: same bounds-checked header.
+    let doff = usize::from(unsafe { (*tcp).doff() });
+    if doff < 5 {
+        return Err(());
+    }
+    let tcp_hdr_len = doff * 4;
+    let options_len = tcp_hdr_len - 20;
+    if options_len < 4 || options_len > MAX_TCP_OPTS {
+        return Err(());
+    }
+    // A SYN carries no payload: require the IPv6 payload length to equal the TCP
+    // header (no extension headers, no data), so the checksummed segment equals
+    // the header region we rewrite. TCP Fast Open payloads are out of scope.
+    if payload_len != tcp_hdr_len {
+        return Err(());
+    }
+    let seg_len = tcp_hdr_len;
+    if seg_len > MAX_TCP_SEG {
+        return Err(());
+    }
+
+    // Read the tuple pieces needed for the checksum/ack; the MSS and cookie come
+    // from [`compute_cookie_v6`]. `dst_port` was read above for the B2.3c gating.
+    // The 16-byte addresses are *not* read here: they are only needed for the
+    // pseudo-header sum below, and reading them after the cookie call (and the
+    // swap) keeps nothing address-sized live across `compute_cookie_v6`, which the
+    // verifier would otherwise spill onto this frame — the difference between
+    // fitting and busting the `MAX_BPF_STACK` chain budget.
+    let src_port = load_be16(ctx, OFF_TCP6_SRCPORT)?;
+    let client_seq = load_be32(ctx, OFF_TCP6_SEQ)?;
+    let ack = client_seq.wrapping_add(1);
+
+    // Compute the stateless SYN-cookie **before** any mutation (bails to `Err` —
+    // hence `XDP_PASS`, frame untouched — if the cookie key is absent), over the
+    // 16-byte v6 addresses read from the packet.
+    let (cookie_seq, mss) = compute_cookie_v6(ctx)?;
+
+    // --- in-place, same-length SYN -> SYN-ACK surgery ---
+    // Reflect the frame: swap MACs, IPv6 addresses, TCP ports. Data offset kept
+    // (reserved nibble cleared); seq = cookie; ack = client_seq + 1; flags =
+    // SYN|ACK only; fixed window; zeroed urgent pointer.
+    swap_bytes::<6>(ctx, OFF_MAC_DST, OFF_MAC_SRC)?;
+    swap_bytes::<16>(ctx, OFF_IP6_SRC, OFF_IP6_DST)?;
+    swap_bytes::<2>(ctx, OFF_TCP6_SRCPORT, OFF_TCP6_DSTPORT)?;
+    store_u8(ctx, OFF_TCP6_DATAOFF, (doff << 4) as u8)?;
+    store_be32(ctx, OFF_TCP6_SEQ, cookie_seq)?;
+    store_be32(ctx, OFF_TCP6_ACK, ack)?;
+    store_u8(ctx, OFF_TCP6_FLAGS, TCP_FLAGS_SYN_ACK)?;
+    store_be16(ctx, OFF_TCP6_WINDOW, SYNACK_WINDOW)?;
+    store_be16(ctx, OFF_TCP6_URG, 0)?;
+    // Rewrite the options region in place: one 4-byte MSS option, NOP-padded to
+    // the original options length so the header keeps its byte length.
+    write_mss_option(ctx, OFF_TCP6_OPTS, options_len, mss)?;
+
+    // IPv6 has NO header checksum — nothing to recompute at L3.
+
+    // TCP checksum: computed *analytically* from the exact header/options bytes
+    // we just wrote plus the IPv6 pseudo-header (the 16-byte source + destination
+    // addresses, the 32-bit TCP length, and the next-header byte). The two
+    // addresses are read from the packet *now* (post-swap); the address sum is
+    // swap-invariant, so this is correct, and it keeps them off the frame across
+    // the earlier `compute_cookie_v6` call.
+    // Address pseudo-header sum: read the two addresses from the packet now
+    // (post-swap; the sum is swap-invariant) and fold them one at a time so only
+    // one 16-byte scratch array is live at once and none crossed `compute_cookie_v6`.
+    let mut sum: u32 = sum_addr16(&load_addr16(ctx, OFF_IP6_SRC)?);
+    sum += sum_addr16(&load_addr16(ctx, OFF_IP6_DST)?);
+    sum += u32::from(IpProto::Tcp as u8); // next header = 6
+    sum += seg_len as u32; // TCP length (SYN has no payload => header length)
+    sum += u32::from(dst_port); // reply source port = original destination port
+    sum += u32::from(src_port); // reply destination port = original source port
+    sum += (cookie_seq >> 16) + (cookie_seq & 0xffff);
+    sum += (ack >> 16) + (ack & 0xffff);
+    sum += ((doff as u32) << 12) | 0x0012; // data-offset word | SYN|ACK flags
+    sum += u32::from(SYNACK_WINDOW);
+    // Options: one MSS option (kind 2, len 4, mss) then NOP padding, which is an
+    // even number of 0x01 bytes (options length is a multiple of 4), i.e. whole
+    // 0x0101 words.
+    sum += 0x0204;
+    sum += u32::from(mss);
+    let nop_words = (options_len - 4) / 2;
+    sum += (nop_words as u32) * 0x0101;
+    let tcp_check = fold_checksum(sum);
+    store_be16(ctx, OFF_TCP6_CHECK, tcp_check)?;
 
     Ok(xdp_action::XDP_TX)
 }
@@ -718,28 +995,34 @@ fn cookie_keys() -> Result<(u64, u64), ()> {
 /// NOP/SACK-permitted/timestamp/window-scale option simply gets the default MSS
 /// in its cookie; full option walking is deferred. Every access here is a
 /// constant offset, so it is trivially bounds-checked.
-fn parse_mss(ctx: &XdpContext) -> Result<u16, ()> {
-    let kind = load_u8(ctx, OFF_TCP_OPTS)?;
-    let len = load_u8(ctx, OFF_TCP_OPTS + 1)?;
+fn parse_mss(ctx: &XdpContext, opts_off: usize) -> Result<u16, ()> {
+    let kind = load_u8(ctx, opts_off)?;
+    let len = load_u8(ctx, opts_off + 1)?;
     if kind == 2 && len == 4 {
-        return load_be16(ctx, OFF_TCP_OPTS + 2);
+        return load_be16(ctx, opts_off + 2);
     }
     Ok(DEFAULT_CLIENT_MSS)
 }
 
-/// Write a single 4-byte MSS option at the start of the options region, then
-/// NOP-pad (`0x01`) out to `options_len` so the TCP header keeps its original
-/// byte length. `options_len` is `>= 4` (validated by the caller) and `<=
-/// MAX_TCP_OPTS`.
-fn write_mss_option(ctx: &XdpContext, options_len: usize, mss: u16) -> Result<(), ()> {
-    store_u8(ctx, OFF_TCP_OPTS, 2)?; // kind = MSS
-    store_u8(ctx, OFF_TCP_OPTS + 1, 4)?; // len = 4
-    store_be16(ctx, OFF_TCP_OPTS + 2, mss)?;
+/// Write a single 4-byte MSS option at the start of the options region
+/// (`opts_off`), then NOP-pad (`0x01`) out to `options_len` so the TCP header
+/// keeps its original byte length. `options_len` is `>= 4` (validated by the
+/// caller) and `<= MAX_TCP_OPTS`. Shared by the IPv4 and IPv6 fast paths, which
+/// pass their respective options offset ([`OFF_TCP_OPTS`] / [`OFF_TCP6_OPTS`]).
+fn write_mss_option(
+    ctx: &XdpContext,
+    opts_off: usize,
+    options_len: usize,
+    mss: u16,
+) -> Result<(), ()> {
+    store_u8(ctx, opts_off, 2)?; // kind = MSS
+    store_u8(ctx, opts_off + 1, 4)?; // len = 4
+    store_be16(ctx, opts_off + 2, mss)?;
     for k in 4..MAX_TCP_OPTS {
         if k >= options_len {
             break;
         }
-        store_u8(ctx, OFF_TCP_OPTS + k, 1)?; // NOP padding
+        store_u8(ctx, opts_off + k, 1)?; // NOP padding
     }
     Ok(())
 }
@@ -789,6 +1072,15 @@ fn protected_port(port: u16) -> bool {
 fn blocked_v6(addr: [u8; 16]) -> bool {
     let key = Key::new(128, addr);
     BLOCK_V6.get(&key).is_some()
+}
+
+/// True if `dst` (a SYN's destination IPv6) LPM-matches a protected deception
+/// prefix in [`PROTECT_V6`]. Looked up with a full 128-bit key so the trie
+/// returns the longest matching configured prefix. An empty trie matches
+/// nothing, so an unconfigured box gates every IPv6 SYN to `XDP_PASS`.
+fn protected_v6(dst: [u8; 16]) -> bool {
+    let key = Key::new(128, dst);
+    PROTECT_V6.get(&key).is_some()
 }
 
 /// Token-bucket check keyed by 16-byte source (v4 zero-padded). Returns `true`
