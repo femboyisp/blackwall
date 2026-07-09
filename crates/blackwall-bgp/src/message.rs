@@ -80,14 +80,14 @@ pub fn decode_message(bytes: &[u8]) -> Result<(BgpMessage, usize), BgpError> {
         )));
     }
     let body = &bytes[HEADER_LEN..total_len];
-    let msg = match msg_type {
-        1 => BgpMessage::Open(decode_open(body)?),
-        3 => BgpMessage::Notification(decode_notification(body)?),
-        4 => BgpMessage::Keepalive,
-        2 => BgpMessage::Update,
-        other => {
+    let msg = match MsgType::from_code(msg_type) {
+        Some(MsgType::Open) => BgpMessage::Open(decode_open(body)?),
+        Some(MsgType::Notification) => BgpMessage::Notification(decode_notification(body)?),
+        Some(MsgType::Keepalive) => BgpMessage::Keepalive,
+        Some(MsgType::Update) => BgpMessage::Update,
+        None => {
             return Err(BgpError::Decode(format!(
-                "unknown BGP message type {other}"
+                "unknown BGP message type {msg_type}"
             )))
         }
     };
@@ -122,6 +122,21 @@ impl MsgType {
             MsgType::Update => 2,
             MsgType::Notification => 3,
             MsgType::Keepalive => 4,
+        }
+    }
+
+    /// Parse a one-byte wire type code, or `None` for an unknown type.
+    ///
+    /// Inverse of [`MsgType::code`]; lets [`decode_message`] dispatch on the
+    /// enum rather than bare integer literals, keeping the decode side
+    /// symmetric with the [`MsgType::code`]-based encode side.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(MsgType::Open),
+            2 => Some(MsgType::Update),
+            3 => Some(MsgType::Notification),
+            4 => Some(MsgType::Keepalive),
+            _ => None,
         }
     }
 }
@@ -531,5 +546,19 @@ mod tests {
         let mut bytes = encode_keepalive();
         bytes[17] = 0xFF; // claim length 0xFF.. past the 19-byte buffer
         assert!(decode_message(&bytes).is_err());
+    }
+
+    #[test]
+    fn msgtype_from_code_roundtrips_and_rejects_unknown() {
+        for ty in [
+            MsgType::Open,
+            MsgType::Update,
+            MsgType::Notification,
+            MsgType::Keepalive,
+        ] {
+            assert_eq!(MsgType::from_code(ty.code()), Some(ty));
+        }
+        assert_eq!(MsgType::from_code(0), None);
+        assert_eq!(MsgType::from_code(5), None);
     }
 }
