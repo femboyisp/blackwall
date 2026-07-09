@@ -1,5 +1,6 @@
 //! The Blackwall daemon/CLI entry point.
 
+mod api;
 mod metrics;
 
 use clap::{Parser, Subcommand};
@@ -1862,6 +1863,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     afxdp_udp_responses: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
+            }
+
+            // Optional read-only control API.
+            if let Some(api_cfg) = policy.api.clone() {
+                let store_for_api = std::sync::Arc::new(store.clone());
+                tokio::spawn(api::serve_api(api_cfg, store_for_api));
             }
 
             let mut transports = tokio::task::JoinSet::new();
