@@ -66,6 +66,11 @@ pub fn teardown() {
 ///
 /// Needs `CAP_NET_ADMIN`. IPv6 setup is best-effort (skipped if IPv6 is off).
 fn ensure_tproxy_route() -> Result<(), NftError> {
+    // Disable src_valid_mark to prevent the kernel from treating marked packets
+    // as martian sources during source validation routing checks.
+    let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/src_valid_mark", "0");
+    let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/src_valid_mark", "0");
+
     use std::process::Command;
     let mark = format!("0x{:x}", crate::render::TPROXY_MARK);
     let table = crate::render::TPROXY_ROUTE_TABLE.to_string();
