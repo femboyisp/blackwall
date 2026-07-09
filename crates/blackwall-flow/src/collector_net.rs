@@ -35,7 +35,7 @@ pub async fn run_collector(
 ) -> Result<(), FlowError> {
     let sock = UdpSocket::bind(listen)
         .await
-        .map_err(|e| FlowError::Decode(format!("bind {listen}: {e}")))?;
+        .map_err(|e| FlowError::Io(format!("bind {listen}: {e}")))?;
     let mut buf = vec![0u8; 65535];
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_interval_ms));
     loop {
