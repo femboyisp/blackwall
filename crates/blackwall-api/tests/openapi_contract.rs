@@ -26,3 +26,15 @@ fn openapi_lists_every_route() {
         );
     }
 }
+
+#[test]
+fn openapi_registers_bearer_security_scheme() {
+    let doc = ApiDoc::openapi();
+    let components = doc
+        .components
+        .expect("OpenAPI doc must have components with a security scheme");
+    assert!(
+        components.security_schemes.contains_key("bearer"),
+        "bearer security scheme missing from OpenAPI doc"
+    );
+}

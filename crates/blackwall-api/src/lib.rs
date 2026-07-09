@@ -19,9 +19,25 @@ use axum::routing::get;
 use axum::Router;
 use utoipa::OpenApi;
 
+/// Registers the `bearer` HTTP security scheme referenced by every path.
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer",
+                SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),
+            );
+        }
+    }
+}
+
 /// The generated OpenAPI 3.1 document for the control API.
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&SecurityAddon),
     paths(
         handlers::list_tenants,
         handlers::get_tenant,
