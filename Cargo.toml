@@ -37,6 +37,12 @@ base64 = "0.22.1"
 domain = { version = "0.12.1", features = ["net", "tsig"] }
 kdl = "6.7.1"
 ctrlc = "3.5.2"
+axum = "=0.8.1"
+tower = "=0.5.2"
+tower-http = { version = "=0.6.8", features = ["trace"] }
+utoipa = { version = "=5.3.1", features = ["axum_extras"] }
+subtle = "=2.6.1"
+sha2 = "=0.10.8"
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
