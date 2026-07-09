@@ -690,30 +690,56 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     })
 }
 
-/// Decode a one-line config banner value, expanding the escapes `\n`, `\r`,
-/// `\t`, `\s` (space), and `\\`. Config lines are whitespace-tokenized, so a
-/// banner containing spaces must use `\s` (e.g. `220\sSMTP\sready\r\n`
-/// decodes to `220 SMTP ready\r\n`). An unrecognized escape is left verbatim
-/// (both characters kept), and a trailing lone backslash is kept as-is.
-fn decode_banner_escapes(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
+/// Decode a one-line config banner value into raw bytes, expanding the escapes
+/// `\n`, `\r`, `\t`, `\s` (space), `\\`, and `\xNN` (an arbitrary byte from two
+/// hex digits). Config lines are whitespace-tokenized, so a banner containing
+/// spaces must use `\s` (e.g. `220\sSMTP\sready\r\n` → `220 SMTP ready\r\n`);
+/// a binary response (DNS/NTP) uses `\xNN`. An unrecognized or malformed escape
+/// (including `\x` not followed by two hex digits, and a trailing lone
+/// backslash) is left verbatim.
+fn decode_banner_escapes(raw: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut buf = [0u8; 4];
+    let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             continue;
         }
         match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('s') => out.push(' '),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('s') => out.push(b' '),
+            Some('\\') => out.push(b'\\'),
+            Some('x') => {
+                // `\xNN` — exactly two hex digits become one byte; anything
+                // else is kept verbatim (`\x` plus whatever was consumed).
+                let c1 = chars.peek().copied();
+                match c1.and_then(|c| c.to_digit(16)) {
+                    None => out.extend_from_slice(b"\\x"),
+                    Some(hi) => {
+                        chars.next();
+                        match chars.peek().copied().and_then(|c| c.to_digit(16)) {
+                            None => {
+                                out.extend_from_slice(b"\\x");
+                                out.extend_from_slice(
+                                    c1.unwrap_or('x').encode_utf8(&mut buf).as_bytes(),
+                                );
+                            }
+                            Some(lo) => {
+                                chars.next();
+                                out.push(u8::try_from(hi * 16 + lo).unwrap_or(0));
+                            }
+                        }
+                    }
+                }
             }
-            None => out.push('\\'),
+            Some(other) => {
+                out.push(b'\\');
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
         }
     }
     out
@@ -1736,7 +1762,23 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
         )
         .unwrap();
         let x = p.xdp.expect("xdp set");
-        assert_eq!(x.afxdp_udp_banner.as_deref(), Some("220 ready\r\n"));
+        assert_eq!(
+            x.afxdp_udp_banner.as_deref(),
+            Some(b"220 ready\r\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn parses_xdp_afxdp_udp_banner_binary_hex() {
+        let p = parse_text(
+            "interface wan eth0\nxdp afxdp-udp-ports=53 afxdp-udp-banner=\\x00\\x1c\\xff\\sok\n",
+        )
+        .unwrap();
+        let x = p.xdp.expect("xdp set");
+        assert_eq!(
+            x.afxdp_udp_banner.as_deref(),
+            Some([0x00, 0x1c, 0xff, b' ', b'o', b'k'].as_slice())
+        );
     }
 
     #[test]
@@ -1747,11 +1789,23 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
 
     #[test]
     fn decode_banner_escapes_expands_known_and_preserves_unknown() {
-        assert_eq!(decode_banner_escapes("a\\sb\\r\\n\\t\\\\c"), "a b\r\n\t\\c");
+        assert_eq!(
+            decode_banner_escapes("a\\sb\\r\\n\\t\\\\c"),
+            b"a b\r\n\t\\c"
+        );
         // Unknown escape kept verbatim; trailing lone backslash kept.
-        assert_eq!(decode_banner_escapes("x\\qy\\"), "x\\qy\\");
+        assert_eq!(decode_banner_escapes("x\\qy\\"), b"x\\qy\\");
         // No escapes: identity.
-        assert_eq!(decode_banner_escapes("plain"), "plain");
+        assert_eq!(decode_banner_escapes("plain"), b"plain");
+        // \xNN → arbitrary bytes (incl. non-UTF-8).
+        assert_eq!(
+            decode_banner_escapes("\\x00\\x1c\\xFF"),
+            vec![0x00, 0x1c, 0xff]
+        );
+        // Malformed \x kept verbatim: no hex, one hex digit, non-hex second.
+        assert_eq!(decode_banner_escapes("\\x"), b"\\x");
+        assert_eq!(decode_banner_escapes("\\xg"), b"\\xg");
+        assert_eq!(decode_banner_escapes("\\x1z"), b"\\x1z");
     }
 
     #[test]
