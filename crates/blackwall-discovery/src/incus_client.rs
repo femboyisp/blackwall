@@ -134,11 +134,15 @@ pub struct UnixIncusClient {
 impl UnixIncusClient {
     /// Open a connection to the Incus unix socket at `socket_path`.
     ///
-    /// The connection is lazy; actual I/O occurs on the first method call.
+    /// Eagerly probes the socket with a throwaway connection so construction
+    /// fails fast when Incus is not reachable; each later request opens its own
+    /// short-lived connection.
     ///
     /// # Errors
-    /// Currently infallible; returns `Ok` unconditionally.
+    /// Returns [`DiscoveryError`] if the unix socket cannot be connected —
+    /// Incus not running, a wrong socket path, or insufficient permissions.
     pub fn connect(socket_path: &std::path::Path) -> Result<Self, DiscoveryError> {
+        std::os::unix::net::UnixStream::connect(socket_path)?;
         Ok(Self {
             socket_path: socket_path.to_path_buf(),
             event_reader: None,
