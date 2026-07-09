@@ -137,6 +137,26 @@ async fn wrong_token_is_401() {
 }
 
 #[tokio::test]
+async fn openapi_json_requires_auth() {
+    // Without a token the OpenAPI document is guarded like every other route.
+    let resp = app(FakeState::default())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // With the admin bearer token it serves the spec.
+    let (status, body) = get_json(app(FakeState::default()), "/v1/openapi.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"], "3.1.0");
+}
+
+#[tokio::test]
 async fn tenant_ip_assignments_are_scoped() {
     let state = FakeState {
         tenants: vec![TenantView {

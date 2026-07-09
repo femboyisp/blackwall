@@ -209,3 +209,22 @@ pub async fn serve_api(cfg: ApiConfig, store: Arc<Store>) {
         tracing::error!(%e, "api: server exited");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render_target;
+    use blackwall_core::ServiceTarget;
+
+    #[test]
+    fn render_target_covers_all_variants() {
+        assert_eq!(render_target(&ServiceTarget::Host), "host");
+        assert_eq!(
+            render_target(&ServiceTarget::Incus("web01".to_owned())),
+            "incus:web01"
+        );
+        assert_eq!(
+            render_target(&ServiceTarget::Nat("203.0.113.9:8080".parse().unwrap())),
+            "nat:203.0.113.9:8080"
+        );
+    }
+}

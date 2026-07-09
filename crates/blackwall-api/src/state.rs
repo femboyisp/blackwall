@@ -25,7 +25,7 @@ pub struct ServiceView {
     pub proto: String,
     /// Frontend port.
     pub port: u16,
-    /// Rendered target (e.g. `"accept"` or `"nat:203.0.113.9:8080"`).
+    /// Rendered target (e.g. `"host"` or `"nat:203.0.113.9:8080"`).
     pub target: String,
 }
 
