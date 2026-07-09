@@ -1689,6 +1689,7 @@ mod tests {
             rtbh: None,
             flowspec: None,
             metrics_listen: None,
+            api: None,
             engine: blackwall_core::EngineConfig::default(),
             flowtable: None,
             xdp: None,

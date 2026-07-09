@@ -4,9 +4,9 @@
 use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
-    AllowRule, BannerFluxConfig, DnsFluxConfig, EngineConfig, FlowSpecPolicy, FlowTableConfig,
-    L4Proto, Policy, PortState, RtbhPolicy, ServiceTarget, ShapeBandwidth, ShapeRule, Tenant,
-    XdpConfig, XdpMode,
+    AllowRule, ApiConfig, BannerFluxConfig, DnsFluxConfig, EngineConfig, FlowSpecPolicy,
+    FlowTableConfig, L4Proto, Policy, PortState, RtbhPolicy, ServiceTarget, ShapeBandwidth,
+    ShapeRule, Tenant, XdpConfig, XdpMode,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -22,6 +22,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut rtbh: Option<RtbhPolicy> = None;
     let mut flowspec: Option<FlowSpecPolicy> = None;
     let mut metrics_listen: Option<SocketAddr> = None;
+    let mut api: Option<ApiConfig> = None;
     let mut engine = EngineConfig::default();
     let mut flowtable: Option<FlowTableConfig> = None;
     let mut xdp: Option<XdpConfig> = None;
@@ -446,6 +447,47 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         })?);
                 }
             }
+            "api" => {
+                let mut listen: Option<SocketAddr> = None;
+                let mut token_file: Option<std::path::PathBuf> = None;
+                for tok in &line.words[1..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "api",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    match k {
+                        "listen" => {
+                            listen = Some(v.parse::<SocketAddr>().map_err(|_| {
+                                ConfigError::BadValue {
+                                    line: line.number,
+                                    what: "api listen",
+                                    value: v.to_owned(),
+                                }
+                            })?);
+                        }
+                        "token-file" => token_file = Some(std::path::PathBuf::from(v)),
+                        _ => {
+                            return Err(ConfigError::BadValue {
+                                line: line.number,
+                                what: "api key",
+                                value: k.to_owned(),
+                            });
+                        }
+                    }
+                }
+                let listen = listen.ok_or_else(|| ConfigError::BadValue {
+                    line: line.number,
+                    what: "api missing key",
+                    value: "listen".to_owned(),
+                })?;
+                let token_file = token_file.ok_or_else(|| ConfigError::BadValue {
+                    line: line.number,
+                    what: "api missing key",
+                    value: "token-file".to_owned(),
+                })?;
+                api = Some(ApiConfig { listen, token_file });
+            }
             "engine" => {
                 let bad = |what: &'static str, v: &str| ConfigError::BadValue {
                     line: line.number,
@@ -683,6 +725,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         rtbh,
         flowspec,
         metrics_listen,
+        api,
         engine,
         flowtable,
         xdp,
@@ -1557,6 +1600,25 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
     fn metrics_listen_absent_is_none() {
         let p = parse_text("interface wan eth0\n").unwrap();
         assert_eq!(p.metrics_listen, None);
+    }
+
+    #[test]
+    fn parses_api_directive() {
+        let p = parse_text(
+            "interface wan eth0\napi listen=127.0.0.1:8088 token-file=/etc/blackwall/api.token\n",
+        )
+        .unwrap();
+        let api = p.api.expect("api set");
+        assert_eq!(api.listen, "127.0.0.1:8088".parse().unwrap());
+        assert_eq!(
+            api.token_file,
+            std::path::PathBuf::from("/etc/blackwall/api.token")
+        );
+    }
+
+    #[test]
+    fn api_requires_both_keys() {
+        assert!(parse_text("interface wan eth0\napi listen=127.0.0.1:8088\n").is_err());
     }
 
     #[test]
