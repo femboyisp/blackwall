@@ -25,6 +25,11 @@ pub struct LimitQuery {
 type St = State<Arc<dyn AppState>>;
 
 /// `GET /v1/tenants` — every tenant and the addresses it owns.
+#[utoipa::path(
+    get, path = "/v1/tenants",
+    responses((status = 200, description = "All tenants", body = [TenantDto])),
+    security(("bearer" = []))
+)]
 pub async fn list_tenants(State(s): St) -> ApiResult<Json<Vec<TenantDto>>> {
     Ok(Json(
         s.tenants()
@@ -36,6 +41,15 @@ pub async fn list_tenants(State(s): St) -> ApiResult<Json<Vec<TenantDto>>> {
 }
 
 /// `GET /v1/tenants/{name}` — a single tenant; 404 if unknown.
+#[utoipa::path(
+    get, path = "/v1/tenants/{name}",
+    params(("name" = String, Path, description = "Tenant name")),
+    responses(
+        (status = 200, description = "The tenant", body = TenantDto),
+        (status = 404, description = "Unknown tenant")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_tenant(State(s): St, Path(name): Path<String>) -> ApiResult<Json<TenantDto>> {
     let t = s.tenants().await?.into_iter().find(|t| t.name == name);
     t.map(|t| Json(TenantDto::from(t)))
@@ -44,6 +58,15 @@ pub async fn get_tenant(State(s): St, Path(name): Path<String>) -> ApiResult<Jso
 
 /// `GET /v1/tenants/{name}/services` — services owned by the tenant; 404 if
 /// the tenant is unknown.
+#[utoipa::path(
+    get, path = "/v1/tenants/{name}/services",
+    params(("name" = String, Path, description = "Tenant name")),
+    responses(
+        (status = 200, description = "Services owned by the tenant", body = [ServiceDto]),
+        (status = 404, description = "Unknown tenant")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn tenant_services(
     State(s): St,
     Path(name): Path<String>,
@@ -63,6 +86,15 @@ pub async fn tenant_services(
 
 /// `GET /v1/tenants/{name}/ip-assignments` — addresses assigned to the
 /// tenant; 404 if the tenant is unknown.
+#[utoipa::path(
+    get, path = "/v1/tenants/{name}/ip-assignments",
+    params(("name" = String, Path, description = "Tenant name")),
+    responses(
+        (status = 200, description = "Addresses assigned to the tenant", body = [IpAssignmentDto]),
+        (status = 404, description = "Unknown tenant")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn tenant_ip_assignments(
     State(s): St,
     Path(name): Path<String>,
@@ -81,6 +113,11 @@ pub async fn tenant_ip_assignments(
 }
 
 /// `GET /v1/mitigations/rtbh` — active RTBH blackholes.
+#[utoipa::path(
+    get, path = "/v1/mitigations/rtbh",
+    responses((status = 200, description = "Active RTBH blackholes", body = [RtbhDto])),
+    security(("bearer" = []))
+)]
 pub async fn list_rtbh(State(s): St) -> ApiResult<Json<Vec<RtbhDto>>> {
     Ok(Json(
         s.rtbh().await?.into_iter().map(RtbhDto::from).collect(),
@@ -88,6 +125,11 @@ pub async fn list_rtbh(State(s): St) -> ApiResult<Json<Vec<RtbhDto>>> {
 }
 
 /// `GET /v1/mitigations/flowspec` — active FlowSpec rules.
+#[utoipa::path(
+    get, path = "/v1/mitigations/flowspec",
+    responses((status = 200, description = "Active FlowSpec rules", body = [FlowSpecDto])),
+    security(("bearer" = []))
+)]
 pub async fn list_flowspec(State(s): St) -> ApiResult<Json<Vec<FlowSpecDto>>> {
     Ok(Json(
         s.flowspec()
@@ -99,11 +141,21 @@ pub async fn list_flowspec(State(s): St) -> ApiResult<Json<Vec<FlowSpecDto>>> {
 }
 
 /// `GET /v1/mitigations/xdp` — active XDP block / rate-limit entries.
+#[utoipa::path(
+    get, path = "/v1/mitigations/xdp",
+    responses((status = 200, description = "Active XDP block / rate-limit entries", body = [XdpDto])),
+    security(("bearer" = []))
+)]
 pub async fn list_xdp(State(s): St) -> ApiResult<Json<Vec<XdpDto>>> {
     Ok(Json(s.xdp().await?.into_iter().map(XdpDto::from).collect()))
 }
 
 /// `GET /v1/detections` — active volumetric detections.
+#[utoipa::path(
+    get, path = "/v1/detections",
+    responses((status = 200, description = "Active volumetric detections", body = [DetectionDto])),
+    security(("bearer" = []))
+)]
 pub async fn list_detections(State(s): St) -> ApiResult<Json<Vec<DetectionDto>>> {
     Ok(Json(
         s.detections()
@@ -116,6 +168,12 @@ pub async fn list_detections(State(s): St) -> ApiResult<Json<Vec<DetectionDto>>>
 
 /// `GET /v1/sessions?limit=` — most-recent deception sessions, capped at
 /// `limit` (default `DEFAULT_LIMIT`, currently 100).
+#[utoipa::path(
+    get, path = "/v1/sessions",
+    params(("limit" = Option<i64>, Query, description = "Maximum rows to return (default 100)")),
+    responses((status = 200, description = "Most-recent deception sessions", body = [SessionDto])),
+    security(("bearer" = []))
+)]
 pub async fn list_sessions(
     State(s): St,
     Query(q): Query<LimitQuery>,
@@ -132,6 +190,12 @@ pub async fn list_sessions(
 
 /// `GET /v1/audit?limit=` — most-recent audit-log entries, capped at `limit`
 /// (default `DEFAULT_LIMIT`, currently 100).
+#[utoipa::path(
+    get, path = "/v1/audit",
+    params(("limit" = Option<i64>, Query, description = "Maximum rows to return (default 100)")),
+    responses((status = 200, description = "Most-recent audit-log entries", body = [AuditDto])),
+    security(("bearer" = []))
+)]
 pub async fn list_audit(
     State(s): St,
     Query(q): Query<LimitQuery>,
