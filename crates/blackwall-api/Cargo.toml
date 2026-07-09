@@ -21,6 +21,15 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 http-body-util = "=0.1.2"
+# Self dev-dependency: pulls in this crate again with `testutil` enabled so
+# `tests/read_endpoints.rs` (a separate, external test crate) can see
+# `testutil::FakeState`, while normal (non-dev) builds never compile it.
+blackwall-api = { path = ".", features = ["testutil"] }
+
+[features]
+# Exposes `testutil::FakeState` outside `#[cfg(test)]` so the external
+# integration test crate (`tests/read_endpoints.rs`) can use it.
+testutil = []
 
 [lints]
 workspace = true
