@@ -245,12 +245,6 @@ expression: json
               }
             },
             {
-              "tproxy": {
-                "family": "ip",
-                "port": 61000
-              }
-            },
-            {
               "mangle": {
                 "key": {
                   "meta": {
@@ -259,6 +253,15 @@ expression: json
                 },
                 "value": 1
               }
+            },
+            {
+              "tproxy": {
+                "family": "ip",
+                "port": 61000
+              }
+            },
+            {
+              "accept": null
             }
           ],
           "comment": "deception TCP: tproxy to engine port 61000"

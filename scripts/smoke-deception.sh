@@ -83,8 +83,10 @@ ip addr add "$HOST_DB_IP/30" dev "$DB_H"; ip link set "$DB_H" up
 ip -n "$BOX" addr add "$BOX_DB_IP/30" dev "$DB_B"; ip -n "$BOX" link set "$DB_B" up
 # box forwards; scanner routes the managed prefix through the box (routed, not local)
 inbox sysctl -qw net.ipv4.ip_forward=1
+inbox ethtool -K "$SC_BOX" rx off tx off
+inscan ethtool -K "$SC_SCAN" rx off tx off
 inscan ip route add "$PREFIX" via "$BOX_SC_IP"
-ok "scanner routes $PREFIX via the box (dst is NOT local on the box)"
+ok "scanner routes $PREFIX via the box (dst is NOT local on the box, checksum offloading disabled)"
 
 step "3. blackwalld config + engine (applies nft itself)"
 printf '* = smoke-generic\\r\\n\n' > "$RUNDIR/banners.txt"
