@@ -274,6 +274,10 @@ impl Store {
     }
 
     /// Update the active detection row for `target`.
+    ///
+    /// Best-effort by design: when no active (`cleared_at IS NULL`) row exists
+    /// for `target`, the `UPDATE` matches nothing and this silently succeeds —
+    /// a detection that was already cleared (or never recorded) needs no update.
     pub async fn update_detection(
         &self,
         target: IpAddr,
@@ -298,6 +302,10 @@ impl Store {
     }
 
     /// Mark the active detection row for `target` as cleared.
+    ///
+    /// Best-effort by design: when no active (`cleared_at IS NULL`) row exists
+    /// for `target`, the `UPDATE` matches nothing and this silently succeeds —
+    /// clearing an already-cleared (or never-recorded) detection is a no-op.
     pub async fn clear_detection(&self, target: IpAddr, at_ms: u64) -> Result<(), StateError> {
         let target = ipnetwork_addr(target);
         let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
