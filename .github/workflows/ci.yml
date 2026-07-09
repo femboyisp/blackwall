@@ -163,7 +163,6 @@ jobs:
         # gate timeout locally either. Separate from the cargo-run hang and
         # from #88. Skipped so it can't starve the rest of the suite; the
         # single-connection `deception` gate above still exercises the engine.
-        if: false
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
@@ -200,7 +199,6 @@ jobs:
         # hangs (BIRD orphaned when the scenario's lab test is killed), holding
         # the CI step past its timeout. Latent until now because flow-live
         # wedged earlier and cancelled the job first. Re-enable via #137.
-        if: false
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
@@ -211,7 +209,6 @@ jobs:
       - name: Run the lab gate (flowspec-auto)
         # DISABLED pending the systemic lab-gate-wedge fix (#137), same cause
         # as the flowspec gate above. Re-enable via #137.
-        if: false
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
