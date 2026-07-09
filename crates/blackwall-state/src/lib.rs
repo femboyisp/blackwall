@@ -3,6 +3,7 @@
 
 mod audit;
 mod cookie;
+mod detections;
 mod error;
 mod flowspec;
 mod rtbh;
@@ -11,6 +12,8 @@ mod sessions;
 mod tenants;
 mod xdp;
 
+pub use audit::AuditRow;
+pub use detections::DetectionRow;
 pub use error::StateError;
 pub use flowspec::{FlowSpecRequestRow, FlowSpecRuleRow};
 pub use rtbh::{RtbhBlackholeRow, RtbhRequestRow};
@@ -31,6 +34,19 @@ use std::sync::Arc;
 pub struct Store {
     pool: PgPool,
 }
+
+/// Raw column tuple decoded from a `deception_sessions` row:
+/// `(local_addr, local_port, peer_addr, proto, emulator, bytes_in, bytes_out, note)`.
+type SessionRowTuple = (
+    sqlx::types::ipnetwork::IpNetwork,
+    i32,
+    sqlx::types::ipnetwork::IpNetwork,
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+);
 
 /// Raw column tuple decoded from a `flowspec_rules` row:
 /// `(dst, proto, dst_port, rate::real, origin, announced_at_ms, withdrawn_at_ms)`.
@@ -190,6 +206,49 @@ impl Store {
         Ok(out)
     }
 
+    /// List all tenants with the addresses they own.
+    ///
+    /// A tenant with no `ip_assignments` row still appears, with an empty
+    /// address vector (the `LEFT JOIN` yields a `NULL` address for it, which
+    /// is skipped rather than pushed).
+    pub async fn list_tenants(&self) -> Result<Vec<(String, Vec<IpAddr>)>, StateError> {
+        let rows: Vec<(String, Option<sqlx::types::ipnetwork::IpNetwork>)> = sqlx::query_as(
+            "SELECT t.name, a.address FROM tenants t \
+             LEFT JOIN ip_assignments a ON a.tenant_id = t.id \
+             ORDER BY t.name, a.address",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: Vec<(String, Vec<IpAddr>)> = Vec::new();
+        for (name, addr) in rows {
+            match out.last_mut() {
+                Some((n, addrs)) if *n == name => {
+                    if let Some(net) = addr {
+                        addrs.push(net.ip());
+                    }
+                }
+                _ => out.push((name, addr.into_iter().map(|net| net.ip()).collect())),
+            }
+        }
+        Ok(out)
+    }
+
+    /// List every IP assignment as `(tenant name, address)`.
+    pub async fn list_ip_assignments(&self) -> Result<Vec<(String, IpAddr)>, StateError> {
+        let rows: Vec<(String, sqlx::types::ipnetwork::IpNetwork)> = sqlx::query_as(
+            "SELECT t.name, a.address FROM ip_assignments a \
+             JOIN tenants t ON t.id = a.tenant_id \
+             ORDER BY t.name, a.address",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, addr)| (name, addr.ip()))
+            .collect())
+    }
+
     /// Append a deception-session audit row.
     pub async fn record_session(&self, s: &SessionRow) -> Result<(), StateError> {
         sqlx::query(
@@ -218,12 +277,67 @@ impl Store {
         Ok(row.0)
     }
 
+    /// List the `limit` most recently recorded deception sessions, newest
+    /// first.
+    pub async fn list_recent_sessions(&self, limit: i64) -> Result<Vec<SessionRow>, StateError> {
+        let rows: Vec<SessionRowTuple> = sqlx::query_as(
+            "SELECT local_addr, local_port, peer_addr, proto, emulator, bytes_in, bytes_out, note \
+             FROM deception_sessions ORDER BY at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (local_addr, local_port, peer_addr, proto, emulator, bytes_in, bytes_out, note) in rows
+        {
+            out.push(SessionRow {
+                local_addr: local_addr.ip(),
+                local_port: narrow_port(local_port)?,
+                peer_addr: peer_addr.ip(),
+                proto,
+                emulator,
+                bytes_in,
+                bytes_out,
+                note,
+            });
+        }
+        Ok(out)
+    }
+
     /// Count audit-log entries.
     pub async fn audit_count(&self) -> Result<i64, StateError> {
         let row: (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log")
             .fetch_one(&self.pool)
             .await?;
         Ok(row.0)
+    }
+
+    /// List the `limit` most recent audit-log entries, newest first.
+    pub async fn list_recent_audit(&self, limit: i64) -> Result<Vec<AuditRow>, StateError> {
+        let rows: Vec<(i64, String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT (EXTRACT(EPOCH FROM at) * 1000)::bigint, actor, action, detail \
+             FROM audit_log ORDER BY at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (at_ms, actor, action, detail) in rows {
+            let at_ms = u64::try_from(at_ms).map_err(|_| {
+                StateError::Db(sqlx::Error::Decode(
+                    format!("at_ms {at_ms} out of u64 range").into(),
+                ))
+            })?;
+            out.push(AuditRow {
+                at_ms,
+                actor,
+                action,
+                detail,
+            });
+        }
+        Ok(out)
     }
 
     /// Count detection rows (active and cleared).
@@ -319,6 +433,48 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// List all currently-active (`cleared_at IS NULL`) detections.
+    pub async fn list_active_detections(&self) -> Result<Vec<DetectionRow>, StateError> {
+        let rows: Vec<(
+            sqlx::types::ipnetwork::IpNetwork,
+            f64,
+            f64,
+            String,
+            i64,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT target, observed_pps, observed_bps, severity, \
+                    (EXTRACT(EPOCH FROM first_seen) * 1000)::bigint, \
+                    (EXTRACT(EPOCH FROM last_seen) * 1000)::bigint \
+             FROM detections WHERE cleared_at IS NULL ORDER BY target",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (target, observed_pps, observed_bps, severity, first_seen_ms, last_seen_ms) in rows {
+            let first_seen_ms = u64::try_from(first_seen_ms).map_err(|_| {
+                StateError::Db(sqlx::Error::Decode(
+                    format!("first_seen_ms {first_seen_ms} out of u64 range").into(),
+                ))
+            })?;
+            let last_seen_ms = u64::try_from(last_seen_ms).map_err(|_| {
+                StateError::Db(sqlx::Error::Decode(
+                    format!("last_seen_ms {last_seen_ms} out of u64 range").into(),
+                ))
+            })?;
+            out.push(DetectionRow {
+                target: target.ip(),
+                observed_pps,
+                observed_bps,
+                severity,
+                first_seen_ms,
+                last_seen_ms,
+            });
+        }
+        Ok(out)
     }
 
     /// Insert or refresh the active `rtbh_blackholes` mirror row for
@@ -955,6 +1111,22 @@ mod tests {
         std::env::var("DATABASE_URL").ok()
     }
 
+    /// Serializes every test whose read-back assertions depend on being the
+    /// only writer of a shared table for the duration of its critical
+    /// section.
+    ///
+    /// Two categories rely on this: tests that call `apply_policy`, which
+    /// `TRUNCATE`s the shared `tenants` table (cascading to
+    /// `ip_assignments`/`services`) before repopulating it, so a second such
+    /// test racing on the same database could interleave its own `TRUNCATE`
+    /// between another's write and read-back; and tests that assert an exact
+    /// `deception_sessions` row count (`before + 1`), which a concurrent
+    /// `record_session` from another test would otherwise perturb. Every such
+    /// test acquires this lock for its whole write-then-read critical
+    /// section.
+    static DB_SERIAL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     #[tokio::test]
     async fn connect_and_migrate_is_idempotent() {
         let Some(url) = test_url() else {
@@ -974,6 +1146,7 @@ mod tests {
         };
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let _guard = DB_SERIAL_LOCK.lock().await;
 
         let policy = blackwall_config_sample();
         let written = store.apply_policy(&policy, "test").await.expect("apply");
@@ -1143,6 +1316,7 @@ mod tests {
         };
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let _guard = DB_SERIAL_LOCK.lock().await;
         let before = store.session_count().await.expect("count");
         store
             .record_session(&SessionRow {
@@ -1695,5 +1869,195 @@ mod tests {
             xdp: None,
             stateless_tcp_ports: Vec::new(),
         }
+    }
+
+    /// Build a policy with tenant `"t-read"` owning `203.0.113.7` (no
+    /// services) plus a second tenant `"t-empty"` that owns nothing, so a
+    /// single `apply_policy` seeds both the tenant-with-assignment and the
+    /// tenant-with-no-assignment case that [`Store::list_tenants`] must
+    /// handle via its `LEFT JOIN`.
+    fn tenant_read_policy() -> Policy {
+        use blackwall_core::Tenant;
+        Policy {
+            interface: "eth0".to_owned(),
+            prefixes: vec!["203.0.113.0/24".parse().expect("prefix")],
+            default_state: blackwall_core::PortState::Deception,
+            tenants: vec![
+                Tenant {
+                    name: "t-read".to_owned(),
+                    owned: vec!["203.0.113.7".parse().expect("ip")],
+                    allows: Vec::new(),
+                },
+                Tenant {
+                    name: "t-empty".to_owned(),
+                    owned: Vec::new(),
+                    allows: Vec::new(),
+                },
+            ],
+            shaping: Vec::new(),
+            banner_flux: None,
+            dns_flux: None,
+            rtbh: None,
+            flowspec: None,
+            metrics_listen: None,
+            api: None,
+            engine: blackwall_core::EngineConfig::default(),
+            flowtable: None,
+            xdp: None,
+            stateless_tcp_ports: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tenants_and_ip_assignments_reflect_policy() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let _guard = DB_SERIAL_LOCK.lock().await;
+
+        store
+            .apply_policy(&tenant_read_policy(), "test")
+            .await
+            .expect("apply");
+
+        let read_addr: IpAddr = "203.0.113.7".parse().unwrap();
+        let tenants = store.list_tenants().await.expect("list_tenants");
+        assert!(
+            tenants
+                .iter()
+                .any(|(name, addrs)| name == "t-read" && addrs == &vec![read_addr]),
+            "t-read with its address must appear: {tenants:?}"
+        );
+        assert!(
+            tenants
+                .iter()
+                .any(|(name, addrs)| name == "t-empty" && addrs.is_empty()),
+            "a tenant with no assignments must still appear, with an empty address vec: {tenants:?}"
+        );
+
+        let assignments = store
+            .list_ip_assignments()
+            .await
+            .expect("list_ip_assignments");
+        assert!(assignments.contains(&("t-read".to_owned(), read_addr)));
+        assert!(
+            !assignments.iter().any(|(name, _)| name == "t-empty"),
+            "a tenant with no assignments must not appear in list_ip_assignments"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_active_detections_excludes_cleared() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let t: IpAddr = "198.51.100.201".parse().unwrap();
+        let d = sample_detection(t, 10_000, 11_000);
+        store.open_detection(&d).await.expect("open");
+
+        let active = store.list_active_detections().await.expect("list");
+        let row = active
+            .iter()
+            .find(|r| r.target == t)
+            .expect("freshly opened detection must be active");
+        assert_eq!(row.observed_pps, d.observed_pps);
+        assert_eq!(row.observed_bps, d.observed_bps);
+        assert_eq!(row.severity, "critical");
+        assert_eq!(row.first_seen_ms, 10_000);
+        assert_eq!(row.last_seen_ms, 11_000);
+
+        store.clear_detection(t, 12_000).await.expect("clear");
+        let active_after = store.list_active_detections().await.expect("list2");
+        assert!(
+            !active_after.iter().any(|r| r.target == t),
+            "cleared detection must not appear as active"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recent_sessions_orders_newest_first_and_respects_limit() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let _guard = DB_SERIAL_LOCK.lock().await;
+
+        let peer_first: IpAddr = "198.51.100.210".parse().unwrap();
+        let peer_second: IpAddr = "198.51.100.211".parse().unwrap();
+        for (peer, note) in [(peer_first, "first"), (peer_second, "second")] {
+            store
+                .record_session(&SessionRow {
+                    local_addr: "203.0.113.9".parse().unwrap(),
+                    local_port: 80,
+                    peer_addr: peer,
+                    proto: "tcp".to_owned(),
+                    emulator: "http".to_owned(),
+                    bytes_in: 1,
+                    bytes_out: 2,
+                    note: Some(note.to_owned()),
+                })
+                .await
+                .expect("record");
+        }
+
+        let recent = store
+            .list_recent_sessions(1)
+            .await
+            .expect("list_recent_sessions");
+        assert_eq!(recent.len(), 1, "limit must cap the result to 1 row");
+        assert_eq!(
+            recent[0].note.as_deref(),
+            Some("second"),
+            "the most recently recorded session must come first"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recent_audit_orders_newest_first_and_respects_limit() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let _guard = DB_SERIAL_LOCK.lock().await;
+
+        // Three back-to-back apply_policy calls guarantee at least three
+        // fresh audit_log rows attributed to "audit-actor". audit_log is
+        // append-only (unlike tenants, it is never TRUNCATEd by
+        // apply_policy), so these rows are guaranteed to persist regardless
+        // of what other tests do concurrently to the shared tenants table.
+        for _ in 0..3 {
+            store
+                .apply_policy(&tenant_read_policy(), "audit-actor")
+                .await
+                .expect("apply");
+        }
+
+        let top_one = store.list_recent_audit(1).await.expect("list limit 1");
+        assert_eq!(top_one.len(), 1, "limit must cap the result to 1 row");
+        assert_eq!(top_one[0].action, "apply_policy");
+
+        let top_two = store.list_recent_audit(2).await.expect("list limit 2");
+        assert_eq!(top_two.len(), 2, "limit must cap the result to 2 rows");
+        assert!(
+            top_two[0].at_ms >= top_two[1].at_ms,
+            "results must be newest first"
+        );
+
+        let recent_ten = store.list_recent_audit(10).await.expect("list limit 10");
+        assert!(
+            recent_ten.iter().any(|r| r.actor == "audit-actor"),
+            "one of our own apply_policy calls must appear among the 10 most recent audit rows"
+        );
     }
 }
