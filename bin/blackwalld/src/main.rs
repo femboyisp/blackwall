@@ -1526,11 +1526,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             // Operator-configured banner (`afxdp-udp-banner=`),
                             // falling back to the built-in placeholder. Owned so
                             // the responder thread can outlive `xdp_cfg`.
-                            let banner_t: Vec<u8> =
-                                xdp_cfg.afxdp_udp_banner.as_deref().map_or_else(
-                                    || AFXDP_UDP_BANNER.to_vec(),
-                                    |s| s.as_bytes().to_vec(),
-                                );
+                            let banner_t: Vec<u8> = xdp_cfg
+                                .afxdp_udp_banner
+                                .clone()
+                                .unwrap_or_else(|| AFXDP_UDP_BANNER.to_vec());
                             match std::thread::Builder::new()
                                 .name("afxdp-udp-responder".to_owned())
                                 .spawn(move || {

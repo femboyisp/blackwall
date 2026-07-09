@@ -44,10 +44,12 @@ pub struct XdpConfig {
     pub afxdp_udp_ports: Vec<u16>,
     /// Banner bytes the AF_XDP UDP responder reflects to `afxdp_udp_ports`
     /// (`afxdp-udp-banner=` directive), decoded from the config string with
-    /// `\n`/`\r`/`\t`/`\s`/`\\` escapes (config is whitespace-tokenized, so a
-    /// space must be written `\s` — e.g. `220\sready\r\n`). `None` (the
-    /// default) uses the built-in placeholder. The reflection-safe builder
+    /// `\n`/`\r`/`\t`/`\s`/`\\` escapes plus `\xNN` for an arbitrary byte
+    /// (config is whitespace-tokenized, so a space must be written `\s` — e.g.
+    /// `220\sready\r\n`; a binary DNS/NTP-style response uses `\xNN`, e.g.
+    /// `\x00\x1c\x81\x80…`). Raw bytes, so it need not be valid UTF-8. `None`
+    /// (the default) uses the built-in placeholder. The reflection-safe builder
     /// still truncates the banner to at most the request's payload length, so
     /// this can never amplify.
-    pub afxdp_udp_banner: Option<String>,
+    pub afxdp_udp_banner: Option<Vec<u8>>,
 }
