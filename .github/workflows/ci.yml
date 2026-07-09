@@ -156,13 +156,11 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flow-sflow-live.kdl lab-junit-flow-live.xml
       - name: Run the lab gate (deception-resilience)
-        # DISABLED in CI pending investigation (#136): after switching the
-        # scenario off in-netns `cargo run` to the pre-built trafficgen binary,
-        # this gate still hangs at the connect-flood step (600 concurrent conns
-        # under a background wire flood) — it does not terminate within the
-        # gate timeout locally either. Separate from the cargo-run hang and
-        # from #88. Skipped so it can't starve the rest of the suite; the
-        # single-connection `deception` gate above still exercises the engine.
+        # Re-enabled: green once the connect-flood step is bounded by its
+        # deadline (#136) AND the deception-TCP tproxy rule terminates with
+        # `accept` (#157) so the engine actually serves the tproxy'd load — with
+        # working tproxy the engine also tears down cleanly, so it no longer
+        # leaves the residue that used to wedge the next gate (rtbh).
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
@@ -195,10 +193,10 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/rtbh-bird.kdl lab-junit-rtbh.xml
       - name: Run the lab gate (flowspec)
-        # DISABLED pending the systemic lab-gate-wedge fix (#137): this gate
-        # hangs (BIRD orphaned when the scenario's lab test is killed), holding
-        # the CI step past its timeout. Latent until now because flow-live
-        # wedged earlier and cancelled the job first. Re-enable via #137.
+        # Re-enabled: its wedge was cross-gate residue left by the preceding
+        # deception-resilience gate's engine (broken tproxy → unclean teardown →
+        # orphaned processes that wedged this BIRD gate). Fixed upstream by the
+        # tproxy accept fix (#157); this gate now runs green.
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
@@ -207,8 +205,8 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-bird.kdl lab-junit-flowspec.xml
       - name: Run the lab gate (flowspec-auto)
-        # DISABLED pending the systemic lab-gate-wedge fix (#137), same cause
-        # as the flowspec gate above. Re-enable via #137.
+        # Re-enabled: same story as the flowspec gate above — the cross-gate
+        # residue that wedged it is gone with the tproxy accept fix (#157).
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
