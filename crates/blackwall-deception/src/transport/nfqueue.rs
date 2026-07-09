@@ -125,6 +125,21 @@ pub fn run(
         Some(Protocol::from(IPPROTO_ICMPV6)),
     )
     .map_err(DeceptionError::Io)?;
+
+    // FREEBIND: a deployed deception prefix is *routed to* the box, not assigned
+    // to an interface, so the reply's source address is non-local. Without
+    // IP(V6)_FREEBIND the kernel rejects a non-local source — for IPv6 it
+    // rejects the `IPV6_PKTINFO` source pin (`EINVAL`), and the whole stateless
+    // v6 tier would be silently unable to answer from a routed prefix. Setting
+    // it per-socket avoids requiring the global `net.ipv{4,6}.ip_nonlocal_bind`
+    // sysctl. (The v4 socket is header-included, so its source rarely needs
+    // this, but set it for parity and for any non-hdrincl kernel path.)
+    v4.set_freebind(true).map_err(DeceptionError::Io)?;
+    v6_tcp.set_freebind_ipv6(true).map_err(DeceptionError::Io)?;
+    v6_udp.set_freebind_ipv6(true).map_err(DeceptionError::Io)?;
+    v6_icmp
+        .set_freebind_ipv6(true)
+        .map_err(DeceptionError::Io)?;
     let socks = RawSockets {
         v4,
         v6_tcp,

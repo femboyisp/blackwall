@@ -153,7 +153,11 @@ install steps above) for this to work.
   connection state; a client that completes the handshake gets the port's
   banner (PSH|ACK|FIN) and the connection closes immediately — a spoofed-source
   SYN flood against these ports creates no state on the box. Dual-stack (IPv4 +
-  IPv6, v6 replies go via a raw socket + `IPV6_PKTINFO`). Deception UDP on
+  IPv6, v6 replies go via a raw socket + `IPV6_PKTINFO`). Because a managed
+  prefix is *routed to* the box (not assigned to an interface), replies come
+  from a non-local source; the responder sets `IP_FREEBIND`/`IPV6_FREEBIND` on
+  its raw sockets so this works out of the box — you do **not** need to set the
+  `net.ipv{4,6}.ip_nonlocal_bind` sysctl. Deception UDP on
   these paths is answered by a reflection-safe responder whose reply is never
   longer than the request (amplification factor ≤ 1 — it can't be used as a
   UDP reflector).
