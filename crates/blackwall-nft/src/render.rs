@@ -378,13 +378,6 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
                     })),
                     op: Operator::EQ,
                 }),
-                // tproxy to the configured engine port — typed variant,
-                // serializes as {"tproxy": {"family": "<f>", "port": <n>}}
-                Statement::TProxy(TProxy {
-                    family: Some(addr_family.into()),
-                    port: policy.engine.tproxy_port,
-                    addr: None,
-                }),
                 // meta mark set TPROXY_MARK — so the policy route installed by
                 // `apply` delivers this (possibly forwarded) packet to the local
                 // transparent socket instead of routing it onward.
@@ -392,6 +385,12 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
                     key: Expression::Named(NamedExpression::Meta(Meta { key: MetaKey::Mark })),
                     value: Expression::Number(TPROXY_MARK),
                 }),
+                Statement::TProxy(TProxy {
+                    family: Some(addr_family.into()),
+                    port: policy.engine.tproxy_port,
+                    addr: None,
+                }),
+                Statement::Accept(None),
             ]
             .into(),
             handle: None,
