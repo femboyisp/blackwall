@@ -1,5 +1,6 @@
 //! Shared domain types and the policy model for Blackwall.
 
+mod api;
 mod dns;
 mod engine;
 mod flowspec;
@@ -15,6 +16,7 @@ mod shape;
 mod target;
 mod xdp;
 
+pub use api::ApiConfig;
 pub use dns::DnsFluxConfig;
 pub use engine::{
     EngineConfig, DEFAULT_MAX_CONCURRENT, DEFAULT_NFQUEUE_NUM, DEFAULT_SESSION_TIMEOUT_SECS,
