@@ -722,6 +722,7 @@ mod tests {
             flowtable: None,
             xdp: None,
             stateless_tcp_ports: Vec::new(),
+            shadow: false,
         }
     }
 
@@ -752,6 +753,7 @@ mod tests {
             flowtable: None,
             xdp: None,
             stateless_tcp_ports: Vec::new(),
+            shadow: false,
         }
     }
 
@@ -1258,6 +1260,7 @@ mod tests {
             flowtable: None,
             xdp: None,
             stateless_tcp_ports: Vec::new(),
+            shadow: false,
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.

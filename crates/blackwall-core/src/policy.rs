@@ -74,4 +74,7 @@ pub struct Policy {
     /// Set via the `stateless-tcp ports=` directive; empty (the default)
     /// preserves today's behaviour where all deception TCP is interactive.
     pub stateless_tcp_ports: Vec<u16>,
+    /// Shadow mode: log + record + meter mitigations (RTBH/FlowSpec/XDP)
+    /// without applying them. `false` (the default) is live.
+    pub shadow: bool,
 }

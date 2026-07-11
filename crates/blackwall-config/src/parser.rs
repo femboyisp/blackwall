@@ -28,6 +28,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut xdp: Option<XdpConfig> = None;
     let mut stateless_tcp_ports: Vec<u16> = Vec::new();
     let mut pops: Vec<PopEntry> = Vec::new();
+    let mut shadow = false;
 
     let mut i = 0;
     while i < lines.len() {
@@ -772,6 +773,16 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     }
                 }
             }
+            "shadow" => {
+                if line.words.len() > 1 {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "shadow",
+                        value: line.words[1..].join(" "),
+                    });
+                }
+                shadow = true;
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -816,6 +827,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         flowtable,
         xdp,
         stateless_tcp_ports,
+        shadow,
     })
 }
 
@@ -1686,6 +1698,23 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
     fn metrics_listen_absent_is_none() {
         let p = parse_text("interface wan eth0\n").unwrap();
         assert_eq!(p.metrics_listen, None);
+    }
+
+    #[test]
+    fn parses_shadow_directive() {
+        let p = parse_text("interface wan eth0\nshadow\n").unwrap();
+        assert!(p.shadow);
+    }
+
+    #[test]
+    fn shadow_defaults_false() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert!(!p.shadow);
+    }
+
+    #[test]
+    fn shadow_rejects_trailing_tokens() {
+        assert!(parse_text("interface wan eth0\nshadow rtbh\n").is_err());
     }
 
     #[test]

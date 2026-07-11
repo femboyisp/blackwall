@@ -35,6 +35,7 @@ fn sample() -> Policy {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: Vec::new(),
+        shadow: false,
     }
 }
 
@@ -92,6 +93,7 @@ fn stale_set_elements_removed_on_second_apply() {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: Vec::new(),
+        shadow: false,
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 

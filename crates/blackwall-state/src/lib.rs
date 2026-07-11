@@ -1871,6 +1871,7 @@ mod tests {
             flowtable: None,
             xdp: None,
             stateless_tcp_ports: Vec::new(),
+            shadow: false,
         }
     }
 
@@ -1909,6 +1910,7 @@ mod tests {
             flowtable: None,
             xdp: None,
             stateless_tcp_ports: Vec::new(),
+            shadow: false,
         }
     }
 
