@@ -6,7 +6,7 @@
 //! (record format 1, header protocol 1) that etherparse can parse to an IP
 //! packet produce observations.  Everything else is skipped silently.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 
@@ -68,16 +68,23 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
     // Datagram envelope.
     let _version = cur.read_u32()?;
     let agent_addr_type = cur.read_u32()?;
-    let agent_addr_len: usize = match agent_addr_type {
-        1 => 4,
-        2 => 16,
+    let agent: IpAddr = match agent_addr_type {
+        1 => {
+            let b = cur.take(4)?;
+            IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+        }
+        2 => {
+            let b = cur.take(16)?;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(b);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
         t => {
             return Err(FlowError::Decode(format!(
                 "unknown sFlow agent address type {t}"
             )))
         }
     };
-    cur.take(agent_addr_len)?; // skip agent address
     let _sub_agent = cur.read_u32()?;
     let _sequence = cur.read_u32()?;
     let _uptime = cur.read_u32()?;
@@ -93,8 +100,8 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
         // real agents such as hsflowd). Other sample types (counters) are
         // skipped.
         match sample_type & 0xFFF {
-            1 => decode_flow_sample(sample_body, &mut observations)?,
-            3 => decode_expanded_flow_sample(sample_body, &mut observations)?,
+            1 => decode_flow_sample(sample_body, agent, &mut observations)?,
+            3 => decode_expanded_flow_sample(sample_body, agent, &mut observations)?,
             _ => continue,
         }
     }
@@ -107,7 +114,11 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
 /// Returns `Err(FlowError::Decode)` only when a length field in the sample
 /// runs past the sample body (structural truncation).  Non-raw records,
 /// non-Ethernet header protocols, and etherparse failures are skipped.
-fn decode_flow_sample(body: &[u8], out: &mut Vec<FlowObservation>) -> Result<(), FlowError> {
+fn decode_flow_sample(
+    body: &[u8],
+    agent: IpAddr,
+    out: &mut Vec<FlowObservation>,
+) -> Result<(), FlowError> {
     let mut cur = Cursor::new(body);
 
     let _sequence = cur.read_u32()?;
@@ -130,7 +141,7 @@ fn decode_flow_sample(body: &[u8], out: &mut Vec<FlowObservation>) -> Result<(),
             continue;
         }
 
-        if let Some(obs) = decode_raw_header_record(record_body, sampling_rate) {
+        if let Some(obs) = decode_raw_header_record(record_body, sampling_rate, agent) {
             out.push(obs);
         }
     }
@@ -146,6 +157,7 @@ fn decode_flow_sample(body: &[u8], out: &mut Vec<FlowObservation>) -> Result<(),
 /// decoded the same way as the regular path.
 fn decode_expanded_flow_sample(
     body: &[u8],
+    agent: IpAddr,
     out: &mut Vec<FlowObservation>,
 ) -> Result<(), FlowError> {
     let mut cur = Cursor::new(body);
@@ -172,7 +184,7 @@ fn decode_expanded_flow_sample(
             continue;
         }
 
-        if let Some(obs) = decode_raw_header_record(record_body, sampling_rate) {
+        if let Some(obs) = decode_raw_header_record(record_body, sampling_rate, agent) {
             out.push(obs);
         }
     }
@@ -181,7 +193,11 @@ fn decode_expanded_flow_sample(
 }
 
 /// Parse one raw-header record body and return an observation if possible.
-fn decode_raw_header_record(body: &[u8], sampling_rate: u32) -> Option<FlowObservation> {
+fn decode_raw_header_record(
+    body: &[u8],
+    sampling_rate: u32,
+    agent: IpAddr,
+) -> Option<FlowObservation> {
     let mut cur = Cursor::new(body);
 
     let header_protocol = cur.read_u32().ok()?;
@@ -234,6 +250,7 @@ fn decode_raw_header_record(body: &[u8], sampling_rate: u32) -> Option<FlowObser
         frame_len,
         sampling_rate,
         tcp_flags,
+        agent,
     })
 }
 
@@ -291,19 +308,23 @@ mod tests {
         v.to_be_bytes()
     }
 
-    /// Assemble a one-flow-sample sFlow v5 datagram around `header`.
-    fn sflow_datagram(header: &[u8], sampling_rate: u32) -> Vec<u8> {
+    /// Assemble the sFlow v5 envelope (version, agent address, sub-agent, seq,
+    /// uptime, num_samples=1) for a datagram carrying exactly one sample.
+    fn envelope(agent_addr_type: u32, agent_addr: &[u8]) -> Vec<u8> {
         let mut d = Vec::new();
         d.extend_from_slice(&be(5)); // version
-        d.extend_from_slice(&be(1)); // agent type ipv4
-        d.extend_from_slice(&[10, 0, 0, 1]); // agent addr
+        d.extend_from_slice(&be(agent_addr_type));
+        d.extend_from_slice(agent_addr);
         d.extend_from_slice(&be(0)); // sub agent
         d.extend_from_slice(&be(1)); // seq
         d.extend_from_slice(&be(1000)); // uptime
         d.extend_from_slice(&be(1)); // num_samples
+        d
+    }
 
-        // --- flow sample ---
-        // record (header) bytes, padded to 4-byte boundary
+    /// Build a regular (type 1) flow-sample body wrapping one raw-header
+    /// record around `header`, padded to a 4-byte boundary.
+    fn flow_sample_body(header: &[u8], sampling_rate: u32) -> Vec<u8> {
         let header_len = header.len();
         let pad = (4 - (header_len % 4)) % 4;
         let mut rec = Vec::new();
@@ -326,11 +347,40 @@ mod tests {
         flow.extend_from_slice(&be(1)); // record_type = raw header
         flow.extend_from_slice(&be(u32::try_from(rec.len()).unwrap())); // record_length
         flow.extend_from_slice(&rec);
+        flow
+    }
 
+    /// Assemble a one-flow-sample sFlow v5 datagram with a given agent
+    /// address type/bytes around `header`.
+    fn datagram_with_agent(
+        agent_addr_type: u32,
+        agent_addr: &[u8],
+        header: &[u8],
+        sampling_rate: u32,
+    ) -> Vec<u8> {
+        let mut d = envelope(agent_addr_type, agent_addr);
+        let flow = flow_sample_body(header, sampling_rate);
         d.extend_from_slice(&be(1)); // sample_type = flow sample
         d.extend_from_slice(&be(u32::try_from(flow.len()).unwrap())); // sample_length
         d.extend_from_slice(&flow);
         d
+    }
+
+    /// Assemble a one-flow-sample sFlow v5 datagram around `header`.
+    fn sflow_datagram(header: &[u8], sampling_rate: u32) -> Vec<u8> {
+        datagram_with_agent(1, &[10, 0, 0, 1], header, sampling_rate)
+    }
+
+    /// Build a datagram with a given IPv4 agent address (addr type 1)
+    /// containing one raw-header flow sample.
+    fn build_test_datagram_v4_agent(agent: [u8; 4]) -> Vec<u8> {
+        datagram_with_agent(1, &agent, &sample_eth_ipv4_udp(), 1024)
+    }
+
+    /// Build a datagram with a given IPv6 agent address (addr type 2)
+    /// containing one raw-header flow sample.
+    fn build_test_datagram_v6_agent(agent: [u8; 16]) -> Vec<u8> {
+        datagram_with_agent(2, &agent, &sample_eth_ipv4_udp(), 1024)
     }
 
     /// Assemble a one-flow-sample sFlow v5 datagram using the EXPANDED (type-3)
@@ -491,5 +541,26 @@ mod tests {
         d.extend_from_slice(&be(0)); // num_samples
 
         assert!(decode_datagram(&d).is_err());
+    }
+
+    #[test]
+    fn decodes_agent_address_v4() {
+        // Build a datagram with agent 10.222.3.8 (addr type 1) containing one
+        // raw-header flow sample (reuse the existing sample-building helper).
+        let dg = build_test_datagram_v4_agent([10, 222, 3, 8]);
+        let obs = decode_datagram(&dg).unwrap();
+        assert!(!obs.is_empty());
+        assert!(obs
+            .iter()
+            .all(|o| o.agent == IpAddr::V4(Ipv4Addr::new(10, 222, 3, 8))));
+    }
+
+    #[test]
+    fn decodes_agent_address_v6() {
+        let dg =
+            build_test_datagram_v6_agent([0x2a, 0x12, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8]);
+        let obs = decode_datagram(&dg).unwrap();
+        assert!(!obs.is_empty());
+        assert!(obs.iter().all(|o| matches!(o.agent, IpAddr::V6(_))));
     }
 }

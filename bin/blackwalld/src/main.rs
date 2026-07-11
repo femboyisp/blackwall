@@ -154,6 +154,34 @@ enum Command {
         #[command(subcommand)]
         action: XdpCmd,
     },
+    /// POP sensor (hsflowd) config generation.
+    Sensor {
+        /// Which sensor action to perform.
+        #[command(subcommand)]
+        action: SensorCmd,
+    },
+}
+
+/// Operator actions for the `sensor` subcommand.
+#[derive(Subcommand)]
+enum SensorCmd {
+    /// Render an `hsflowd.conf` for each `pop` entry in the flow config.
+    ///
+    /// Prints one commented block per POP to stdout; redirect/split the output
+    /// to populate each POP's `/etc/hsflowd.conf`.
+    RenderHsflowd {
+        /// Path to the Blackwall (flow) config file (its `pop` directives are
+        /// the source of each agent's sampling rate).
+        #[arg(long)]
+        config: PathBuf,
+        /// The home `flow` daemon's sFlow collector address (`ip:port`), same
+        /// as the `flow --listen` address.
+        #[arg(long)]
+        collector: SocketAddr,
+        /// The network device each POP's hsflowd should sample (e.g. `eth0`).
+        #[arg(long)]
+        iface: String,
+    },
 }
 
 /// Operator actions for the `xdp` subcommand.
@@ -1298,16 +1326,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|_| "DATABASE_URL must be set for the flow detector")?;
             let store = std::sync::Arc::new(blackwall_state::Store::connect(&database_url).await?);
             store.migrate().await?;
+            let agents = blackwall_flow::AgentRegistry::from_entries(&policy.pops);
             let detector = blackwall_flow::ThresholdDetector::new(
                 policy.prefixes.clone(),
                 pps_threshold,
                 bps_threshold,
                 window_secs * 1000,
                 hold_down_secs * 1000,
+                agents,
             );
 
             // Collector counters (sFlow datagrams / decode errors) for /metrics.
             let collector_metrics = std::sync::Arc::new(blackwall_flow::CollectorMetrics::new());
+            // Per-agent (POP) telemetry snapshot, refreshed once per collector
+            // tick and read by /metrics; the detector itself is owned by
+            // `run_collector` behind `Box<dyn Detector>` so this is the only
+            // way the metrics endpoint can see it.
+            let agent_snapshot: std::sync::Arc<std::sync::Mutex<Vec<blackwall_flow::AgentStat>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             // Captured inside the rtbh arm below so /metrics can report session state.
             let mut bgp_for_metrics: Option<blackwall_bgp::BgpHandle> = None;
 
@@ -1612,6 +1648,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     xdp: xdp_for_metrics.clone(),
                     stateless: None,
                     afxdp_udp_responses: afxdp_udp_metric.clone(),
+                    agent_stats: Some(agent_snapshot.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1623,6 +1660,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sink,
                 1000,
                 Some(collector_metrics),
+                Some(agent_snapshot),
             );
             let run_result = match xdp_shutdown {
                 // With XDP attached, race the collector against a shutdown signal
@@ -1676,6 +1714,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Rtbh { action } => run_rtbh(action).await,
         Command::Flowspec { action } => run_flowspec(action).await,
         Command::Xdp { action } => run_xdp(action).await,
+        Command::Sensor { action } => run_sensor(action),
         Command::Run {
             config,
             database_url,
@@ -1861,6 +1900,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     xdp: None,
                     stateless: Some(stateless_metrics.clone()),
                     afxdp_udp_responses: None,
+                    agent_stats: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -2281,6 +2321,41 @@ async fn run_xdp(action: XdpCmd) -> Result<(), Box<dyn std::error::Error>> {
             pin_dir,
         } => xdp_capture(count, duration, out, &pin_dir).await,
     }
+}
+
+/// Dispatch one `sensor` subcommand.
+fn run_sensor(action: SensorCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        SensorCmd::RenderHsflowd {
+            config,
+            collector,
+            iface,
+        } => sensor_render_hsflowd(&config, collector, &iface),
+    }
+}
+
+/// `sensor render-hsflowd`: parse `config` and print an `hsflowd.conf` block
+/// for each `pop` entry, addressed at `collector` and sampling `iface`.
+///
+/// This is CLI glue over [`blackwall_core::render_hsflowd_conf`] (which is
+/// unit-tested); it is coverage-excluded like the rest of the CLI dispatch
+/// layer.
+fn sensor_render_hsflowd(
+    config: &std::path::Path,
+    collector: SocketAddr,
+    iface: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = blackwall_config::parse_file(config)?;
+    let collector_ip = collector.ip().to_string();
+    let collector_port = collector.port();
+    for pop in &policy.pops {
+        println!("# --- POP {} (agent {}) ---", pop.name, pop.agent);
+        println!(
+            "{}",
+            blackwall_core::render_hsflowd_conf(iface, &collector_ip, collector_port, pop.sampling)
+        );
+    }
+    Ok(())
 }
 
 /// Require an `xdp` block in `config`, returning the parsed policy so a CLI

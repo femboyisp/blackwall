@@ -249,6 +249,8 @@ mod tests {
             proto,
             top_sources: vec![],
             top_ports,
+            pops: vec![],
+            top_source_blocks: vec![],
             severity: Severity::High,
             first_seen_ms: 0,
             last_seen_ms: 0,

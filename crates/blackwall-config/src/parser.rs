@@ -5,8 +5,8 @@ use crate::error::ConfigError;
 use crate::lexer::Line;
 use blackwall_core::{
     AllowRule, ApiConfig, BannerFluxConfig, DnsFluxConfig, EngineConfig, FlowSpecPolicy,
-    FlowTableConfig, L4Proto, Policy, PortState, RtbhPolicy, ServiceTarget, ShapeBandwidth,
-    ShapeRule, Tenant, XdpConfig, XdpMode,
+    FlowTableConfig, L4Proto, Policy, PopEntry, PortState, RtbhPolicy, ServiceTarget,
+    ShapeBandwidth, ShapeRule, Tenant, XdpConfig, XdpMode,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -27,6 +27,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut flowtable: Option<FlowTableConfig> = None;
     let mut xdp: Option<XdpConfig> = None;
     let mut stateless_tcp_ports: Vec<u16> = Vec::new();
+    let mut pops: Vec<PopEntry> = Vec::new();
 
     let mut i = 0;
     while i < lines.len() {
@@ -488,6 +489,90 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 })?;
                 api = Some(ApiConfig { listen, token_file });
             }
+            "pop" => {
+                let name = line.words.get(1).ok_or_else(|| ConfigError::BadValue {
+                    line: line.number,
+                    what: "pop name",
+                    value: String::new(),
+                })?;
+                let mut agent: Option<IpAddr> = None;
+                let mut sampling: Option<u32> = None;
+                for tok in &line.words[2..] {
+                    let (k, v) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                        line: line.number,
+                        what: "pop",
+                        value: tok.as_str().to_owned(),
+                    })?;
+                    match k {
+                        "agent" => {
+                            agent = Some(v.parse().map_err(|_| ConfigError::BadValue {
+                                line: line.number,
+                                what: "pop agent",
+                                value: v.to_owned(),
+                            })?);
+                        }
+                        "sampling" => {
+                            sampling = Some(v.parse().map_err(|_| ConfigError::BadValue {
+                                line: line.number,
+                                what: "pop sampling",
+                                value: v.to_owned(),
+                            })?);
+                        }
+                        _ => {
+                            return Err(ConfigError::BadValue {
+                                line: line.number,
+                                what: "pop key",
+                                value: k.to_owned(),
+                            });
+                        }
+                    }
+                }
+                let agent = agent.ok_or_else(|| ConfigError::BadValue {
+                    line: line.number,
+                    what: "pop missing agent",
+                    value: name.as_str().to_owned(),
+                })?;
+                let sampling = sampling.ok_or_else(|| ConfigError::BadValue {
+                    line: line.number,
+                    what: "pop missing sampling",
+                    value: name.as_str().to_owned(),
+                })?;
+                // POP names become a Prometheus label value verbatim
+                // (`blackwall_flow_pop_last_seen_seconds{pop="<name>"}`), so
+                // restrict the charset to close a label-escaping hazard.
+                if !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "pop name",
+                        value: name.as_str().to_owned(),
+                    });
+                }
+                // A duplicate agent IP or POP name breaks `/metrics` (two
+                // series with the same `pop` label make Prometheus reject
+                // the whole scrape), so fail fast at parse time.
+                if pops.iter().any(|p| p.agent == agent) {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "pop",
+                        value: "duplicate agent".to_owned(),
+                    });
+                }
+                if pops.iter().any(|p| p.name == *name) {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "pop",
+                        value: "duplicate name".to_owned(),
+                    });
+                }
+                pops.push(PopEntry {
+                    name: name.as_str().to_owned(),
+                    agent,
+                    sampling,
+                });
+            }
             "engine" => {
                 let bad = |what: &'static str, v: &str| ConfigError::BadValue {
                     line: line.number,
@@ -726,6 +811,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         flowspec,
         metrics_listen,
         api,
+        pops,
         engine,
         flowtable,
         xdp,
@@ -2042,6 +2128,68 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
         };
         assert!(e.to_string().contains("line 3"));
         assert!(e.to_string().contains("baz"));
+    }
+
+    #[test]
+    fn parses_pop_directive() {
+        let p = parse_text(
+            "interface wan eth0\npop ord agent=10.222.3.8 sampling=1000\npop fra agent=10.222.4.8 sampling=500\n",
+        )
+        .unwrap();
+        assert_eq!(p.pops.len(), 2);
+        assert_eq!(p.pops[0].name, "ord");
+        assert_eq!(
+            p.pops[0].agent,
+            "10.222.3.8".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(p.pops[0].sampling, 1000);
+        assert_eq!(p.pops[1].name, "fra");
+    }
+
+    #[test]
+    fn pop_rejects_duplicate_agent() {
+        let err = parse_text(
+            "interface wan eth0\npop ord agent=10.222.3.8 sampling=1000\npop fra agent=10.222.3.8 sampling=500\n",
+        )
+        .expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "pop", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pop_rejects_duplicate_name() {
+        let err = parse_text(
+            "interface wan eth0\npop ord agent=10.222.3.8 sampling=1000\npop ord agent=10.222.4.8 sampling=500\n",
+        )
+        .expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "pop", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pop_rejects_bad_name() {
+        let err = parse_text("interface wan eth0\npop or:d agent=10.222.3.8 sampling=1000\n")
+            .expect_err("should fail");
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "pop name",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pop_requires_agent_and_sampling() {
+        assert!(parse_text("interface wan eth0\npop ord agent=10.222.3.8\n").is_err());
+        assert!(parse_text("interface wan eth0\npop ord sampling=1000\n").is_err());
     }
 
     #[test]

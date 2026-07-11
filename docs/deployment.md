@@ -179,6 +179,50 @@ install steps above) for this to work.
   `blackwall_stateless_udp_responses_total` on the `run` daemon's `/metrics`;
   `blackwall_xdp_syn_cookies_sent_total` on the `flow` daemon's `/metrics`.
 
+## POP sensor (sFlow)
+Anycast POPs are not `blackwalld` hosts: each POP runs `hsflowd` (host-sflow)
+to sample its uplink and export sFlow v5/UDP to the home `flow` daemon, which
+does the actual detection. The flow config is the single source of truth for
+which POPs exist and how they sample — a `pop` directive per POP:
+```
+pop ord agent=10.222.3.8 sampling=1000
+pop fra agent=10.222.4.8 sampling=500
+```
+`agent=` is the POP's mesh IP (the address hsflowd stamps as the sFlow agent
+on every datagram — this is how the collector attributes traffic back to a
+POP); `sampling=` is that POP's configured 1-in-N packet sampling rate. The
+`flow` daemon builds its `AgentRegistry` from these entries: every
+`FlowObservation` is tagged with the originating POP, and an agent sending at
+a rate wildly different from its configured `sampling` trips the
+sampling-sanity clamp.
+
+Generate each POP's `hsflowd.conf` from the same config, so the POP-map and
+the deployed sensors never drift apart:
+```bash
+blackwalld sensor render-hsflowd \
+  --config /etc/blackwall/blackwall.conf \
+  --collector <home-flow-mesh-ip>:6343 \
+  --iface eth0
+```
+This prints one commented block per `pop` entry:
+```
+# --- POP ord (agent 10.222.3.8) ---
+sflow {
+  sampling = 1000
+  polling = 0
+  collector { ip = <home-flow-mesh-ip>  udpport = 6343 }
+  pcap { dev = eth0 }
+}
+```
+Split the output and install the right block as `/etc/hsflowd.conf` on each
+POP (`--iface` is the device to sample there — usually the uplink NIC, not
+necessarily the same name on every POP host). `--collector` must match the
+`flow --listen` address of the home daemon and be reachable from every POP —
+in practice this means sFlow v5/UDP traverses the WireGuard mesh, so the
+POP's firewall/routes must permit outbound UDP to the collector over the WG
+interface, and the home box's config must accept it (`flow --listen
+0.0.0.0:6343` or scoped to the mesh interface).
+
 ## Not yet implemented (know before you rely on it)
 - **No AF_XDP zero-copy path yet.** B1 (XDP source-drop + rate-limit) and B2
   (stateless SYN cookies, both the userspace tier and the in-XDP fast path

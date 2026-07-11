@@ -6,7 +6,9 @@
 //!   cargo test -p blackwall-flow --test interop -- detects_volumetric_attack --ignored --nocapture
 
 use async_trait::async_trait;
-use blackwall_flow::{run_collector, DetectionEvent, MitigationSink, ThresholdDetector};
+use blackwall_flow::{
+    run_collector, AgentRegistry, DetectionEvent, MitigationSink, ThresholdDetector,
+};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -104,12 +106,14 @@ async fn detects_volumetric_attack() {
         1e15,
         1000,
         2000,
+        AgentRegistry::default(),
     );
     let collector = tokio::spawn(run_collector(
         listen,
         Box::new(detector),
         sink.clone(),
         1000,
+        None,
         None,
     ));
     tokio::time::sleep(Duration::from_millis(300)).await; // let the collector bind
@@ -145,10 +149,18 @@ async fn detects_live_sflow_attack() {
         f64::INFINITY, // bps not gated here
         1000,          // window_ms
         2000,          // hold_down_ms
+        AgentRegistry::default(),
     ));
     let sink = Arc::new(CountingSink::default());
     let listen: SocketAddr = "127.0.0.1:6343".parse().expect("addr");
-    tokio::spawn(run_collector(listen, detector, sink.clone(), 250, None));
+    tokio::spawn(run_collector(
+        listen,
+        detector,
+        sink.clone(),
+        250,
+        None,
+        None,
+    ));
 
     // Poll for hsflowd's real samples to drive an Opened event.
     for _ in 0..120 {

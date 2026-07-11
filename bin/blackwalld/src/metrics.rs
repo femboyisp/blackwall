@@ -4,10 +4,22 @@
 //! there is no auth or TLS. Enabled by the `metrics listen=<ip:port>` directive.
 
 use blackwall_metrics::{render_prometheus, render_xdp_metrics, Metric, MetricKind, XdpMetrics};
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// Current wall-clock time in ms since epoch; `0` if the clock is somehow
+/// before the epoch. Used only to compute the per-POP last-seen-seconds
+/// gauge at scrape time.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
 
 /// Everything the scrape handler reads at request time. Cheap to clone (an
 /// `Arc<Store>`, a cloneable `BgpHandle`, an `Arc<CollectorMetrics>`).
@@ -29,6 +41,9 @@ pub(crate) struct MetricsSources {
     /// AF_XDP UDP responder replies-sent counter (sub-project B3.2); `None`
     /// when the AF_XDP UDP responder is disabled (`afxdp-udp-ports` empty).
     pub afxdp_udp_responses: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Per-POP agent telemetry snapshot, refreshed once per collector tick;
+    /// `None` outside the flow daemon (no sFlow collector, no agents).
+    pub agent_stats: Option<Arc<std::sync::Mutex<Vec<blackwall_flow::AgentStat>>>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -221,6 +236,83 @@ fn xdp_block(sources: &MetricsSources) -> Option<String> {
     }))
 }
 
+/// Render the per-POP telemetry blocks (`blackwall_flow_pop_last_seen_seconds`,
+/// `blackwall_flow_agent_sampling_mismatch_total`) plus the
+/// `blackwall_flow_unknown_agent_observations_total` scalar, or `None` when the
+/// flow daemon has no per-agent snapshot wired up (`sources.agent_stats` is
+/// `None` — the deception engine, which has no sFlow collector).
+///
+/// POP names are dynamic labels unknown at compile time, so — like
+/// [`xdp_block`]'s `reason` label — this hand-writes the exposition text
+/// directly rather than going through [`Metric`], which only carries a
+/// `&'static str` name. `now_ms` is the current wall-clock time, used to
+/// turn each POP's last-seen timestamp into an age in seconds.
+fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
+    let snapshot = sources.agent_stats.as_ref()?;
+    let mut stats: Vec<blackwall_flow::AgentStat> = match snapshot.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    // Deterministic scrape output regardless of HashMap iteration order.
+    stats.sort_by(|a, b| a.pop.cmp(&b.pop));
+
+    let mut out = String::new();
+    if !stats.is_empty() {
+        let _ = writeln!(
+            out,
+            "# HELP blackwall_flow_pop_last_seen_seconds Seconds since this POP's sFlow agent was last observed"
+        );
+        let _ = writeln!(out, "# TYPE blackwall_flow_pop_last_seen_seconds gauge");
+        for s in &stats {
+            let age_secs = now_ms.saturating_sub(s.last_seen_ms) / 1000;
+            let _ = writeln!(
+                out,
+                "blackwall_flow_pop_last_seen_seconds{{pop=\"{}\"}} {age_secs}",
+                s.pop
+            );
+        }
+        let _ = writeln!(
+            out,
+            "\n# HELP blackwall_flow_agent_sampling_mismatch_total Sampling-rate mismatches clamped per POP"
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE blackwall_flow_agent_sampling_mismatch_total counter"
+        );
+        for s in &stats {
+            let _ = writeln!(
+                out,
+                "blackwall_flow_agent_sampling_mismatch_total{{pop=\"{}\"}} {}",
+                s.pop, s.mismatches
+            );
+        }
+    }
+
+    // Always emitted (a single scalar, not per-label) so the series exists
+    // even before any known agent has been observed.
+    let unknown = sources
+        .collector
+        .as_ref()
+        .map_or(0, |c| c.unknown_agent_observations());
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_flow_unknown_agent_observations_total sFlow sample observations from agents not in the POP map."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_flow_unknown_agent_observations_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "blackwall_flow_unknown_agent_observations_total {unknown}"
+    );
+
+    Some(out)
+}
+
 /// Serve `/metrics` forever. Each connection is handled on its own task so a
 /// slow client cannot block scrapes; a bind failure disables the endpoint (and
 /// is logged) without taking down the daemon.
@@ -261,6 +353,12 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
                 body.push('\n');
             }
             body.push_str(&xdp);
+        }
+        if let Some(agent) = agent_stats_block(sources, now_ms()) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&agent);
         }
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

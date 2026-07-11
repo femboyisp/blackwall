@@ -1,13 +1,13 @@
 //! Thin UDP collector: receive sFlow datagrams, decode, feed the detector, and
 //! forward detection events to the sink on a timer. Coverage-excluded.
 
-use crate::detector::Detector;
+use crate::detector::{AgentStat, Detector};
 use crate::error::FlowError;
 use crate::metrics::CollectorMetrics;
 use crate::sflow::decode_datagram;
 use crate::sink::MitigationSink;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 
@@ -24,14 +24,22 @@ fn now_ms() -> u64 {
 /// window and forwards events to `sink`. Decode errors are logged and skipped.
 ///
 /// When `metrics` is `Some`, the collector increments `datagrams` per received
-/// datagram and `decode_errors` per decode failure, for the `/metrics`
-/// endpoint. Callers with no metrics endpoint pass `None`.
+/// datagram and `decode_errors` per decode failure, and (after each tick)
+/// publishes the detector's cumulative unknown-agent observation count, for
+/// the `/metrics` endpoint. Callers with no metrics endpoint pass `None`.
+///
+/// When `agent_snapshot` is `Some`, the collector overwrites it with
+/// `detector.agent_stats()` after each tick, so `/metrics` can render
+/// per-POP gauges without reaching into the detector directly (it is owned
+/// here behind `Box<dyn Detector>`). Callers with no per-agent metrics pass
+/// `None`.
 pub async fn run_collector(
     listen: SocketAddr,
     mut detector: Box<dyn Detector + Send>,
     sink: Arc<dyn MitigationSink>,
     tick_interval_ms: u64,
     metrics: Option<Arc<CollectorMetrics>>,
+    agent_snapshot: Option<Arc<Mutex<Vec<AgentStat>>>>,
 ) -> Result<(), FlowError> {
     let sock = UdpSocket::bind(listen)
         .await
@@ -59,7 +67,14 @@ pub async fn run_collector(
                 }
             }
             _ = ticker.tick() => {
-                for event in detector.tick(now_ms()) {
+                let events = detector.tick(now_ms());
+                if let Some(snapshot) = &agent_snapshot {
+                    *snapshot.lock().unwrap() = detector.agent_stats();
+                }
+                if let Some(m) = &metrics {
+                    m.set_unknown_agent_observations(detector.unknown_agent_observations());
+                }
+                for event in events {
                     sink.handle(&event).await;
                 }
             }
