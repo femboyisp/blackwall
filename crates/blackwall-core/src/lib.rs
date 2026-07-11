@@ -6,6 +6,7 @@ mod engine;
 mod flowspec;
 mod flowtable;
 mod flux;
+mod hsflowd;
 mod md5secret;
 mod policy;
 mod pop;
@@ -26,6 +27,7 @@ pub use engine::{
 pub use flowspec::FlowSpecPolicy;
 pub use flowtable::FlowTableConfig;
 pub use flux::BannerFluxConfig;
+pub use hsflowd::render_hsflowd_conf;
 pub use md5secret::Md5Secret;
 pub use policy::{AllowRule, Policy, Tenant};
 pub use pop::PopEntry;

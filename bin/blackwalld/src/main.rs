@@ -154,6 +154,34 @@ enum Command {
         #[command(subcommand)]
         action: XdpCmd,
     },
+    /// POP sensor (hsflowd) config generation.
+    Sensor {
+        /// Which sensor action to perform.
+        #[command(subcommand)]
+        action: SensorCmd,
+    },
+}
+
+/// Operator actions for the `sensor` subcommand.
+#[derive(Subcommand)]
+enum SensorCmd {
+    /// Render an `hsflowd.conf` for each `pop` entry in the flow config.
+    ///
+    /// Prints one commented block per POP to stdout; redirect/split the output
+    /// to populate each POP's `/etc/hsflowd.conf`.
+    RenderHsflowd {
+        /// Path to the Blackwall (flow) config file (its `pop` directives are
+        /// the source of each agent's sampling rate).
+        #[arg(long)]
+        config: PathBuf,
+        /// The home `flow` daemon's sFlow collector address (`ip:port`), same
+        /// as the `flow --listen` address.
+        #[arg(long)]
+        collector: SocketAddr,
+        /// The network device each POP's hsflowd should sample (e.g. `eth0`).
+        #[arg(long)]
+        iface: String,
+    },
 }
 
 /// Operator actions for the `xdp` subcommand.
@@ -1686,6 +1714,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Rtbh { action } => run_rtbh(action).await,
         Command::Flowspec { action } => run_flowspec(action).await,
         Command::Xdp { action } => run_xdp(action).await,
+        Command::Sensor { action } => run_sensor(action),
         Command::Run {
             config,
             database_url,
@@ -2292,6 +2321,41 @@ async fn run_xdp(action: XdpCmd) -> Result<(), Box<dyn std::error::Error>> {
             pin_dir,
         } => xdp_capture(count, duration, out, &pin_dir).await,
     }
+}
+
+/// Dispatch one `sensor` subcommand.
+fn run_sensor(action: SensorCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        SensorCmd::RenderHsflowd {
+            config,
+            collector,
+            iface,
+        } => sensor_render_hsflowd(&config, collector, &iface),
+    }
+}
+
+/// `sensor render-hsflowd`: parse `config` and print an `hsflowd.conf` block
+/// for each `pop` entry, addressed at `collector` and sampling `iface`.
+///
+/// This is CLI glue over [`blackwall_core::render_hsflowd_conf`] (which is
+/// unit-tested); it is coverage-excluded like the rest of the CLI dispatch
+/// layer.
+fn sensor_render_hsflowd(
+    config: &std::path::Path,
+    collector: SocketAddr,
+    iface: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = blackwall_config::parse_file(config)?;
+    let collector_ip = collector.ip().to_string();
+    let collector_port = collector.port();
+    for pop in &policy.pops {
+        println!("# --- POP {} (agent {}) ---", pop.name, pop.agent);
+        println!(
+            "{}",
+            blackwall_core::render_hsflowd_conf(iface, &collector_ip, collector_port, pop.sampling)
+        );
+    }
+    Ok(())
 }
 
 /// Require an `xdp` block in `config`, returning the parsed policy so a CLI
