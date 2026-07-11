@@ -2,6 +2,7 @@
 
 mod api;
 mod metrics;
+mod shadow;
 
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -770,11 +771,14 @@ async fn bgp_supervisor(mut states: tokio::sync::watch::Receiver<blackwall_bgp::
 
 /// Runs until `rx` is closed (i.e. for the process's lifetime, since the
 /// paired `ChannelSink`'s sender is held by the running collector).
-async fn rtbh_manager_task(
-    mut manager: blackwall_rtbh::RtbhManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+async fn rtbh_manager_task<B, J>(
+    mut manager: blackwall_rtbh::RtbhManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
-) {
+) where
+    B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
+    J: blackwall_rtbh::manager::BlackholeJournal + Send + 'static,
+{
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -814,11 +818,14 @@ async fn rtbh_manager_task(
 /// still-pending `add` for the same target (the operator's remove is the
 /// newer intent and must win over a not-yet-applied add), then marks this
 /// row `applied`.
-async fn apply_request(
-    manager: &mut blackwall_rtbh::RtbhManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+async fn apply_request<B, J>(
+    manager: &mut blackwall_rtbh::RtbhManager<B, J>,
     request_store: &blackwall_state::Store,
     req: blackwall_state::RtbhRequestRow,
-) {
+) where
+    B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
+    J: blackwall_rtbh::manager::BlackholeJournal + Send + 'static,
+{
     match req.action.as_str() {
         "add" => match manager.apply_add(req.target, mono_now(), wall_now()).await {
             blackwall_rtbh::ApplyOutcome::Applied => {
@@ -878,11 +885,14 @@ async fn apply_request(
 ///
 /// Runs until `rx` is closed (i.e. for the process's lifetime, since the
 /// paired `SelectorSink`'s sender is held by the running collector).
-async fn flowspec_manager_task(
-    mut manager: blackwall_rtbh::FlowSpecManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+async fn flowspec_manager_task<B, J>(
+    mut manager: blackwall_rtbh::FlowSpecManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::FlowMitigationEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
-) {
+) where
+    B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
+    J: blackwall_rtbh::flowspec_manager::FlowSpecJournal + Send + 'static,
+{
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -930,11 +940,14 @@ async fn flowspec_manager_task(
 /// `pending` (retried on the next tick); `Rejected` marks it `rejected` with
 /// the reason. For `"remove"`: withdraws the flow, supersedes any other
 /// still-pending `add` for the same flow key, then marks this row `applied`.
-async fn apply_flowspec_request(
-    manager: &mut blackwall_rtbh::FlowSpecManager<blackwall_bgp::BgpHandle, blackwall_state::Store>,
+async fn apply_flowspec_request<B, J>(
+    manager: &mut blackwall_rtbh::FlowSpecManager<B, J>,
     request_store: &blackwall_state::Store,
     req: blackwall_state::FlowSpecRequestRow,
-) {
+) where
+    B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
+    J: blackwall_rtbh::flowspec_manager::FlowSpecJournal + Send + 'static,
+{
     let rule = blackwall_bgp::FlowSpecRule {
         dst: host_prefix(req.dst),
         protocol: Some(req.proto),
@@ -996,12 +1009,12 @@ async fn apply_flowspec_request(
 /// controller can never overflow a map.
 const XDP_MAX_ENTRIES: usize = 65_536;
 
-/// The concrete [`blackwall_xdp::manager::XdpManager`] the daemon runs: a
-/// shared attached data plane as executor and the Postgres journal as mirror.
-type DaemonXdpManager = blackwall_xdp::manager::XdpManager<
-    std::sync::Arc<blackwall_xdp::XdpDataplane>,
-    blackwall_state::PgXdpJournal,
->;
+/// The [`blackwall_xdp::manager::XdpManager`] the daemon runs: an executor
+/// that is either the live attached data plane or (in shadow mode)
+/// [`shadow::XdpExec::Shadow`], plus a journal `J` that is the Postgres
+/// mirror ([`blackwall_state::PgXdpJournal`]) live, or the all-no-op
+/// [`blackwall_xdp::NoOpXdpJournal`] in shadow (so the mirror stays empty).
+type DaemonXdpManager<J> = blackwall_xdp::manager::XdpManager<shadow::XdpExec, J>;
 
 /// Build an [`ipnet::IpNet`] from a stored address + optional prefix length,
 /// falling back to a host route (`/32`/`/128`) when the length is absent.
@@ -1057,12 +1070,14 @@ fn xdp_entry_to_action(
 /// When `auto_enabled` is false (no `default-rate-limit` configured) detection
 /// events are still drained off the channel but ignored — only operator CLI
 /// requests populate the maps. Runs until `rx` is closed.
-async fn xdp_manager_task(
-    mut manager: DaemonXdpManager,
+async fn xdp_manager_task<J>(
+    mut manager: DaemonXdpManager<J>,
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
     auto_enabled: bool,
-) {
+) where
+    J: blackwall_xdp::XdpJournal + 'static,
+{
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -1193,11 +1208,13 @@ fn afxdp_udp_responder_loop(
 /// it `pending` (retried on the next tick); `Rejected` marks it `rejected`.
 /// `unblock`/`clear_rate`: always applies, then marks `applied`. Unknown
 /// actions are logged and left untouched.
-async fn apply_xdp_request(
-    manager: &mut DaemonXdpManager,
+async fn apply_xdp_request<J>(
+    manager: &mut DaemonXdpManager<J>,
     request_store: &blackwall_state::Store,
     req: blackwall_state::XdpRequestRow,
-) {
+) where
+    J: blackwall_xdp::XdpJournal,
+{
     use blackwall_xdp::manager::ApplyOutcome;
 
     let mark = |id: i64, status: &'static str| async move {
@@ -1322,6 +1339,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             hold_down_secs,
         } => {
             let policy = blackwall_config::parse_file(&config)?;
+            if policy.shadow {
+                tracing::warn!(
+                    "SHADOW MODE — mitigations are LOGGED, NOT APPLIED (RTBH/FlowSpec/XDP)"
+                );
+            }
             let database_url = std::env::var("DATABASE_URL")
                 .map_err(|_| "DATABASE_URL must be set for the flow detector")?;
             let store = std::sync::Arc::new(blackwall_state::Store::connect(&database_url).await?);
@@ -1346,6 +1368,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             // Captured inside the rtbh arm below so /metrics can report session state.
             let mut bgp_for_metrics: Option<blackwall_bgp::BgpHandle> = None;
+            // Shared shadow-mode counters: fed by the RTBH/FlowSpec managers
+            // below (when `policy.shadow`) and by the XDP shadow gate, read by
+            // the metrics endpoint. Built unconditionally — harmless all-zero
+            // counters when shadow mode is off.
+            let shadow_metrics = std::sync::Arc::new(shadow::ShadowMetrics::default());
 
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
             {
@@ -1354,47 +1381,73 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let pg_sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> =
                         std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store.clone()));
 
-                    let peer = blackwall_bgp::PeerConfig {
-                        local_asn: rtbh.local_asn,
-                        peer_asn: rtbh.peer_asn,
-                        peer_addr: rtbh.peer_addr,
-                        router_id: rtbh.router_id,
-                        hold_time: 90,
-                        md5: rtbh.md5.as_ref().map(|s| s.reveal().to_owned()),
-                        gtsm_hops: rtbh.gtsm_hops,
-                    };
-                    // `BgpHandle` is a cloneable mpsc sender; both the RTBH and
-                    // (optionally) FlowSpec managers share the one iBGP session.
-                    let (bgp, _bgp_join) = blackwall_bgp::spawn(peer)?;
-                    // Supervise the session: log loudly when it leaves Established
-                    // (mitigations aren't reaching the peer) — issue #79.
-                    tokio::spawn(bgp_supervisor(bgp.state_watch()));
-                    bgp_for_metrics = Some(bgp.clone());
                     let controller =
                         blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
-                    let journal: blackwall_state::Store = (*store).clone();
-                    let mut manager =
-                        blackwall_rtbh::RtbhManager::new(controller, bgp.clone(), journal);
-
-                    // Rehydrate the controller from the announced mirror before
-                    // this session starts accepting new detections/requests.
-                    let mirror = store.list_active_blackholes().await?;
-                    let rehydrate_rows: Vec<(IpAddr, u64, blackwall_rtbh::BlackholeOrigin)> =
-                        mirror
-                            .into_iter()
-                            .map(|row| {
-                                let origin = match row.origin.as_str() {
-                                    "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
-                                    _ => blackwall_rtbh::BlackholeOrigin::Auto,
-                                };
-                                (row.target, row.announced_at_ms, origin)
-                            })
-                            .collect();
-                    manager.rehydrate(rehydrate_rows, mono_now()).await;
-
                     let channel_cap = rtbh.max_blackholes.max(1024);
                     let (tx, rx) = mpsc::channel::<blackwall_flow::DetectionEvent>(channel_cap);
-                    tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+
+                    // The live BGP handle, threaded to the FlowSpec
+                    // construction below so its live branch reuses this same
+                    // iBGP session. `None` in shadow mode (no real session is
+                    // spawned) — which is exactly what the FlowSpec match keys
+                    // off, so there is no implicit cross-block invariant.
+                    let live_bgp: Option<blackwall_bgp::BgpHandle> = if policy.shadow {
+                        let recorder =
+                            shadow::AuditShadowRecorder::new(store.clone(), shadow_metrics.clone());
+                        let exec = blackwall_rtbh::ShadowBgpExecutor::new(recorder);
+                        let manager = blackwall_rtbh::RtbhManager::new(
+                            controller,
+                            exec,
+                            blackwall_rtbh::NoOpJournal,
+                        );
+                        // No rehydrate: the shadow mirror is intentionally
+                        // empty — nothing was ever really announced, so there
+                        // is nothing to replay.
+                        tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+                        None
+                    } else {
+                        let peer = blackwall_bgp::PeerConfig {
+                            local_asn: rtbh.local_asn,
+                            peer_asn: rtbh.peer_asn,
+                            peer_addr: rtbh.peer_addr,
+                            router_id: rtbh.router_id,
+                            hold_time: 90,
+                            md5: rtbh.md5.as_ref().map(|s| s.reveal().to_owned()),
+                            gtsm_hops: rtbh.gtsm_hops,
+                        };
+                        // `BgpHandle` is a cloneable mpsc sender; both the RTBH
+                        // and (optionally) FlowSpec managers share the one
+                        // iBGP session.
+                        let (bgp, _bgp_join) = blackwall_bgp::spawn(peer)?;
+                        // Supervise the session: log loudly when it leaves
+                        // Established (mitigations aren't reaching the peer)
+                        // — issue #79.
+                        tokio::spawn(bgp_supervisor(bgp.state_watch()));
+                        bgp_for_metrics = Some(bgp.clone());
+                        let journal: blackwall_state::Store = (*store).clone();
+                        let mut manager =
+                            blackwall_rtbh::RtbhManager::new(controller, bgp.clone(), journal);
+
+                        // Rehydrate the controller from the announced mirror
+                        // before this session starts accepting new
+                        // detections/requests.
+                        let mirror = store.list_active_blackholes().await?;
+                        let rehydrate_rows: Vec<(IpAddr, u64, blackwall_rtbh::BlackholeOrigin)> =
+                            mirror
+                                .into_iter()
+                                .map(|row| {
+                                    let origin = match row.origin.as_str() {
+                                        "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
+                                        _ => blackwall_rtbh::BlackholeOrigin::Auto,
+                                    };
+                                    (row.target, row.announced_at_ms, origin)
+                                })
+                                .collect();
+                        manager.rehydrate(rehydrate_rows, mono_now()).await;
+
+                        tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+                        Some(bgp)
+                    };
 
                     match policy.flowspec.clone() {
                         // RTBH-only: today's behaviour, Fanout([Pg, Channel→rtbh]).
@@ -1406,48 +1459,82 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 channel_sink,
                             ]))
                         }
-                        // RTBH + FlowSpec: build a second single-owner manager off
-                        // the SAME BGP session and route detections through a
-                        // SelectorSink instead of the plain RTBH ChannelSink.
+                        // RTBH + FlowSpec: build a second single-owner manager
+                        // (shadow or, off the SAME live BGP session, real) and
+                        // route detections through a SelectorSink instead of
+                        // the plain RTBH ChannelSink.
                         Some(fs) => {
                             let fs_controller = blackwall_rtbh::FlowSpecController::new(
                                 flowspec_config_from(&policy, &fs),
                             );
-                            let fs_journal: blackwall_state::Store = (*store).clone();
-                            let mut fs_manager = blackwall_rtbh::FlowSpecManager::new(
-                                fs_controller,
-                                bgp,
-                                fs_journal,
-                            );
-
-                            // Rehydrate FlowSpec rules from the announced mirror.
-                            let fs_mirror = store.list_active_flowspec().await?;
-                            let fs_rehydrate: Vec<(
-                                blackwall_bgp::FlowSpecRule,
-                                u64,
-                                blackwall_rtbh::BlackholeOrigin,
-                            )> = fs_mirror
-                                .into_iter()
-                                .map(|row| {
-                                    let origin = match row.origin.as_str() {
-                                        "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
-                                        _ => blackwall_rtbh::BlackholeOrigin::Auto,
-                                    };
-                                    let rule = blackwall_bgp::FlowSpecRule {
-                                        dst: host_prefix(row.dst),
-                                        protocol: Some(row.proto),
-                                        dst_port: Some(row.dst_port),
-                                        action: blackwall_bgp::FlowAction::TrafficRate(row.rate),
-                                    };
-                                    (rule, row.announced_at_ms, origin)
-                                })
-                                .collect();
-                            fs_manager.rehydrate(fs_rehydrate, mono_now()).await;
-
                             let fs_cap = fs.max_rules.max(1024);
                             let (fs_tx, fs_rx) =
                                 mpsc::channel::<blackwall_flow::FlowMitigationEvent>(fs_cap);
-                            tokio::spawn(flowspec_manager_task(fs_manager, fs_rx, store.clone()));
+
+                            // Reuse the live BGP handle from the RTBH branch
+                            // (`Some` on the live path, `None` in shadow mode).
+                            // Matching the real value here removes the earlier
+                            // cross-block `.expect()` on `bgp_for_metrics`.
+                            match live_bgp {
+                                None => {
+                                    let recorder = shadow::AuditShadowRecorder::new(
+                                        store.clone(),
+                                        shadow_metrics.clone(),
+                                    );
+                                    let exec = blackwall_rtbh::ShadowBgpExecutor::new(recorder);
+                                    let fs_manager = blackwall_rtbh::FlowSpecManager::new(
+                                        fs_controller,
+                                        exec,
+                                        blackwall_rtbh::NoOpJournal,
+                                    );
+                                    // No rehydrate: shadow mirror stays empty.
+                                    tokio::spawn(flowspec_manager_task(
+                                        fs_manager,
+                                        fs_rx,
+                                        store.clone(),
+                                    ));
+                                }
+                                Some(bgp) => {
+                                    let fs_journal: blackwall_state::Store = (*store).clone();
+                                    let mut fs_manager = blackwall_rtbh::FlowSpecManager::new(
+                                        fs_controller,
+                                        bgp,
+                                        fs_journal,
+                                    );
+
+                                    // Rehydrate FlowSpec rules from the announced mirror.
+                                    let fs_mirror = store.list_active_flowspec().await?;
+                                    let fs_rehydrate: Vec<(
+                                        blackwall_bgp::FlowSpecRule,
+                                        u64,
+                                        blackwall_rtbh::BlackholeOrigin,
+                                    )> = fs_mirror
+                                        .into_iter()
+                                        .map(|row| {
+                                            let origin = match row.origin.as_str() {
+                                                "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
+                                                _ => blackwall_rtbh::BlackholeOrigin::Auto,
+                                            };
+                                            let rule = blackwall_bgp::FlowSpecRule {
+                                                dst: host_prefix(row.dst),
+                                                protocol: Some(row.proto),
+                                                dst_port: Some(row.dst_port),
+                                                action: blackwall_bgp::FlowAction::TrafficRate(
+                                                    row.rate,
+                                                ),
+                                            };
+                                            (rule, row.announced_at_ms, origin)
+                                        })
+                                        .collect();
+                                    fs_manager.rehydrate(fs_rehydrate, mono_now()).await;
+
+                                    tokio::spawn(flowspec_manager_task(
+                                        fs_manager,
+                                        fs_rx,
+                                        store.clone(),
+                                    ));
+                                }
+                            }
 
                             let selection = blackwall_flow::SelectionConfig {
                                 concentration: fs.concentration,
@@ -1600,32 +1687,64 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             XDP_MAX_ENTRIES,
                             default_pps,
                         );
-                        let journal = blackwall_state::PgXdpJournal::new(store.clone());
-                        let mut manager = blackwall_xdp::manager::XdpManager::new(
-                            controller,
-                            dataplane.clone(),
-                            journal,
-                        );
-
-                        // Rehydrate the controller + maps from the active mirror
-                        // (blocks and rate limits, burst included) before this
-                        // session accepts new detections/requests.
-                        let rows: Vec<_> = store
-                            .xdp_active()
-                            .await?
-                            .iter()
-                            .filter_map(xdp_entry_to_action)
-                            .collect();
-                        manager.reapply_active(rows).await;
-
                         let (xdp_tx, xdp_rx) =
                             mpsc::channel::<blackwall_flow::DetectionEvent>(4096);
-                        let handle = tokio::spawn(xdp_manager_task(
-                            manager,
-                            xdp_rx,
-                            store.clone(),
-                            auto_enabled,
-                        ));
+
+                        // Shadow mode swaps BOTH I/O seams of the manager, so
+                        // the session touches neither the eBPF maps nor the
+                        // `xdp_entries` mirror:
+                        //   * executor  → `ShadowXdpExecutor` (records + meters,
+                        //     never writes a map), and
+                        //   * journal    → `NoOpXdpJournal` (persists nothing),
+                        // and it SKIPS rehydrate — the shadow mirror is
+                        // intentionally empty, so there is nothing to reapply
+                        // (and reapplying would re-log stale rows as "would
+                        // mitigate"). This mirrors the RTBH/FlowSpec shadow
+                        // arms. When `!policy.shadow`, the live path
+                        // (`XdpExec::Live` + `PgXdpJournal` + rehydrate) is
+                        // exactly as before.
+                        let handle = if policy.shadow {
+                            let executor = shadow::XdpExec::Shadow(shadow::ShadowXdpExecutor::new(
+                                store.clone(),
+                                shadow_metrics.clone(),
+                            ));
+                            let manager = blackwall_xdp::manager::XdpManager::new(
+                                controller,
+                                executor,
+                                blackwall_xdp::NoOpXdpJournal,
+                            );
+                            // No rehydrate: the shadow mirror is intentionally empty.
+                            tokio::spawn(xdp_manager_task(
+                                manager,
+                                xdp_rx,
+                                store.clone(),
+                                auto_enabled,
+                            ))
+                        } else {
+                            let executor = shadow::XdpExec::Live(dataplane.clone());
+                            let journal = blackwall_state::PgXdpJournal::new(store.clone());
+                            let mut manager = blackwall_xdp::manager::XdpManager::new(
+                                controller, executor, journal,
+                            );
+
+                            // Rehydrate the controller + maps from the active
+                            // mirror (blocks and rate limits, burst included)
+                            // before this session accepts new detections/requests.
+                            let rows: Vec<_> = store
+                                .xdp_active()
+                                .await?
+                                .iter()
+                                .filter_map(xdp_entry_to_action)
+                                .collect();
+                            manager.reapply_active(rows).await;
+
+                            tokio::spawn(xdp_manager_task(
+                                manager,
+                                xdp_rx,
+                                store.clone(),
+                                auto_enabled,
+                            ))
+                        };
                         xdp_shutdown = Some((handle, dataplane));
 
                         tracing::info!(interface = %iface, auto = auto_enabled, "XDP data plane attached");
@@ -1649,6 +1768,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     stateless: None,
                     afxdp_udp_responses: afxdp_udp_metric.clone(),
                     agent_stats: Some(agent_snapshot.clone()),
+                    shadow: Some(shadow_metrics.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1901,6 +2021,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     stateless: Some(stateless_metrics.clone()),
                     afxdp_udp_responses: None,
                     agent_stats: None,
+                    shadow: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }

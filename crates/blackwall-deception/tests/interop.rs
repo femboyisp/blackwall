@@ -123,6 +123,7 @@ async fn serves_deception_banner() {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: Vec::new(),
+        shadow: false,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
@@ -189,6 +190,7 @@ async fn serves_deception_under_load() {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: Vec::new(),
+        shadow: false,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
@@ -277,6 +279,7 @@ fn serves_stateless_syn_cookie() {
         // The stateless-tier port under test (Component 2c wiring): deception
         // TCP on 8080 is routed to the engine's NFQUEUE instead of tproxy.
         stateless_tcp_ports: vec![8080],
+        shadow: false,
     };
 
     // Apply the REAL nft ruleset: stateless-tcp TCP on 8080 -> nfqueue
@@ -361,6 +364,7 @@ fn serves_stateless_syn_cookie_v6() {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: vec![8080],
+        shadow: false,
     };
 
     blackwall_nft::apply(&policy).expect("nft apply");

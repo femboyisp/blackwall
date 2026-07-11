@@ -7,6 +7,7 @@ pub mod controller;
 pub mod flowspec_controller;
 pub mod flowspec_manager;
 pub mod manager;
+pub mod shadow;
 
 pub use controller::{BlackholeOrigin, RtbhAction, RtbhConfig, RtbhController};
 pub use flowspec_controller::{FlowKey, FlowSpecAction, FlowSpecConfig, FlowSpecController};
@@ -14,6 +15,7 @@ pub use flowspec_manager::{FlowSpecJournal, FlowSpecManager};
 pub use manager::{
     ApplyOutcome, BgpError, BgpExecutor, BlackholeJournal, JournalError, RtbhManager,
 };
+pub use shadow::{NoOpJournal, ShadowAction, ShadowBgpExecutor, ShadowRecorder};
 
 /// Executes BGP commands against a live session via [`blackwall_bgp::BgpHandle`].
 #[async_trait::async_trait]

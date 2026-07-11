@@ -13,7 +13,8 @@ pub use capture::{XdpCapture, DEFAULT_CAPTURE_PIN_DIR};
 pub use control::{XdpAction, XdpController, XdpOrigin};
 pub use dataplane::{XdpDataplane, XdpError, XdpStats};
 pub use manager::{
-    ApplyOutcome, XdpExecError, XdpExecutor, XdpJournal, XdpJournalError, XdpManager,
+    ApplyOutcome, NoOpXdpJournal, XdpExecError, XdpExecutor, XdpJournal, XdpJournalError,
+    XdpManager,
 };
 pub use pcap::{to_pcap, CapturedPacket};
 pub use sink::XdpMitigationSink;

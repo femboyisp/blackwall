@@ -7,6 +7,7 @@
 #   - transport/{tproxy,nfqueue}.rs   TPROXY transparent sockets, NFQUEUE + raw sockets
 #   - blackwall-nft/src/apply.rs      nftables kernel apply
 #   - blackwalld/src/main.rs          daemon process/runtime glue
+#   - blackwalld/src/shadow.rs        shadow-mode audit/log/meter I/O glue
 #   - discovery/src/{incus_client,proc_io}.rs   Incus unix-socket + /proc readers
 #   - speedtest/src/providers/*_net.rs          live HTTP/TCP speedtest fetchers
 #   - blackwall-lab/src/{exec/*,cli,bin/lab}.rs   netns/process orchestration (needs CAP_NET_ADMIN)
@@ -28,6 +29,6 @@
 # Extra args are forwarded to cargo llvm-cov (e.g. --html, --summary-only).
 set -euo pipefail
 
-EXCLUDE='(transport/(tproxy|nfqueue)\.rs|blackwall-nft/src/apply\.rs|blackwalld/src/(main|metrics|api)\.rs|discovery/src/incus_client\.rs|discovery/src/proc_io\.rs|speedtest/src/providers/.*_net\.rs|shaper/src/apply\.rs|dns/src/send_net\.rs|flow/src/collector_net\.rs|bgp/src/session_net\.rs|blackwall-lab/src/exec/.*\.rs|blackwall-lab/src/cli\.rs|blackwall-lab/src/bin/lab\.rs|blackwall-trafficgen/src/io/.*\.rs|blackwall-trafficgen/src/bin/.*\.rs|blackwall-xdp/src/dataplane\.rs|blackwall-xdp/src/afxdp\.rs|blackwall-xdp/src/capture\.rs)'
+EXCLUDE='(transport/(tproxy|nfqueue)\.rs|blackwall-nft/src/apply\.rs|blackwalld/src/(main|metrics|api|shadow)\.rs|discovery/src/incus_client\.rs|discovery/src/proc_io\.rs|speedtest/src/providers/.*_net\.rs|shaper/src/apply\.rs|dns/src/send_net\.rs|flow/src/collector_net\.rs|bgp/src/session_net\.rs|blackwall-lab/src/exec/.*\.rs|blackwall-lab/src/cli\.rs|blackwall-lab/src/bin/lab\.rs|blackwall-trafficgen/src/io/.*\.rs|blackwall-trafficgen/src/bin/.*\.rs|blackwall-xdp/src/dataplane\.rs|blackwall-xdp/src/afxdp\.rs|blackwall-xdp/src/capture\.rs)'
 
 exec cargo llvm-cov --workspace --fail-under-lines 90 --ignore-filename-regex "$EXCLUDE" "$@"
