@@ -178,13 +178,20 @@ impl ThresholdDetector {
 
 impl Detector for ThresholdDetector {
     fn observe(&mut self, obs: &FlowObservation, now_ms: u64) {
-        self.agent_last_seen.insert(obs.agent, now_ms);
-
-        // Sampling sanity: clamp an agent whose reported rate deviates far from
-        // its configured expected rate (guards volume math + collector against a
-        // misconfigured POP). Unknown agents are trusted as-is.
+        // Liveness + sampling sanity are tracked ONLY for agents known to the
+        // registry. The sFlow agent address is attacker-controlled, unauthenticated
+        // application-layer data; keying the liveness/mismatch maps on arbitrary
+        // (possibly spoofed) addresses would let a UDP sender grow them without
+        // bound (memory DoS). Restricting to configured POPs bounds both maps to
+        // the number of known agents, and an unknown agent's "liveness" is
+        // meaningless anyway. Unknown agents are trusted as-is for the volume math.
         let effective_rate = match self.agents.expected_sampling(obs.agent) {
             Some(expected) => {
+                self.agent_last_seen.insert(obs.agent, now_ms);
+
+                // Clamp an agent whose reported rate deviates far from its
+                // configured expected rate (guards the volume math + collector
+                // against a misconfigured POP), and count the mismatch.
                 let lo = expected / 4;
                 let hi = expected.saturating_mul(4);
                 if obs.sampling_rate < lo || obs.sampling_rate > hi {
@@ -791,6 +798,37 @@ mod tests {
             5_000,
         );
         assert_eq!(det.agent_last_seen().get(&agent_ip(8)), Some(&5_000));
+    }
+
+    #[test]
+    fn unknown_agent_not_tracked() {
+        // Only agent_ip(8) is registered. An observation from an unregistered
+        // (possibly spoofed) agent must NOT grow the liveness or mismatch maps —
+        // otherwise an unauthenticated UDP sender could exhaust memory.
+        let reg = AgentRegistry::from_entries(&[PopEntry {
+            name: "ord".into(),
+            agent: agent_ip(8),
+            sampling: 1000,
+        }]);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0,
+            1.0,
+            10_000,
+            30_000,
+            reg,
+        );
+
+        // Unknown agent with a wildly-off rate: still untracked and trusted as-is.
+        det.observe(
+            &agent_obs(agent_ip(200), "198.51.100.5", "203.0.113.9", 1, 100),
+            5_000,
+        );
+
+        assert_eq!(det.agent_last_seen().get(&agent_ip(200)), None);
+        assert!(det.agent_last_seen().is_empty());
+        assert_eq!(det.sampling_mismatches().get(&agent_ip(200)), None);
+        assert!(det.sampling_mismatches().is_empty());
     }
 
     #[test]
