@@ -421,6 +421,8 @@ mod tests {
                 .map(|s| (s.parse::<IpAddr>().unwrap(), 1.0))
                 .collect(),
             top_ports: vec![],
+            pops: vec![],
+            top_source_blocks: vec![],
             severity: Severity::High,
             first_seen_ms: 0,
             last_seen_ms: 0,

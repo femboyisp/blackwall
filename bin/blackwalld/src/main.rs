@@ -1298,16 +1298,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|_| "DATABASE_URL must be set for the flow detector")?;
             let store = std::sync::Arc::new(blackwall_state::Store::connect(&database_url).await?);
             store.migrate().await?;
+            let agents = blackwall_flow::AgentRegistry::from_entries(&policy.pops);
             let detector = blackwall_flow::ThresholdDetector::new(
                 policy.prefixes.clone(),
                 pps_threshold,
                 bps_threshold,
                 window_secs * 1000,
                 hold_down_secs * 1000,
+                agents,
             );
 
             // Collector counters (sFlow datagrams / decode errors) for /metrics.
             let collector_metrics = std::sync::Arc::new(blackwall_flow::CollectorMetrics::new());
+            // Per-agent (POP) telemetry snapshot, refreshed once per collector
+            // tick and read by /metrics; the detector itself is owned by
+            // `run_collector` behind `Box<dyn Detector>` so this is the only
+            // way the metrics endpoint can see it.
+            let agent_snapshot: std::sync::Arc<std::sync::Mutex<Vec<blackwall_flow::AgentStat>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             // Captured inside the rtbh arm below so /metrics can report session state.
             let mut bgp_for_metrics: Option<blackwall_bgp::BgpHandle> = None;
 
@@ -1612,6 +1620,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     xdp: xdp_for_metrics.clone(),
                     stateless: None,
                     afxdp_udp_responses: afxdp_udp_metric.clone(),
+                    agent_stats: Some(agent_snapshot.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -1623,6 +1632,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sink,
                 1000,
                 Some(collector_metrics),
+                Some(agent_snapshot),
             );
             let run_result = match xdp_shutdown {
                 // With XDP attached, race the collector against a shutdown signal
@@ -1861,6 +1871,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     xdp: None,
                     stateless: Some(stateless_metrics.clone()),
                     afxdp_udp_responses: None,
+                    agent_stats: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }

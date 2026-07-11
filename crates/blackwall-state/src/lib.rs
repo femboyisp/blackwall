@@ -1827,6 +1827,8 @@ mod tests {
             proto: 17,
             top_sources: vec![("198.51.100.5".parse().unwrap(), 40_000.0)],
             top_ports: vec![(53, 40_000.0)],
+            pops: vec![],
+            top_source_blocks: vec![],
             severity: Severity::Critical,
             first_seen_ms,
             last_seen_ms,

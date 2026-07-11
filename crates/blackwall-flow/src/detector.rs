@@ -96,6 +96,33 @@ pub trait Detector {
 
     /// Advance time to `now_ms`, evict stale samples, and return any new events.
     fn tick(&mut self, now_ms: u64) -> Vec<DetectionEvent>;
+
+    /// Per-agent telemetry for the metrics endpoint; default empty for
+    /// detectors without a notion of registered agents.
+    fn agent_stats(&self) -> Vec<AgentStat> {
+        Vec::new()
+    }
+
+    /// Count of observations attributed to an agent absent from the POP
+    /// registry; default zero for detectors without a notion of registered
+    /// agents.
+    fn unknown_agent_observations(&self) -> u64 {
+        0
+    }
+}
+
+/// Per-POP telemetry snapshot for the metrics endpoint: one entry per agent
+/// known to the [`AgentRegistry`](crate::agents::AgentRegistry), refreshed
+/// once per collector tick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentStat {
+    /// POP name for this agent, as configured in the registry.
+    pub pop: String,
+    /// Timestamp (ms since epoch) this agent was last observed.
+    pub last_seen_ms: u64,
+    /// Count of samples from this agent whose reported sampling rate was
+    /// clamped because it deviated far from the agent's expected rate.
+    pub mismatches: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +167,7 @@ pub struct ThresholdDetector {
     agents: crate::agents::AgentRegistry,
     agent_last_seen: HashMap<IpAddr, u64>,
     sampling_mismatches: HashMap<IpAddr, u64>,
+    unknown_agent_observations: u64,
 }
 
 impl ThresholdDetector {
@@ -172,6 +200,7 @@ impl ThresholdDetector {
             agents,
             agent_last_seen: HashMap::new(),
             sampling_mismatches: HashMap::new(),
+            unknown_agent_observations: 0,
         }
     }
 
@@ -212,7 +241,10 @@ impl Detector for ThresholdDetector {
                     obs.sampling_rate
                 }
             }
-            None => obs.sampling_rate,
+            None => {
+                self.unknown_agent_observations = self.unknown_agent_observations.saturating_add(1);
+                obs.sampling_rate
+            }
         };
 
         if !self.prefixes.iter().any(|p| p.contains(&obs.dst)) {
@@ -347,6 +379,21 @@ impl Detector for ThresholdDetector {
         }
 
         events
+    }
+
+    fn agent_stats(&self) -> Vec<AgentStat> {
+        self.agent_last_seen
+            .iter()
+            .map(|(&addr, &last_seen_ms)| AgentStat {
+                pop: self.agents.name(addr).to_owned(),
+                last_seen_ms,
+                mismatches: self.sampling_mismatches.get(&addr).copied().unwrap_or(0),
+            })
+            .collect()
+    }
+
+    fn unknown_agent_observations(&self) -> u64 {
+        self.unknown_agent_observations
     }
 }
 
@@ -940,6 +987,92 @@ mod tests {
 
         assert_eq!(det.sampling_mismatches().get(&agent_ip(8)), Some(&1));
         assert_eq!(det.sampling_mismatches().get(&agent_ip(9)), None);
+    }
+
+    #[test]
+    fn agent_stats_reports_known_agent_last_seen_and_mismatches() {
+        let reg = AgentRegistry::from_entries(&[PopEntry {
+            name: "ord".into(),
+            agent: agent_ip(8),
+            sampling: 1000,
+        }]);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0,
+            1.0,
+            10_000,
+            30_000,
+            reg,
+        );
+        // Rogue rate (1) vs expected 1000 -> clamped, one mismatch recorded.
+        det.observe(
+            &agent_obs(agent_ip(8), "198.51.100.5", "203.0.113.9", 1, 100),
+            5_000,
+        );
+
+        let stats = det.agent_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].pop, "ord");
+        assert_eq!(stats[0].last_seen_ms, 5_000);
+        assert_eq!(stats[0].mismatches, 1);
+    }
+
+    #[test]
+    fn agent_stats_excludes_unknown_agents() {
+        let reg = AgentRegistry::from_entries(&[PopEntry {
+            name: "ord".into(),
+            agent: agent_ip(8),
+            sampling: 1000,
+        }]);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0,
+            1.0,
+            10_000,
+            30_000,
+            reg,
+        );
+        det.observe(
+            &agent_obs(agent_ip(200), "198.51.100.5", "203.0.113.9", 1, 100),
+            5_000,
+        );
+        assert!(det.agent_stats().is_empty());
+    }
+
+    #[test]
+    fn unknown_agent_observations_counts_only_unregistered_agents() {
+        let reg = AgentRegistry::from_entries(&[PopEntry {
+            name: "ord".into(),
+            agent: agent_ip(8),
+            sampling: 1000,
+        }]);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0,
+            1.0,
+            10_000,
+            30_000,
+            reg,
+        );
+        assert_eq!(det.unknown_agent_observations(), 0);
+
+        // Known agent: does not count.
+        det.observe(
+            &agent_obs(agent_ip(8), "198.51.100.5", "203.0.113.9", 1000, 100),
+            1_000,
+        );
+        assert_eq!(det.unknown_agent_observations(), 0);
+
+        // Unknown agent: counts, twice.
+        det.observe(
+            &agent_obs(agent_ip(200), "198.51.100.6", "203.0.113.9", 1, 100),
+            1_000,
+        );
+        det.observe(
+            &agent_obs(agent_ip(201), "198.51.100.7", "203.0.113.9", 1, 100),
+            1_000,
+        );
+        assert_eq!(det.unknown_agent_observations(), 2);
     }
 
     #[test]
