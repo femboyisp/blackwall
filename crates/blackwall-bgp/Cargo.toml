@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+blackwall-core = { path = "../blackwall-core" }
 thiserror = { workspace = true }
 ipnet = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
@@ -15,6 +16,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+blackwall-config = { path = "../blackwall-config" }
 
 [lints]
 workspace = true

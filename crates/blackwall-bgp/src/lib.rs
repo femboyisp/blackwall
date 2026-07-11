@@ -3,6 +3,7 @@
 mod error;
 mod flowspec;
 mod message;
+mod render;
 mod route;
 mod session_net;
 mod update;
@@ -14,6 +15,7 @@ pub use message::{
     encode_notification, encode_open, parse_header, BgpMessage, MsgType, NotificationMsg, OpenMsg,
     HEADER_LEN, MARKER,
 };
+pub use render::{render_bird_ibgp, BirdGenError};
 pub use route::{Origin, Route};
 pub use session_net::{
     spawn, BgpHandle, BgpSendError, PeerConfig, PeerConfigError, SessionCommand, SessionState,
