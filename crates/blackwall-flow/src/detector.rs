@@ -33,6 +33,17 @@ pub enum Severity {
     Critical,
 }
 
+/// One POP's contribution to a detection within the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PopContribution {
+    /// POP name (or `"unknown"`).
+    pub pop: String,
+    /// Estimated packets/s this POP contributed.
+    pub est_pps: f64,
+    /// Estimated bits/s this POP contributed.
+    pub est_bps: f64,
+}
+
 /// A snapshot of an active attack against a single destination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
@@ -50,6 +61,10 @@ pub struct Detection {
     pub top_sources: Vec<(IpAddr, f64)>,
     /// Top-3 destination ports by estimated PPS, descending.
     pub top_ports: Vec<(u16, f64)>,
+    /// Per-POP contribution to this detection, by contributed PPS descending.
+    pub pops: Vec<PopContribution>,
+    /// Top attacker source blocks (/24 v4, /48 v6) by estimated PPS, descending.
+    pub top_source_blocks: Vec<(ipnet::IpNet, f64)>,
     /// Severity derived from `max(pps/threshold, bps/threshold)`.
     pub severity: Severity,
     /// Timestamp (ms since epoch) when this detection was first opened.
@@ -95,10 +110,6 @@ struct Sample {
     proto: u8,
     est_packets: u64,
     est_bytes: u64,
-    #[expect(
-        dead_code,
-        reason = "recorded per interface for future per-sample agent attribution (e.g. per-agent top-sources); not yet read by detector logic"
-    )]
     agent: IpAddr,
 }
 
@@ -299,6 +310,7 @@ impl Detector for ThresholdDetector {
                         window_secs,
                         first_seen_ms: state.first_seen_ms,
                         last_seen_ms: now_ms,
+                        agents: &self.agents,
                     });
                     events.push(DetectionEvent::Updated(detection));
                 } else {
@@ -314,6 +326,7 @@ impl Detector for ThresholdDetector {
                         window_secs,
                         first_seen_ms: now_ms,
                         last_seen_ms: now_ms,
+                        agents: &self.agents,
                     });
                     events.push(DetectionEvent::Opened(detection));
                 }
@@ -352,6 +365,7 @@ struct DetectionParams<'a> {
     window_secs: f64,
     first_seen_ms: u64,
     last_seen_ms: u64,
+    agents: &'a crate::agents::AgentRegistry,
 }
 
 /// Build a [`Detection`] from the current window of samples.
@@ -413,6 +427,51 @@ fn build_detection(p: DetectionParams<'_>) -> Detection {
         })
         .collect();
 
+    // Per-POP contribution: sum est per agent, name via the registry.
+    let mut pop_pkts: HashMap<IpAddr, (u128, u128)> = HashMap::new();
+    for s in p.samples {
+        let e = pop_pkts.entry(s.agent).or_insert((0, 0));
+        e.0 = e.0.saturating_add(u128::from(s.est_packets));
+        e.1 = e.1.saturating_add(u128::from(s.est_bytes));
+    }
+    let mut pops: Vec<PopContribution> = pop_pkts
+        .into_iter()
+        .map(|(agent, (pkts, bytes))| {
+            #[expect(clippy::cast_precision_loss, reason = "u128 sums to f64 rate estimate")]
+            let est_pps = pkts as f64 / p.window_secs;
+            #[expect(clippy::cast_precision_loss, reason = "u128 sums to f64 rate estimate")]
+            let est_bps = (bytes as f64) * 8.0 / p.window_secs;
+            PopContribution {
+                pop: p.agents.name(agent).to_owned(),
+                est_pps,
+                est_bps,
+            }
+        })
+        .collect();
+    pops.sort_by(|a, b| {
+        b.est_pps
+            .partial_cmp(&a.est_pps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Source-block rollup: /24 for v4, /48 for v6.
+    let mut block_pkts: HashMap<ipnet::IpNet, u128> = HashMap::new();
+    for s in p.samples {
+        let block = source_block(s.src);
+        let entry = block_pkts.entry(block).or_insert(0u128);
+        *entry = entry.saturating_add(u128::from(s.est_packets));
+    }
+    let mut top_source_blocks: Vec<(ipnet::IpNet, f64)> = block_pkts
+        .into_iter()
+        .map(|(net, pkts)| {
+            #[expect(clippy::cast_precision_loss, reason = "u128 sum to f64 rate estimate")]
+            let pps = pkts as f64 / p.window_secs;
+            (net, pps)
+        })
+        .collect();
+    top_source_blocks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top_source_blocks.truncate(5);
+
     // Severity.
     let r = f64::max(p.pps / p.pps_threshold, p.bps / p.bps_threshold);
     let severity = if r >= 10.0 {
@@ -431,9 +490,23 @@ fn build_detection(p: DetectionParams<'_>) -> Detection {
         proto,
         top_sources,
         top_ports,
+        pops,
+        top_source_blocks,
         severity,
         first_seen_ms: p.first_seen_ms,
         last_seen_ms: p.last_seen_ms,
+    }
+}
+
+/// The attacker source block for attribution: /24 for IPv4, /48 for IPv6.
+fn source_block(src: IpAddr) -> ipnet::IpNet {
+    match src {
+        IpAddr::V4(v4) => ipnet::Ipv4Net::new(v4, 24)
+            .map(|n| ipnet::IpNet::V4(n.trunc()))
+            .unwrap_or_else(|_| ipnet::IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap())),
+        IpAddr::V6(v6) => ipnet::Ipv6Net::new(v6, 48)
+            .map(|n| ipnet::IpNet::V6(n.trunc()))
+            .unwrap_or_else(|_| ipnet::IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap())),
     }
 }
 
@@ -867,5 +940,53 @@ mod tests {
 
         assert_eq!(det.sampling_mismatches().get(&agent_ip(8)), Some(&1));
         assert_eq!(det.sampling_mismatches().get(&agent_ip(9)), None);
+    }
+
+    #[test]
+    fn detection_tags_contributing_pops_and_source_blocks() {
+        let reg = AgentRegistry::from_entries(&[
+            blackwall_core::PopEntry {
+                name: "ord".into(),
+                agent: agent_ip(8),
+                sampling: 1,
+            },
+            blackwall_core::PopEntry {
+                name: "fra".into(),
+                agent: agent_ip(9),
+                sampling: 1,
+            },
+        ]);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0,
+            1.0,
+            10_000,
+            30_000,
+            reg,
+        );
+        // Two POPs each see traffic to the same victim from the same /24.
+        det.observe(
+            &agent_obs(agent_ip(8), "198.51.100.5", "203.0.113.9", 1, 100),
+            1_000,
+        );
+        det.observe(
+            &agent_obs(agent_ip(9), "198.51.100.6", "203.0.113.9", 1, 100),
+            1_000,
+        );
+        let ev = det.tick(1_000);
+        let d = ev
+            .iter()
+            .find_map(|e| match e {
+                DetectionEvent::Opened(d) => Some(d),
+                _ => None,
+            })
+            .expect("opened");
+        let names: Vec<&str> = d.pops.iter().map(|p| p.pop.as_str()).collect();
+        assert!(names.contains(&"ord") && names.contains(&"fra"));
+        // Both sources are in 198.51.100.0/24 → one rolled-up block.
+        assert_eq!(
+            d.top_source_blocks[0].0,
+            "198.51.100.0/24".parse::<ipnet::IpNet>().unwrap()
+        );
     }
 }
