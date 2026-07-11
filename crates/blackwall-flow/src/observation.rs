@@ -21,6 +21,8 @@ pub struct FlowObservation {
     pub sampling_rate: u32,
     /// TCP flag bits (0 if not TCP).
     pub tcp_flags: u8,
+    /// The sFlow agent (POP) address the sampled datagram came from.
+    pub agent: IpAddr,
 }
 
 #[cfg(test)]
@@ -39,6 +41,7 @@ mod tests {
             frame_len: 1500,
             sampling_rate: 1024,
             tcp_flags: 0,
+            agent: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         };
         let copy = o; // Copy
         assert_eq!(o, copy);

@@ -404,6 +404,7 @@ mod tests {
             frame_len: len,
             sampling_rate: rate,
             tcp_flags: 0,
+            agent: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         }
     }
 
