@@ -2,3 +2,5 @@
 .env
 .claude/
 
+.superpowers/
+docs/superpowers/
