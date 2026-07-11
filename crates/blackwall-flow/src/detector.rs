@@ -95,6 +95,11 @@ struct Sample {
     proto: u8,
     est_packets: u64,
     est_bytes: u64,
+    #[expect(
+        dead_code,
+        reason = "recorded per interface for future per-sample agent attribution (e.g. per-agent top-sources); not yet read by detector logic"
+    )]
+    agent: IpAddr,
 }
 
 /// Per-destination state tracked by [`ThresholdDetector`].
@@ -121,6 +126,9 @@ pub struct ThresholdDetector {
     window_ms: u64,
     hold_down_ms: u64,
     state: HashMap<IpAddr, DstState>,
+    agents: crate::agents::AgentRegistry,
+    agent_last_seen: HashMap<IpAddr, u64>,
+    sampling_mismatches: HashMap<IpAddr, u64>,
 }
 
 impl ThresholdDetector {
@@ -133,12 +141,15 @@ impl ThresholdDetector {
     /// - `bps_threshold` — bits per second above which an attack is declared.
     /// - `window_ms` — sliding window size in milliseconds for rate computation.
     /// - `hold_down_ms` — milliseconds below threshold before a detection is cleared.
+    /// - `agents` — registry of known sFlow agents and their expected sampling
+    ///   rates, used for liveness tracking and the sampling-sanity clamp.
     pub fn new(
         prefixes: Vec<IpNet>,
         pps_threshold: f64,
         bps_threshold: f64,
         window_ms: u64,
         hold_down_ms: u64,
+        agents: crate::agents::AgentRegistry,
     ) -> Self {
         Self {
             prefixes,
@@ -147,18 +158,51 @@ impl ThresholdDetector {
             window_ms,
             hold_down_ms,
             state: HashMap::new(),
+            agents,
+            agent_last_seen: HashMap::new(),
+            sampling_mismatches: HashMap::new(),
         }
+    }
+
+    /// Last-seen timestamp (ms) per agent, for liveness monitoring.
+    pub fn agent_last_seen(&self) -> &HashMap<IpAddr, u64> {
+        &self.agent_last_seen
+    }
+
+    /// Count of samples per agent whose reported sampling rate was clamped
+    /// because it deviated far from the agent's configured expected rate.
+    pub fn sampling_mismatches(&self) -> &HashMap<IpAddr, u64> {
+        &self.sampling_mismatches
     }
 }
 
 impl Detector for ThresholdDetector {
     fn observe(&mut self, obs: &FlowObservation, now_ms: u64) {
+        self.agent_last_seen.insert(obs.agent, now_ms);
+
+        // Sampling sanity: clamp an agent whose reported rate deviates far from
+        // its configured expected rate (guards volume math + collector against a
+        // misconfigured POP). Unknown agents are trusted as-is.
+        let effective_rate = match self.agents.expected_sampling(obs.agent) {
+            Some(expected) => {
+                let lo = expected / 4;
+                let hi = expected.saturating_mul(4);
+                if obs.sampling_rate < lo || obs.sampling_rate > hi {
+                    *self.sampling_mismatches.entry(obs.agent).or_insert(0) += 1;
+                    expected
+                } else {
+                    obs.sampling_rate
+                }
+            }
+            None => obs.sampling_rate,
+        };
+
         if !self.prefixes.iter().any(|p| p.contains(&obs.dst)) {
             return;
         }
 
-        let est_packets = u64::from(obs.sampling_rate);
-        let est_bytes = u64::from(obs.sampling_rate) * u64::from(obs.frame_len);
+        let est_packets = u64::from(effective_rate);
+        let est_bytes = u64::from(effective_rate) * u64::from(obs.frame_len);
 
         let entry = self.state.entry(obs.dst).or_insert_with(|| DstState {
             samples: Vec::new(),
@@ -174,6 +218,7 @@ impl Detector for ThresholdDetector {
             proto: obs.proto,
             est_packets,
             est_bytes,
+            agent: obs.agent,
         });
     }
 
@@ -392,6 +437,8 @@ fn build_detection(p: DetectionParams<'_>) -> Detection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::AgentRegistry;
+    use blackwall_core::PopEntry;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn obs(dst: [u8; 4], src: [u8; 4], rate: u32, len: u32) -> FlowObservation {
@@ -408,6 +455,32 @@ mod tests {
         }
     }
 
+    fn agent_ip(o: u8) -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 222, 0, o))
+    }
+
+    /// Test helper for agent-aware observations (distinct from `obs` above,
+    /// which predates agent-awareness and is kept for the existing tests).
+    fn agent_obs(
+        agent: std::net::IpAddr,
+        src: &str,
+        dst: &str,
+        rate: u32,
+        frame: u32,
+    ) -> FlowObservation {
+        FlowObservation {
+            src: src.parse().unwrap(),
+            dst: dst.parse().unwrap(),
+            proto: 17,
+            src_port: 1234,
+            dst_port: 53,
+            frame_len: frame,
+            sampling_rate: rate,
+            tcp_flags: 0,
+            agent,
+        }
+    }
+
     fn detector() -> ThresholdDetector {
         // prefix 203.0.113.0/24; pps threshold 100k; bps very high; window 1s; hold-down 2s
         ThresholdDetector::new(
@@ -416,6 +489,7 @@ mod tests {
             1e15,
             1000,
             2000,
+            AgentRegistry::default(),
         )
     }
 
@@ -570,6 +644,7 @@ mod tests {
             1e15, // impossibly high bps threshold
             0,    // zero window — the fix clamps this to 1ms
             2000,
+            AgentRegistry::default(),
         );
         // A modest number of samples that should not cross 1e15 threshold.
         for _ in 0..10 {
@@ -592,6 +667,7 @@ mod tests {
             1000.0, // bps very low
             1000,
             2000,
+            AgentRegistry::default(),
         );
         // 1 sample * rate=1 * frame_len=200 → est_bytes=200 → bps = 200*8/1 = 1600 > 1000
         d.observe(&obs([203, 0, 113, 8], [10, 0, 0, 1], 1, 200), 0);
@@ -611,6 +687,7 @@ mod tests {
             1.0, // very low bps threshold
             1000,
             2000,
+            AgentRegistry::default(),
         );
         let max_rate = u32::MAX;
         let max_len = u32::MAX;
@@ -637,5 +714,120 @@ mod tests {
             }
             other => panic!("expected Opened, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clamps_rogue_agent_sampling_to_expected() {
+        // A rogue agent reporting 1-in-1 (expected 1-in-1000) must be clamped to
+        // 1000, so its observed volume equals what a correctly-configured agent
+        // reporting 1-in-1000 would produce — NOT the ~1000x-inflated rogue value.
+        // Assert equality against a control detector fed the honest rate.
+        let window_ms = 1_000; // 1s window so bps math is a clean divisor.
+        let mk = || {
+            ThresholdDetector::new(
+                vec!["203.0.113.0/24".parse().unwrap()],
+                1.0,
+                1.0,
+                window_ms,
+                30_000,
+                AgentRegistry::from_entries(&[PopEntry {
+                    name: "ord".into(),
+                    agent: agent_ip(8),
+                    sampling: 1000,
+                }]),
+            )
+        };
+        // Rogue: claims sampling_rate=1; honest control: claims 1000.
+        let mut rogue = mk();
+        rogue.observe(
+            &agent_obs(agent_ip(8), "198.51.100.5", "203.0.113.9", 1, 100),
+            500,
+        );
+        let rogue_d = rogue
+            .tick(1_000)
+            .into_iter()
+            .find_map(|e| match e {
+                DetectionEvent::Opened(d) => Some(d),
+                _ => None,
+            })
+            .expect("rogue opened");
+
+        let mut honest = mk();
+        honest.observe(
+            &agent_obs(agent_ip(8), "198.51.100.5", "203.0.113.9", 1000, 100),
+            500,
+        );
+        let honest_d = honest
+            .tick(1_000)
+            .into_iter()
+            .find_map(|e| match e {
+                DetectionEvent::Opened(d) => Some(d),
+                _ => None,
+            })
+            .expect("honest opened");
+
+        // Clamp makes the rogue volume identical to the honest-rate volume.
+        assert_eq!(rogue_d.observed_bps, honest_d.observed_bps);
+        assert_eq!(rogue_d.observed_pps, honest_d.observed_pps);
+    }
+
+    #[test]
+    fn tracks_agent_last_seen() {
+        let reg = AgentRegistry::from_entries(&[PopEntry {
+            name: "ord".into(),
+            agent: agent_ip(8),
+            sampling: 1000,
+        }]);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0,
+            1.0,
+            10_000,
+            30_000,
+            reg,
+        );
+        det.observe(
+            &agent_obs(agent_ip(8), "198.51.100.5", "203.0.113.9", 1000, 100),
+            5_000,
+        );
+        assert_eq!(det.agent_last_seen().get(&agent_ip(8)), Some(&5_000));
+    }
+
+    #[test]
+    fn counts_sampling_mismatch() {
+        let reg = AgentRegistry::from_entries(&[
+            PopEntry {
+                name: "ord".into(),
+                agent: agent_ip(8),
+                sampling: 1000,
+            },
+            PopEntry {
+                name: "iad".into(),
+                agent: agent_ip(9),
+                sampling: 1000,
+            },
+        ]);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            1.0,
+            1.0,
+            10_000,
+            30_000,
+            reg,
+        );
+
+        // Rogue agent: reports rate=1, wildly outside [250, 4000] band for expected 1000.
+        det.observe(
+            &agent_obs(agent_ip(8), "198.51.100.5", "203.0.113.9", 1, 100),
+            1_000,
+        );
+        // Honest agent: reports the expected rate.
+        det.observe(
+            &agent_obs(agent_ip(9), "198.51.100.6", "203.0.113.9", 1000, 100),
+            1_000,
+        );
+
+        assert_eq!(det.sampling_mismatches().get(&agent_ip(8)), Some(&1));
+        assert_eq!(det.sampling_mismatches().get(&agent_ip(9)), None);
     }
 }
