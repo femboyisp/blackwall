@@ -337,6 +337,7 @@ name = "blackwall-flow"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blackwall-core",
  "etherparse",
  "ipnet",
  "thiserror 2.0.18",

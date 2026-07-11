@@ -58,6 +58,9 @@ pub struct Policy {
     pub metrics_listen: Option<std::net::SocketAddr>,
     /// Operations control API config (`api listen=`/`token-file=`); `None` disables it.
     pub api: Option<crate::ApiConfig>,
+    /// POP-map for anycast telemetry (`pop` directives); empty disables POP
+    /// naming/sanity (all agents tag as `"unknown"`).
+    pub pops: Vec<crate::PopEntry>,
     /// Deception-engine wiring (concurrency, timeout, TPROXY port, NFQUEUE number).
     /// Defaults if no `engine` directive is present.
     pub engine: crate::EngineConfig,

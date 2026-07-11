@@ -12,6 +12,7 @@ etherparse = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["time", "net", "sync"] }
 async-trait = { workspace = true }
+blackwall-core = { path = "../blackwall-core" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
