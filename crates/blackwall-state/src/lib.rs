@@ -305,6 +305,26 @@ impl Store {
         Ok(out)
     }
 
+    /// Append one row to the `audit_log`: `actor` performed `action`, with
+    /// structured `detail`. A standalone counterpart to the audit insert
+    /// embedded in [`Store::apply_policy`]'s transaction, for call sites
+    /// (e.g. shadow-mode mitigation recording) that have no transaction of
+    /// their own and just need a single durable audit row.
+    pub async fn record_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        detail: &serde_json::Value,
+    ) -> Result<(), StateError> {
+        sqlx::query("INSERT INTO audit_log (actor, action, detail) VALUES ($1, $2, $3)")
+            .bind(actor)
+            .bind(action)
+            .bind(detail)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Count audit-log entries.
     pub async fn audit_count(&self) -> Result<i64, StateError> {
         let row: (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log")
@@ -2065,5 +2085,34 @@ mod tests {
             recent_ten.iter().any(|r| r.actor == "audit-actor"),
             "one of our own apply_policy calls must appear among the 10 most recent audit rows"
         );
+    }
+
+    #[tokio::test]
+    async fn record_audit_appends_a_row_with_the_given_fields() {
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let _guard = DB_SERIAL_LOCK.lock().await;
+
+        let before = store.audit_count().await.expect("count before");
+        let detail = serde_json::json!({ "plane": "rtbh", "verb": "announce" });
+        store
+            .record_audit("shadow", "shadow.rtbh.announce", &detail)
+            .await
+            .expect("record_audit");
+        let after = store.audit_count().await.expect("count after");
+        assert_eq!(
+            after,
+            before + 1,
+            "record_audit must append exactly one row"
+        );
+
+        let recent = store.list_recent_audit(1).await.expect("list limit 1");
+        assert_eq!(recent[0].actor, "shadow");
+        assert_eq!(recent[0].action, "shadow.rtbh.announce");
+        assert_eq!(recent[0].detail, detail);
     }
 }

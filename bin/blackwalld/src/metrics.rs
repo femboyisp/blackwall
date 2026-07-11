@@ -44,6 +44,9 @@ pub(crate) struct MetricsSources {
     /// Per-POP agent telemetry snapshot, refreshed once per collector tick;
     /// `None` outside the flow daemon (no sFlow collector, no agents).
     pub agent_stats: Option<Arc<std::sync::Mutex<Vec<blackwall_flow::AgentStat>>>>,
+    /// Shadow-mode "would mitigate" counters (RTBH/FlowSpec/XDP); `None`
+    /// outside the flow daemon (no RTBH/FlowSpec/XDP managers to shadow).
+    pub shadow: Option<Arc<crate::shadow::ShadowMetrics>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -313,6 +316,38 @@ fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
     Some(out)
 }
 
+/// Render `blackwall_shadow_would_mitigate_total{plane,action}` from the
+/// shared shadow counters, or `None` when shadow counters aren't wired up
+/// (outside the flow daemon). Labels are a fixed, known-at-compile-time set
+/// (unlike [`agent_stats_block`]'s dynamic POP names), but still hand-written
+/// since [`Metric`] only carries unlabelled series.
+fn shadow_block(sources: &MetricsSources) -> Option<String> {
+    use std::sync::atomic::Ordering;
+
+    let shadow = sources.shadow.as_ref()?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_shadow_would_mitigate_total Mitigations that would have been applied under shadow mode, by plane and action"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_shadow_would_mitigate_total counter");
+    for (plane, action, counter) in [
+        ("rtbh", "announce", &shadow.rtbh_announce),
+        ("rtbh", "withdraw", &shadow.rtbh_withdraw),
+        ("flowspec", "announce", &shadow.flowspec_announce),
+        ("flowspec", "withdraw", &shadow.flowspec_withdraw),
+        ("xdp", "block", &shadow.xdp_block),
+        ("xdp", "rate_limit", &shadow.xdp_rate_limit),
+    ] {
+        let _ = writeln!(
+            out,
+            "blackwall_shadow_would_mitigate_total{{plane=\"{plane}\",action=\"{action}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        );
+    }
+    Some(out)
+}
+
 /// Serve `/metrics` forever. Each connection is handled on its own task so a
 /// slow client cannot block scrapes; a bind failure disables the endpoint (and
 /// is logged) without taking down the daemon.
@@ -359,6 +394,12 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
                 body.push('\n');
             }
             body.push_str(&agent);
+        }
+        if let Some(shadow) = shadow_block(sources) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&shadow);
         }
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

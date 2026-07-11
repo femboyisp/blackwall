@@ -1,7 +1,8 @@
 //! Audit-log helpers.
 
-// The append happens inside `Store::apply_policy`'s transaction (lib.rs).
-// `Store::audit_count` (lib.rs) is the first read accessor; richer queries
+// Appends happen inside `Store::apply_policy`'s transaction, or standalone
+// via `Store::record_audit` (both in lib.rs). `Store::audit_count` and
+// `Store::list_recent_audit` (lib.rs) are the read accessors; richer queries
 // land here as the API grows.
 
 /// One `audit_log` row.
