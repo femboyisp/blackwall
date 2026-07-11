@@ -7,19 +7,22 @@ service — scanners and attackers can't tell which ports are real. A port only 
 forwarded service when you explicitly open it (via a declarative config file, the API, or Incus
 auto-discovery); everything else is answered by an interactive honeypot engine that behaves like
 the real thing. Blackwall is built for high packet rates and multi-tenant hosting, with a fast
-nftables data plane and an on-box XDP/eBPF fast-drop + SYN-cookie path today, BGP scrubbing, and
-DNS fast-flux, with a zero-copy AF_XDP path on the roadmap.
+nftables data plane, an on-box XDP/eBPF fast-drop + in-kernel SYN-cookie path with a zero-copy
+AF_XDP responder, ISP-level BGP mitigation (RTBH + FlowSpec), and DNS fast-flux.
 
-> ⚠️ **Status:** active development. Sub-project **A** (deception firewall) is feature-complete
-> through M3 — the nftables data plane enforces deception (TPROXY/NFQUEUE → honeypot engine) and
-> real-service forwarding, with protocol emulators, Incus discovery, CAKE shaping, and DNS/banner
-> fast-flux — plus a stateless SYN-cookie deception tier (keyed SipHash cookies + a reflection-safe
-> UDP responder) for scan/flood volume. Sub-project **D** ships volumetric detection (D1), and **C**
-> (BGP control plane) ships RTBH end to end plus FlowSpec auto-mitigation. Sub-project **B** (the
-> XDP/eBPF DDoS data plane) ships its first two increments — an on-box XDP source-drop +
-> per-source rate-limiter (B1) and an in-kernel SYN-cookie fast path sharing its key with the
-> userspace tier (B2); a zero-copy AF_XDP path and the DDoS-lab XDP gate (B3–B4) are next. A·M4
-> (API/ops) remains. See the [Roadmap](#roadmap).
+> ⚠️ **Status:** active development, approaching a first live deployment. Sub-project **A**
+> (deception firewall) is feature-complete through M3 — the nftables data plane enforces deception
+> (TPROXY/NFQUEUE → honeypot engine) and real-service forwarding, with protocol emulators, Incus
+> discovery, CAKE shaping, and DNS/banner fast-flux — plus a stateless SYN-cookie deception tier
+> (keyed SipHash cookies + a reflection-safe UDP responder). Sub-project **B** (the XDP/eBPF DDoS
+> data plane) is **complete**: on-box source-drop + per-source rate-limit, in-kernel `XDP_TX` SYN
+> cookies (dual-stack), a zero-copy **AF_XDP** UDP responder, and xdpcap observability with a
+> DDoS-lab XDP gate. Sub-project **C** (BGP control plane) ships RTBH + FlowSpec auto-mitigation
+> end to end; **D** (detection) ships sFlow volumetric detection plus anycast-aware telemetry
+> ingest (per-POP identity, liveness, sampling sanity). **A·M4** (API & ops) has shipped its
+> Phase 1 read-only control API (axum + OpenAPI). Remaining: C scrubbing/deaggregation/dn42, D2
+> adaptive/L7 detection, A·M4 mutation/supervision, and the AS214806 deployment integration. See
+> the [Roadmap](#roadmap).
 
 ## How it works
 
@@ -27,7 +30,7 @@ Every `(IP, protocol, port)` across your prefixes is in exactly one of three sta
 
 | State | Behaviour |
 |-------|-----------|
-| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. An optional nftables **flowtable** offloads established forwarded flows to the kernel conntrack fast path (`flowtable devices=…`), and an optional **XDP** fast path (`xdp` directive) drops/rate-limits attack sources at the driver level; a zero-copy AF_XDP path is on the roadmap. |
+| **Open** | A real service — traffic is accepted (and DNAT'd to the backing host, VM, or container for `nat:` targets) by the nftables data plane. The deception engine never touches it. An optional nftables **flowtable** offloads established forwarded flows to the kernel conntrack fast path (`flowtable devices=…`), and an optional **XDP** fast path (`xdp` directive) drops/rate-limits attack sources at the driver level, with a zero-copy AF_XDP responder for the stateless UDP tier. |
 | **Deception** *(default)* | Looks open and alive. Closed ports answer a real TCP handshake and carry on a believable, protocol-aware conversation (SSH, HTTP, SMTP, databases, …) like an interactive honeypot — but nothing real is ever reached, and every probe is logged. Ports opted into the **stateless tier** (`stateless-tcp ports=…`) are instead answered with a keyed SYN-cookie handshake carrying no per-connection state, optionally fronted by an in-kernel XDP fast path (`xdp cookie-ports=…`) that answers the same cookie ahead of nftables. |
 | **Closed** | Silently dropped (e.g. management ports). |
 
@@ -49,7 +52,7 @@ deception) while real services stay stable.
 - **nftables data plane** — real traffic accepted/DNAT'd (`nat:` targets) with an optional flowtable
   fast path for established forwarded flows; deception traffic handed to userspace via TPROXY
   (interactive) or NFQUEUE (stateless SYN-cookie tier); an on-box XDP fast path (drop/rate-limit +
-  SYN cookies) already slots in ahead of it, with a zero-copy AF_XDP path still on the roadmap.
+  SYN cookies) already slots in ahead of it, plus a zero-copy AF_XDP responder for the UDP tier.
 - **Multi-tenant** — per-tenant IP/prefix ownership; tenants manage ports only on their own
   addresses, via config or API.
 - **PostgreSQL-backed state** with a full audit log of every policy change.
@@ -60,8 +63,8 @@ deception) while real services stay stable.
 - **DDoS mitigation** — on-box **XDP/eBPF fast drop + per-source rate-limit** (source-keyed, driven
   by the detection loop; `xdp` directive), a **stateless SYN-cookie tier** (userspace
   `stateless-tcp ports=…` + in-kernel `xdp cookie-ports=…` fast path sharing one SipHash key via
-  Postgres), and ISP-level BGP scrubbing (RTBH, FlowSpec) for operators announcing their own ASN.
-  A zero-copy AF_XDP path is on the roadmap.
+  Postgres) with a zero-copy **AF_XDP** UDP responder, and ISP-level BGP mitigation (RTBH, FlowSpec)
+  for operators announcing their own ASN.
 
 ## Configuration
 
@@ -222,7 +225,11 @@ generation to exercise the XDP/eBPF data plane.
 | `blackwall-dns` | RFC 2136 + TSIG DNS fast-flux against a Knot primary. |
 | `blackwall-flow` | sFlow v5 decode + sliding-window volumetric attack detection (sub-project D). |
 | `blackwall-bgp` | Byte-exact BGP codec (unicast RTBH routes + FlowSpec rules, RFC 8955/8956) + injection-only iBGP speaker (sub-project C). |
-| `blackwall-rtbh` | RTBH controller + single-owner `RtbhManager` — detected/operator attacks → BGP blackhole announcements, persisted and re-announced on restart (sub-project C). |
+| `blackwall-rtbh` | RTBH + FlowSpec controllers and single-owner managers — detected/operator attacks → BGP blackhole/FlowSpec announcements, persisted and re-announced on restart (sub-project C). |
+| `blackwall-xdp` / `blackwall-xdp-ebpf` / `blackwall-xdp-common` | On-box XDP/eBPF data plane (sub-project B): userspace loader/control/sink + the aya eBPF program (source-drop, rate-limit, in-kernel SYN cookies, AF_XDP redirect). |
+| `blackwall-cookie` | `no_std` SipHash SYN-cookie core shared byte-for-byte between the userspace and eBPF tiers. |
+| `blackwall-api` | Tenant-aware, bearer-authenticated read-only control API (axum + OpenAPI), mounted in `blackwalld run` (A·M4). |
+| `blackwall-trafficgen` | DDoS-lab traffic generator (AF_PACKET) for the netns XDP/flood gates. |
 | `blackwall-lab` | netns integration-test lab harness (`lab` CLI) — see below. |
 | `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`, `run`, `flow`, …). |
 
@@ -237,21 +244,24 @@ Blackwall is built as four independent sub-projects, each delivered in milestone
   MySQL/PostgreSQL emulators; TPROXY/NFQUEUE transports; connection cap + session timeout.
 - ✅ **M3 — Discovery, shaping, flux:** host/Incus discovery + reconciler, automatic CAKE shaping
   from multi-provider speedtests, banner fast-flux, DNS fast-flux (RFC 2136 + TSIG to Knot).
-- ⏳ **M4 — API & ops:** tenant-scoped REST API, Prometheus metrics, daemon supervision.
+- 🟡 **M4 — API & ops:** **Phase 1 shipped** — a tenant-aware, bearer-authenticated **read-only
+  control API** (axum) with a generated OpenAPI document, mounted in `blackwalld run`. Remaining:
+  mutation endpoints, daemon supervision, load/bench harness.
 
-**B — DDoS data plane** *(in progress)* — XDP/eBPF fast drop, stateless SYN cookies, AF_XDP,
-conntrack, rate limiting.
+**B — DDoS data plane** ✅ *(complete)* — on-box XDP/eBPF fast drop, in-kernel SYN cookies, zero-copy
+AF_XDP, rate limiting.
 - ✅ **B1 — On-box XDP fast drop:** in-kernel, source-keyed drop + per-source rate-limiting on the
   uplink, driven by the detection loop; `xdp` directive; non-fatal attach with a generic-mode
   fallback.
 - ✅ **B2 — Stateless SYN cookies:** a keyed SipHash-2-4 responder (userspace, NFQUEUE;
   `stateless-tcp ports=…`) plus a reflection-safe UDP responder for the deception tier, and an
-  in-kernel `XDP_TX` SYN-cookie fast path (`xdp cookie-ports=…`) sharing the same key with the
-  userspace tier via Postgres — the two tiers interoperate on a single handshake.
-- ⏳ **B3 — AF_XDP:** a zero-copy userspace fast path.
-- ⏳ **B4 — xdpcap + DDoS-lab XDP gate:** observability and the netns lab gate for the XDP data plane.
-
-The DDoS-lab traffic-generation foundation (`blackwall-trafficgen`) is in place ahead of B3/B4.
+  in-kernel `XDP_TX` SYN-cookie fast path (`xdp cookie-ports=…`, dual-stack IPv4/IPv6) sharing the
+  same key with the userspace tier via Postgres — the two tiers interoperate on a single handshake.
+- ✅ **B3 — AF_XDP:** a zero-copy userspace fast path (`xdpilone`) with a reflection-safe UDP
+  responder, including binary/hex-configurable banners.
+- ✅ **B4 — xdpcap + DDoS-lab XDP gate:** `xdpcap`-style pcap capture plus the netns lab gates for
+  the XDP data plane (`BPF_PROG_TEST_RUN`, AF_XDP redirect, DDoS flood-drop). Multi-queue AF_XDP
+  scaling is deferred (needs multi-queue-NIC hardware).
 
 **C — ISP/BGP control plane** *(in progress)* — a native injection-only iBGP speaker to BIRD.
 - ✅ **C1 — RTBH:** byte-exact BGP codec + speaker (C1a); pure blackhole controller (C1b);
@@ -266,7 +276,22 @@ The DDoS-lab traffic-generation foundation (`blackwall-trafficgen`) is in place 
 
 **D — Detection & telemetry** *(in progress)*
 - ✅ **D1 — Volumetric detection:** sFlow v5 ingest + sliding-window threshold detector driving C.
-- ⏳ **D2+ — NetFlow/IPFIX, adaptive baseline detection** *(later).*
+- ✅ **Anycast telemetry ingest:** per-POP identity from the sFlow agent address, per-POP tagging on
+  detections, per-agent liveness + sampling-sanity, and top-N attacker source-block attribution —
+  so feeds from many anycast POPs read as one logical view.
+- ⏳ **D2+ — NetFlow/IPFIX, adaptive baseline detection, L7 (HTTP/DNS-flood)** *(later).*
+
+**Deployment — Blackwall on an anycast network** *(next)* — turning the platform into a live
+deployment on an anycast ISP (centralized BGP brain + multi-POP telemetry). Staged, not flag-day:
+- 🟡 **M0 — detection-only (shadow):** telemetry ingest (✅, above), plus a POP-sensor deploy
+  contract (hsflowd), a BIRD iBGP-snippet generator, network-wide shadow mode, and Incus/metrics
+  deploy glue. Run live, watch, tune — act on nothing.
+- ⏳ **M1 — arm with safety:** per-upstream blackhole communities, RPKI/ROA cross-check, a single
+  audited disarm + blast-radius caps, and anycast self-protection (don't blackhole yourself).
+- ⏳ **M2 — deception + intel loop:** deception at home (tenant space only), coherent per-IP personas,
+  a tarpit tier, and a deception→mitigation intel loop.
+- ⏳ **M3 — harden & scale:** HA/brain-loss survival, public looking-glass, tenant self-service,
+  multi-source correlation, scrubbing redirect, prefix steering.
 
 **Integration lab** *(cross-cutting)* — a reproducible netns harness (`blackwall-lab`) with one
 `lab` command that runs identically locally and in CI. Every component is gated against the real
