@@ -41,6 +41,12 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Parse a config and print the generated BIRD iBGP include.
+    BirdConfig {
+        /// Path to the Blackwall config file.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Parse a config, persist it, and apply the ruleset to the kernel.
     Apply {
         /// Path to the Blackwall config file.
@@ -1290,6 +1296,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let json = blackwall_nft::ruleset_json(&policy)?;
             println!("{json}");
             Ok(())
+        }
+        Command::BirdConfig { config } => {
+            let policy = blackwall_config::parse_file(&config)?;
+            match blackwall_bgp::render_bird_ibgp(&policy) {
+                Ok(s) => {
+                    print!("{s}");
+                    Ok(())
+                }
+                Err(e) => Err(format!("bird-config: {e}").into()),
+            }
         }
         Command::Speedtest {
             librespeed_server,
