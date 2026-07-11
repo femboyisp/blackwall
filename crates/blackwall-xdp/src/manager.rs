@@ -47,6 +47,28 @@ pub struct XdpExecError;
 #[error("XDP journal error: {0}")]
 pub struct XdpJournalError(pub String);
 
+/// An [`XdpJournal`] that persists nothing.
+///
+/// Installed in place of the real persistence journal when the `shadow`
+/// config directive is set, so the `xdp_entries` mirror stays empty: in
+/// shadow mode no block or rate-limit is ever written to the eBPF maps, so
+/// nothing must be journaled that a later live restart could rehydrate (via
+/// [`XdpManager::reapply_active`]) and install for real. Mirrors
+/// `blackwall_rtbh::NoOpJournal`.
+pub struct NoOpXdpJournal;
+
+#[async_trait]
+impl XdpJournal for NoOpXdpJournal {
+    async fn record(
+        &self,
+        _action: &XdpAction,
+        _origin: XdpOrigin,
+        _at_ms: u64,
+    ) -> Result<(), XdpJournalError> {
+        Ok(())
+    }
+}
+
 /// Outcome of a manual [`XdpManager`] apply call.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -580,5 +602,25 @@ mod tests {
             1,
             "repeated failures for one source coalesce to a single queued op"
         );
+    }
+
+    #[tokio::test]
+    async fn noop_journal_records_nothing_and_succeeds() {
+        // The shadow-mode journal must accept every record call without error
+        // and persist nothing — it holds no state, so a `Block` and a
+        // `RateLimit` record both simply return Ok, leaving no observable
+        // mirror behind for a later live restart to rehydrate.
+        let journal = NoOpXdpJournal;
+        let block = XdpAction::Block {
+            net: "198.51.100.0/24".parse().unwrap(),
+        };
+        let rate = XdpAction::RateLimit {
+            src: "198.51.100.9".parse().unwrap(),
+            pps: 500,
+            burst: 500,
+            victim: Some("203.0.113.7".parse().unwrap()),
+        };
+        assert!(journal.record(&block, XdpOrigin::Manual, 0).await.is_ok());
+        assert!(journal.record(&rate, XdpOrigin::Auto, 1000).await.is_ok());
     }
 }

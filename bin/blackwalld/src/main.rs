@@ -1009,11 +1009,12 @@ async fn apply_flowspec_request<B, J>(
 /// controller can never overflow a map.
 const XDP_MAX_ENTRIES: usize = 65_536;
 
-/// The concrete [`blackwall_xdp::manager::XdpManager`] the daemon runs: an
-/// executor that is either the live attached data plane or (in shadow mode)
-/// [`shadow::XdpExec::Shadow`], plus the Postgres journal as mirror.
-type DaemonXdpManager =
-    blackwall_xdp::manager::XdpManager<shadow::XdpExec, blackwall_state::PgXdpJournal>;
+/// The [`blackwall_xdp::manager::XdpManager`] the daemon runs: an executor
+/// that is either the live attached data plane or (in shadow mode)
+/// [`shadow::XdpExec::Shadow`], plus a journal `J` that is the Postgres
+/// mirror ([`blackwall_state::PgXdpJournal`]) live, or the all-no-op
+/// [`blackwall_xdp::NoOpXdpJournal`] in shadow (so the mirror stays empty).
+type DaemonXdpManager<J> = blackwall_xdp::manager::XdpManager<shadow::XdpExec, J>;
 
 /// Build an [`ipnet::IpNet`] from a stored address + optional prefix length,
 /// falling back to a host route (`/32`/`/128`) when the length is absent.
@@ -1069,12 +1070,14 @@ fn xdp_entry_to_action(
 /// When `auto_enabled` is false (no `default-rate-limit` configured) detection
 /// events are still drained off the channel but ignored — only operator CLI
 /// requests populate the maps. Runs until `rx` is closed.
-async fn xdp_manager_task(
-    mut manager: DaemonXdpManager,
+async fn xdp_manager_task<J>(
+    mut manager: DaemonXdpManager<J>,
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
     auto_enabled: bool,
-) {
+) where
+    J: blackwall_xdp::XdpJournal + 'static,
+{
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -1205,11 +1208,13 @@ fn afxdp_udp_responder_loop(
 /// it `pending` (retried on the next tick); `Rejected` marks it `rejected`.
 /// `unblock`/`clear_rate`: always applies, then marks `applied`. Unknown
 /// actions are logged and left untouched.
-async fn apply_xdp_request(
-    manager: &mut DaemonXdpManager,
+async fn apply_xdp_request<J>(
+    manager: &mut DaemonXdpManager<J>,
     request_store: &blackwall_state::Store,
     req: blackwall_state::XdpRequestRow,
-) {
+) where
+    J: blackwall_xdp::XdpJournal,
+{
     use blackwall_xdp::manager::ApplyOutcome;
 
     let mark = |id: i64, status: &'static str| async move {
@@ -1673,43 +1678,64 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             XDP_MAX_ENTRIES,
                             default_pps,
                         );
-                        let journal = blackwall_state::PgXdpJournal::new(store.clone());
-                        // Shadow mode: swap in `ShadowXdpExecutor` so every
-                        // apply call site below (detections, manual CLI
-                        // requests, restart rehydration) records + meters
-                        // instead of writing the live eBPF maps — the maps
-                        // stay untouched by this session. Live wiring
-                        // (`XdpExec::Live`) is unchanged when `!policy.shadow`.
-                        let executor = if policy.shadow {
-                            shadow::XdpExec::Shadow(shadow::ShadowXdpExecutor::new(
-                                store.clone(),
-                                shadow_metrics.clone(),
-                            ))
-                        } else {
-                            shadow::XdpExec::Live(dataplane.clone())
-                        };
-                        let mut manager =
-                            blackwall_xdp::manager::XdpManager::new(controller, executor, journal);
-
-                        // Rehydrate the controller + maps from the active mirror
-                        // (blocks and rate limits, burst included) before this
-                        // session accepts new detections/requests.
-                        let rows: Vec<_> = store
-                            .xdp_active()
-                            .await?
-                            .iter()
-                            .filter_map(xdp_entry_to_action)
-                            .collect();
-                        manager.reapply_active(rows).await;
-
                         let (xdp_tx, xdp_rx) =
                             mpsc::channel::<blackwall_flow::DetectionEvent>(4096);
-                        let handle = tokio::spawn(xdp_manager_task(
-                            manager,
-                            xdp_rx,
-                            store.clone(),
-                            auto_enabled,
-                        ));
+
+                        // Shadow mode swaps BOTH I/O seams of the manager, so
+                        // the session touches neither the eBPF maps nor the
+                        // `xdp_entries` mirror:
+                        //   * executor  → `ShadowXdpExecutor` (records + meters,
+                        //     never writes a map), and
+                        //   * journal    → `NoOpXdpJournal` (persists nothing),
+                        // and it SKIPS rehydrate — the shadow mirror is
+                        // intentionally empty, so there is nothing to reapply
+                        // (and reapplying would re-log stale rows as "would
+                        // mitigate"). This mirrors the RTBH/FlowSpec shadow
+                        // arms. When `!policy.shadow`, the live path
+                        // (`XdpExec::Live` + `PgXdpJournal` + rehydrate) is
+                        // exactly as before.
+                        let handle = if policy.shadow {
+                            let executor = shadow::XdpExec::Shadow(shadow::ShadowXdpExecutor::new(
+                                store.clone(),
+                                shadow_metrics.clone(),
+                            ));
+                            let manager = blackwall_xdp::manager::XdpManager::new(
+                                controller,
+                                executor,
+                                blackwall_xdp::NoOpXdpJournal,
+                            );
+                            // No rehydrate: the shadow mirror is intentionally empty.
+                            tokio::spawn(xdp_manager_task(
+                                manager,
+                                xdp_rx,
+                                store.clone(),
+                                auto_enabled,
+                            ))
+                        } else {
+                            let executor = shadow::XdpExec::Live(dataplane.clone());
+                            let journal = blackwall_state::PgXdpJournal::new(store.clone());
+                            let mut manager = blackwall_xdp::manager::XdpManager::new(
+                                controller, executor, journal,
+                            );
+
+                            // Rehydrate the controller + maps from the active
+                            // mirror (blocks and rate limits, burst included)
+                            // before this session accepts new detections/requests.
+                            let rows: Vec<_> = store
+                                .xdp_active()
+                                .await?
+                                .iter()
+                                .filter_map(xdp_entry_to_action)
+                                .collect();
+                            manager.reapply_active(rows).await;
+
+                            tokio::spawn(xdp_manager_task(
+                                manager,
+                                xdp_rx,
+                                store.clone(),
+                                auto_enabled,
+                            ))
+                        };
                         xdp_shutdown = Some((handle, dataplane));
 
                         tracing::info!(interface = %iface, auto = auto_enabled, "XDP data plane attached");
