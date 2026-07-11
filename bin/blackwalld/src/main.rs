@@ -1386,7 +1386,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let channel_cap = rtbh.max_blackholes.max(1024);
                     let (tx, rx) = mpsc::channel::<blackwall_flow::DetectionEvent>(channel_cap);
 
-                    if policy.shadow {
+                    // The live BGP handle, threaded to the FlowSpec
+                    // construction below so its live branch reuses this same
+                    // iBGP session. `None` in shadow mode (no real session is
+                    // spawned) — which is exactly what the FlowSpec match keys
+                    // off, so there is no implicit cross-block invariant.
+                    let live_bgp: Option<blackwall_bgp::BgpHandle> = if policy.shadow {
                         let recorder =
                             shadow::AuditShadowRecorder::new(store.clone(), shadow_metrics.clone());
                         let exec = blackwall_rtbh::ShadowBgpExecutor::new(recorder);
@@ -1399,6 +1404,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         // empty — nothing was ever really announced, so there
                         // is nothing to replay.
                         tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+                        None
                     } else {
                         let peer = blackwall_bgp::PeerConfig {
                             local_asn: rtbh.local_asn,
@@ -1440,7 +1446,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         manager.rehydrate(rehydrate_rows, mono_now()).await;
 
                         tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
-                    }
+                        Some(bgp)
+                    };
 
                     match policy.flowspec.clone() {
                         // RTBH-only: today's behaviour, Fanout([Pg, Channel→rtbh]).
@@ -1464,67 +1471,69 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let (fs_tx, fs_rx) =
                                 mpsc::channel::<blackwall_flow::FlowMitigationEvent>(fs_cap);
 
-                            if policy.shadow {
-                                let recorder = shadow::AuditShadowRecorder::new(
-                                    store.clone(),
-                                    shadow_metrics.clone(),
-                                );
-                                let exec = blackwall_rtbh::ShadowBgpExecutor::new(recorder);
-                                let fs_manager = blackwall_rtbh::FlowSpecManager::new(
-                                    fs_controller,
-                                    exec,
-                                    blackwall_rtbh::NoOpJournal,
-                                );
-                                // No rehydrate: shadow mirror stays empty.
-                                tokio::spawn(flowspec_manager_task(
-                                    fs_manager,
-                                    fs_rx,
-                                    store.clone(),
-                                ));
-                            } else {
-                                // The live RTBH branch above always sets
-                                // `bgp_for_metrics` before this point.
-                                let bgp = bgp_for_metrics.clone().expect(
-                                    "live path sets bgp_for_metrics before FlowSpec construction",
-                                );
-                                let fs_journal: blackwall_state::Store = (*store).clone();
-                                let mut fs_manager = blackwall_rtbh::FlowSpecManager::new(
-                                    fs_controller,
-                                    bgp,
-                                    fs_journal,
-                                );
+                            // Reuse the live BGP handle from the RTBH branch
+                            // (`Some` on the live path, `None` in shadow mode).
+                            // Matching the real value here removes the earlier
+                            // cross-block `.expect()` on `bgp_for_metrics`.
+                            match live_bgp {
+                                None => {
+                                    let recorder = shadow::AuditShadowRecorder::new(
+                                        store.clone(),
+                                        shadow_metrics.clone(),
+                                    );
+                                    let exec = blackwall_rtbh::ShadowBgpExecutor::new(recorder);
+                                    let fs_manager = blackwall_rtbh::FlowSpecManager::new(
+                                        fs_controller,
+                                        exec,
+                                        blackwall_rtbh::NoOpJournal,
+                                    );
+                                    // No rehydrate: shadow mirror stays empty.
+                                    tokio::spawn(flowspec_manager_task(
+                                        fs_manager,
+                                        fs_rx,
+                                        store.clone(),
+                                    ));
+                                }
+                                Some(bgp) => {
+                                    let fs_journal: blackwall_state::Store = (*store).clone();
+                                    let mut fs_manager = blackwall_rtbh::FlowSpecManager::new(
+                                        fs_controller,
+                                        bgp,
+                                        fs_journal,
+                                    );
 
-                                // Rehydrate FlowSpec rules from the announced mirror.
-                                let fs_mirror = store.list_active_flowspec().await?;
-                                let fs_rehydrate: Vec<(
-                                    blackwall_bgp::FlowSpecRule,
-                                    u64,
-                                    blackwall_rtbh::BlackholeOrigin,
-                                )> = fs_mirror
-                                    .into_iter()
-                                    .map(|row| {
-                                        let origin = match row.origin.as_str() {
-                                            "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
-                                            _ => blackwall_rtbh::BlackholeOrigin::Auto,
-                                        };
-                                        let rule = blackwall_bgp::FlowSpecRule {
-                                            dst: host_prefix(row.dst),
-                                            protocol: Some(row.proto),
-                                            dst_port: Some(row.dst_port),
-                                            action: blackwall_bgp::FlowAction::TrafficRate(
-                                                row.rate,
-                                            ),
-                                        };
-                                        (rule, row.announced_at_ms, origin)
-                                    })
-                                    .collect();
-                                fs_manager.rehydrate(fs_rehydrate, mono_now()).await;
+                                    // Rehydrate FlowSpec rules from the announced mirror.
+                                    let fs_mirror = store.list_active_flowspec().await?;
+                                    let fs_rehydrate: Vec<(
+                                        blackwall_bgp::FlowSpecRule,
+                                        u64,
+                                        blackwall_rtbh::BlackholeOrigin,
+                                    )> = fs_mirror
+                                        .into_iter()
+                                        .map(|row| {
+                                            let origin = match row.origin.as_str() {
+                                                "manual" => blackwall_rtbh::BlackholeOrigin::Manual,
+                                                _ => blackwall_rtbh::BlackholeOrigin::Auto,
+                                            };
+                                            let rule = blackwall_bgp::FlowSpecRule {
+                                                dst: host_prefix(row.dst),
+                                                protocol: Some(row.proto),
+                                                dst_port: Some(row.dst_port),
+                                                action: blackwall_bgp::FlowAction::TrafficRate(
+                                                    row.rate,
+                                                ),
+                                            };
+                                            (rule, row.announced_at_ms, origin)
+                                        })
+                                        .collect();
+                                    fs_manager.rehydrate(fs_rehydrate, mono_now()).await;
 
-                                tokio::spawn(flowspec_manager_task(
-                                    fs_manager,
-                                    fs_rx,
-                                    store.clone(),
-                                ));
+                                    tokio::spawn(flowspec_manager_task(
+                                        fs_manager,
+                                        fs_rx,
+                                        store.clone(),
+                                    ));
+                                }
                             }
 
                             let selection = blackwall_flow::SelectionConfig {

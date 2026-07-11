@@ -46,29 +46,43 @@ impl AuditShadowRecorder {
 #[async_trait::async_trait]
 impl ShadowRecorder for AuditShadowRecorder {
     async fn record(&self, action: ShadowAction) {
-        let (plane, verb, target, counter): (&str, &str, String, &AtomicU64) = match &action {
+        // `target` is a short display string for the INFO log only; `detail`
+        // is the structured JSON persisted to `audit_log` so `/v1/audit`
+        // consumers read fields (prefix/next_hop/dst/proto/…) rather than
+        // regex over a Debug blob.
+        let (plane, verb, target, detail, counter): (
+            &str,
+            &str,
+            String,
+            serde_json::Value,
+            &AtomicU64,
+        ) = match &action {
             ShadowAction::RtbhAnnounce(r) => (
                 "rtbh",
                 "announce",
-                format!("{r:?}"),
+                r.prefix.to_string(),
+                route_detail("rtbh", "announce", r),
                 &self.metrics.rtbh_announce,
             ),
             ShadowAction::RtbhWithdraw(p) => (
                 "rtbh",
                 "withdraw",
                 p.to_string(),
+                serde_json::json!({ "plane": "rtbh", "verb": "withdraw", "prefix": p.to_string() }),
                 &self.metrics.rtbh_withdraw,
             ),
             ShadowAction::FlowSpecAnnounce(r) => (
                 "flowspec",
                 "announce",
-                format!("{r:?}"),
+                r.dst.to_string(),
+                flowspec_detail("flowspec", "announce", r),
                 &self.metrics.flowspec_announce,
             ),
             ShadowAction::FlowSpecWithdraw(r) => (
                 "flowspec",
                 "withdraw",
-                format!("{r:?}"),
+                r.dst.to_string(),
+                flowspec_detail("flowspec", "withdraw", r),
                 &self.metrics.flowspec_withdraw,
             ),
         };
@@ -79,7 +93,6 @@ impl ShadowRecorder for AuditShadowRecorder {
             target = %target,
             "shadow: would mitigate (logged, not applied)"
         );
-        let detail = serde_json::json!({ "plane": plane, "verb": verb, "target": target });
         if let Err(err) = self
             .store
             .record_audit("shadow", &format!("shadow.{plane}.{verb}"), &detail)
@@ -88,6 +101,40 @@ impl ShadowRecorder for AuditShadowRecorder {
             tracing::warn!(%err, "shadow: audit write failed (mitigation still suppressed)");
         }
     }
+}
+
+/// Structured audit detail for an RTBH route: its prefix, next hop, and
+/// communities (as `asn:value` strings) as their own JSON fields, so audit
+/// consumers read fields rather than a Debug blob.
+fn route_detail(plane: &str, verb: &str, r: &blackwall_bgp::Route) -> serde_json::Value {
+    let communities: Vec<String> = r
+        .communities
+        .iter()
+        .map(|(asn, value)| format!("{asn}:{value}"))
+        .collect();
+    serde_json::json!({
+        "plane": plane,
+        "verb": verb,
+        "prefix": r.prefix.to_string(),
+        "next_hop": r.next_hop.to_string(),
+        "communities": communities,
+    })
+}
+
+/// Structured audit detail for a FlowSpec rule: destination, protocol,
+/// destination port, and rate (bytes/sec) as their own JSON fields.
+fn flowspec_detail(plane: &str, verb: &str, r: &blackwall_bgp::FlowSpecRule) -> serde_json::Value {
+    let rate = match &r.action {
+        blackwall_bgp::FlowAction::TrafficRate(rate) => *rate,
+    };
+    serde_json::json!({
+        "plane": plane,
+        "verb": verb,
+        "dst": r.dst.to_string(),
+        "protocol": r.protocol,
+        "dst_port": r.dst_port,
+        "rate": rate,
+    })
 }
 
 /// [`XdpExecutor`] used in place of the live eBPF map writer when the
