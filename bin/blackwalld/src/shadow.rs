@@ -2,6 +2,7 @@
 //! I/O glue — coverage-excluded.
 
 use blackwall_rtbh::{ShadowAction, ShadowRecorder};
+use blackwall_xdp::{XdpAction, XdpExecError, XdpExecutor};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -85,6 +86,120 @@ impl ShadowRecorder for AuditShadowRecorder {
             .await
         {
             tracing::warn!(%err, "shadow: audit write failed (mitigation still suppressed)");
+        }
+    }
+}
+
+/// [`XdpExecutor`] used in place of the live eBPF map writer when the
+/// `shadow` config directive is set: install actions (`Block`/`RateLimit`)
+/// are logged, metered into [`ShadowMetrics`], and audit-logged instead of
+/// touching a map; removal actions (`Unblock`/`ClearRate`) are pure no-ops,
+/// since shadow mode never installed anything for them to remove.
+pub struct ShadowXdpExecutor {
+    store: Arc<blackwall_state::Store>,
+    metrics: Arc<ShadowMetrics>,
+}
+
+impl ShadowXdpExecutor {
+    /// Build an executor that audits to `store` and meters into `metrics`.
+    pub fn new(store: Arc<blackwall_state::Store>, metrics: Arc<ShadowMetrics>) -> Self {
+        Self { store, metrics }
+    }
+}
+
+#[async_trait::async_trait]
+impl XdpExecutor for ShadowXdpExecutor {
+    async fn apply(&self, action: XdpAction) -> Result<(), XdpExecError> {
+        match action {
+            XdpAction::Block { net } => {
+                self.metrics.xdp_block.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    plane = "xdp",
+                    verb = "block",
+                    target = %net,
+                    "shadow: would mitigate (not applied)"
+                );
+                let detail =
+                    serde_json::json!({"plane": "xdp", "verb": "block", "target": net.to_string()});
+                if let Err(err) = self
+                    .store
+                    .record_audit("shadow", "shadow.xdp.block", &detail)
+                    .await
+                {
+                    tracing::warn!(%err, "shadow: audit write failed (mitigation still suppressed)");
+                }
+            }
+            XdpAction::RateLimit {
+                src,
+                pps,
+                burst,
+                victim,
+            } => {
+                self.metrics.xdp_rate_limit.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    plane = "xdp",
+                    verb = "rate_limit",
+                    target = %src,
+                    pps,
+                    burst,
+                    victim = victim.map(|v| v.to_string()),
+                    "shadow: would mitigate (not applied)"
+                );
+                let detail = serde_json::json!({
+                    "plane": "xdp",
+                    "verb": "rate_limit",
+                    "target": src.to_string(),
+                    "pps": pps,
+                    "burst": burst,
+                    "victim": victim.map(|v| v.to_string()),
+                });
+                if let Err(err) = self
+                    .store
+                    .record_audit("shadow", "shadow.xdp.rate_limit", &detail)
+                    .await
+                {
+                    tracing::warn!(%err, "shadow: audit write failed (mitigation still suppressed)");
+                }
+            }
+            XdpAction::Unblock { net } => {
+                tracing::debug!(
+                    plane = "xdp",
+                    verb = "unblock",
+                    target = %net,
+                    "shadow: no-op (nothing was ever installed)"
+                );
+            }
+            XdpAction::ClearRate { src } => {
+                tracing::debug!(
+                    plane = "xdp",
+                    verb = "clear_rate",
+                    target = %src,
+                    "shadow: no-op (nothing was ever installed)"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Selects between the live eBPF map writer and [`ShadowXdpExecutor`] at
+/// construction time, so [`crate::DaemonXdpManager`]'s single `XdpManager`
+/// type serves both live and shadow sessions — every apply call site
+/// (detections, manual CLI requests, restart rehydration) is gated by
+/// whichever variant is installed, with no per-call-site branching.
+pub enum XdpExec {
+    /// Writes straight to the live eBPF maps.
+    Live(Arc<blackwall_xdp::XdpDataplane>),
+    /// Shadow mode: records + meters, never touches a map.
+    Shadow(ShadowXdpExecutor),
+}
+
+#[async_trait::async_trait]
+impl XdpExecutor for XdpExec {
+    async fn apply(&self, action: XdpAction) -> Result<(), XdpExecError> {
+        match self {
+            Self::Live(dataplane) => dataplane.apply(action).await,
+            Self::Shadow(shadow) => shadow.apply(action).await,
         }
     }
 }

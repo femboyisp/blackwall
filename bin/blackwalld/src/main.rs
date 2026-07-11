@@ -1009,12 +1009,11 @@ async fn apply_flowspec_request<B, J>(
 /// controller can never overflow a map.
 const XDP_MAX_ENTRIES: usize = 65_536;
 
-/// The concrete [`blackwall_xdp::manager::XdpManager`] the daemon runs: a
-/// shared attached data plane as executor and the Postgres journal as mirror.
-type DaemonXdpManager = blackwall_xdp::manager::XdpManager<
-    std::sync::Arc<blackwall_xdp::XdpDataplane>,
-    blackwall_state::PgXdpJournal,
->;
+/// The concrete [`blackwall_xdp::manager::XdpManager`] the daemon runs: an
+/// executor that is either the live attached data plane or (in shadow mode)
+/// [`shadow::XdpExec::Shadow`], plus the Postgres journal as mirror.
+type DaemonXdpManager =
+    blackwall_xdp::manager::XdpManager<shadow::XdpExec, blackwall_state::PgXdpJournal>;
 
 /// Build an [`ipnet::IpNet`] from a stored address + optional prefix length,
 /// falling back to a host route (`/32`/`/128`) when the length is absent.
@@ -1675,11 +1674,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             default_pps,
                         );
                         let journal = blackwall_state::PgXdpJournal::new(store.clone());
-                        let mut manager = blackwall_xdp::manager::XdpManager::new(
-                            controller,
-                            dataplane.clone(),
-                            journal,
-                        );
+                        // Shadow mode: swap in `ShadowXdpExecutor` so every
+                        // apply call site below (detections, manual CLI
+                        // requests, restart rehydration) records + meters
+                        // instead of writing the live eBPF maps — the maps
+                        // stay untouched by this session. Live wiring
+                        // (`XdpExec::Live`) is unchanged when `!policy.shadow`.
+                        let executor = if policy.shadow {
+                            shadow::XdpExec::Shadow(shadow::ShadowXdpExecutor::new(
+                                store.clone(),
+                                shadow_metrics.clone(),
+                            ))
+                        } else {
+                            shadow::XdpExec::Live(dataplane.clone())
+                        };
+                        let mut manager =
+                            blackwall_xdp::manager::XdpManager::new(controller, executor, journal);
 
                         // Rehydrate the controller + maps from the active mirror
                         // (blocks and rate limits, burst included) before this
