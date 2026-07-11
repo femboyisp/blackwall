@@ -1414,6 +1414,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             hold_time: 90,
                             md5: rtbh.md5.as_ref().map(|s| s.reveal().to_owned()),
                             gtsm_hops: rtbh.gtsm_hops,
+                            local_addr: rtbh.local_addr,
                         };
                         // `BgpHandle` is a cloneable mpsc sender; both the RTBH
                         // and (optionally) FlowSpec managers share the one

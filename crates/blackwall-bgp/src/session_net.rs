@@ -70,6 +70,10 @@ pub struct PeerConfig {
     /// below `256 - n` (so `1` = a directly-connected peer must arrive with TTL
     /// 255). Cheaply defeats off-link spoofed BGP packets. `None` disables it.
     pub gtsm_hops: Option<u8>,
+    /// Optional BGP source address. When `Some`, the session binds it as the TCP
+    /// source before connecting, so a pinned-`neighbor` peer (e.g. BIRD) accepts
+    /// the session. `None` = OS-chosen source.
+    pub local_addr: Option<std::net::IpAddr>,
 }
 
 /// A `PeerConfig` that cannot form a valid iBGP session.
@@ -388,7 +392,14 @@ async fn session_once(
     consecutive_failures: &mut u32,
 ) -> SessionOutcome {
     // ── 1. TCP connect ──────────────────────────────────────────────────────
-    let mut stream = match connect_peer(cfg.peer_addr, cfg.md5.as_deref(), cfg.gtsm_hops).await {
+    let mut stream = match connect_peer(
+        cfg.peer_addr,
+        cfg.md5.as_deref(),
+        cfg.gtsm_hops,
+        cfg.local_addr,
+    )
+    .await
+    {
         Ok(s) => {
             info!(peer = %cfg.peer_addr, "TCP connected");
             s
@@ -916,20 +927,24 @@ struct TcpMd5Sig {
 }
 
 /// Connect to `addr`, optionally installing a TCP-MD5 (RFC 2385) signature for
-/// the peer. With `md5 == None` this is exactly [`TcpStream::connect`].
+/// the peer and/or binding a specific source address. With `md5 == None`,
+/// `gtsm_hops == None`, and `local_addr == None` this is exactly
+/// [`TcpStream::connect`].
 ///
 /// # Errors
 ///
-/// Returns any TCP connect error, or an error from installing the MD5 key (e.g.
-/// a key longer than [`libc::TCP_MD5SIG_MAXKEYLEN`] bytes).
+/// Returns any TCP connect error, an error from installing the MD5 key (e.g.
+/// a key longer than [`libc::TCP_MD5SIG_MAXKEYLEN`] bytes), or an error from
+/// binding `local_addr`.
 async fn connect_peer(
     addr: SocketAddr,
     md5: Option<&str>,
     gtsm_hops: Option<u8>,
+    local_addr: Option<std::net::IpAddr>,
 ) -> io::Result<TcpStream> {
-    // The plain path is only valid with neither socket option set; otherwise
-    // build the socket ourselves so we can apply them before connect.
-    if md5.is_none() && gtsm_hops.is_none() {
+    // The plain path is only valid with none of the socket options set;
+    // otherwise build the socket ourselves so we can apply them before connect.
+    if md5.is_none() && gtsm_hops.is_none() && local_addr.is_none() {
         return TcpStream::connect(addr).await;
     }
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
@@ -938,6 +953,9 @@ async fn connect_peer(
     }
     if let Some(hops) = gtsm_hops {
         set_gtsm(&sock, addr, hops)?;
+    }
+    if let Some(src) = local_addr {
+        sock.bind(&socket2::SockAddr::from(std::net::SocketAddr::new(src, 0)))?;
     }
     sock.set_nonblocking(true)?;
     // A nonblocking connect returns EINPROGRESS; hand the fd to tokio, which
@@ -1088,6 +1106,7 @@ mod tests {
             hold_time: hold,
             md5: None,
             gtsm_hops: None,
+            local_addr: None,
         }
     }
 
@@ -1198,6 +1217,23 @@ mod tests {
         assert_eq!(
             getsockopt_int(&sock, libc::IPPROTO_IPV6, libc::IPV6_MINHOPCOUNT),
             255
+        );
+    }
+
+    #[test]
+    fn bind_source_sets_local_addr() {
+        let peer: SocketAddr = "127.0.0.1:179".parse().unwrap();
+        let sock =
+            Socket::new(Domain::for_address(peer), Type::STREAM, Some(Protocol::TCP)).unwrap();
+        sock.bind(&socket2::SockAddr::from(SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            0,
+        )))
+        .unwrap();
+        let local = sock.local_addr().unwrap().as_socket().unwrap();
+        assert_eq!(
+            local.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
     }
 }
