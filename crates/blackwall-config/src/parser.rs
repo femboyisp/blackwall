@@ -537,6 +537,36 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     what: "pop missing sampling",
                     value: name.as_str().to_owned(),
                 })?;
+                // POP names become a Prometheus label value verbatim
+                // (`blackwall_flow_pop_last_seen_seconds{pop="<name>"}`), so
+                // restrict the charset to close a label-escaping hazard.
+                if !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "pop name",
+                        value: name.as_str().to_owned(),
+                    });
+                }
+                // A duplicate agent IP or POP name breaks `/metrics` (two
+                // series with the same `pop` label make Prometheus reject
+                // the whole scrape), so fail fast at parse time.
+                if pops.iter().any(|p| p.agent == agent) {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "pop",
+                        value: "duplicate agent".to_owned(),
+                    });
+                }
+                if pops.iter().any(|p| p.name == *name) {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "pop",
+                        value: "duplicate name".to_owned(),
+                    });
+                }
                 pops.push(PopEntry {
                     name: name.as_str().to_owned(),
                     agent,
@@ -2114,6 +2144,46 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
         );
         assert_eq!(p.pops[0].sampling, 1000);
         assert_eq!(p.pops[1].name, "fra");
+    }
+
+    #[test]
+    fn pop_rejects_duplicate_agent() {
+        let err = parse_text(
+            "interface wan eth0\npop ord agent=10.222.3.8 sampling=1000\npop fra agent=10.222.3.8 sampling=500\n",
+        )
+        .expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "pop", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pop_rejects_duplicate_name() {
+        let err = parse_text(
+            "interface wan eth0\npop ord agent=10.222.3.8 sampling=1000\npop ord agent=10.222.4.8 sampling=500\n",
+        )
+        .expect_err("should fail");
+        assert!(
+            matches!(err, ConfigError::BadValue { what: "pop", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pop_rejects_bad_name() {
+        let err = parse_text("interface wan eth0\npop or:d agent=10.222.3.8 sampling=1000\n")
+            .expect_err("should fail");
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "pop name",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

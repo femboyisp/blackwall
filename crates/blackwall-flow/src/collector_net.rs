@@ -72,7 +72,7 @@ pub async fn run_collector(
                     *snapshot.lock().unwrap() = detector.agent_stats();
                 }
                 if let Some(m) = &metrics {
-                    m.set_unknown_agent_datagrams(detector.unknown_agent_observations());
+                    m.set_unknown_agent_observations(detector.unknown_agent_observations());
                 }
                 for event in events {
                     sink.handle(&event).await;

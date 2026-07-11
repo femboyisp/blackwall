@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct CollectorMetrics {
     datagrams: AtomicU64,
     decode_errors: AtomicU64,
-    unknown_agent_datagrams: AtomicU64,
+    unknown_agent_observations: AtomicU64,
 }
 
 impl CollectorMetrics {
@@ -50,8 +50,8 @@ impl CollectorMetrics {
     /// Total sample observations attributed to agents absent from the POP
     /// registry (`Detector::unknown_agent_observations`).
     #[must_use]
-    pub fn unknown_agent_datagrams(&self) -> u64 {
-        self.unknown_agent_datagrams.load(Ordering::Relaxed)
+    pub fn unknown_agent_observations(&self) -> u64 {
+        self.unknown_agent_observations.load(Ordering::Relaxed)
     }
 
     /// Publish the detector's current cumulative unknown-agent observation
@@ -61,8 +61,9 @@ impl CollectorMetrics {
     /// (`Detector::unknown_agent_observations`), so the collector calls this
     /// once per tick with that total rather than incrementing per datagram
     /// (which would double count).
-    pub fn set_unknown_agent_datagrams(&self, value: u64) {
-        self.unknown_agent_datagrams.store(value, Ordering::Relaxed);
+    pub fn set_unknown_agent_observations(&self, value: u64) {
+        self.unknown_agent_observations
+            .store(value, Ordering::Relaxed);
     }
 }
 
@@ -75,17 +76,17 @@ mod tests {
         let m = CollectorMetrics::new();
         assert_eq!(m.datagrams(), 0);
         assert_eq!(m.decode_errors(), 0);
-        assert_eq!(m.unknown_agent_datagrams(), 0);
+        assert_eq!(m.unknown_agent_observations(), 0);
     }
 
     #[test]
-    fn set_unknown_agent_datagrams_overwrites_rather_than_accumulates() {
+    fn set_unknown_agent_observations_overwrites_rather_than_accumulates() {
         let m = CollectorMetrics::new();
-        m.set_unknown_agent_datagrams(3);
-        assert_eq!(m.unknown_agent_datagrams(), 3);
+        m.set_unknown_agent_observations(3);
+        assert_eq!(m.unknown_agent_observations(), 3);
         // A later tick with a lower or higher cumulative total simply overwrites.
-        m.set_unknown_agent_datagrams(5);
-        assert_eq!(m.unknown_agent_datagrams(), 5);
+        m.set_unknown_agent_observations(5);
+        assert_eq!(m.unknown_agent_observations(), 5);
     }
 
     #[test]

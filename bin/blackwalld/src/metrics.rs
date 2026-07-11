@@ -238,7 +238,7 @@ fn xdp_block(sources: &MetricsSources) -> Option<String> {
 
 /// Render the per-POP telemetry blocks (`blackwall_flow_pop_last_seen_seconds`,
 /// `blackwall_flow_agent_sampling_mismatch_total`) plus the
-/// `blackwall_flow_unknown_agent_datagrams_total` scalar, or `None` when the
+/// `blackwall_flow_unknown_agent_observations_total` scalar, or `None` when the
 /// flow daemon has no per-agent snapshot wired up (`sources.agent_stats` is
 /// `None` — the deception engine, which has no sFlow collector).
 ///
@@ -293,21 +293,21 @@ fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
     let unknown = sources
         .collector
         .as_ref()
-        .map_or(0, |c| c.unknown_agent_datagrams());
+        .map_or(0, |c| c.unknown_agent_observations());
     if !out.is_empty() {
         out.push('\n');
     }
     let _ = writeln!(
         out,
-        "# HELP blackwall_flow_unknown_agent_datagrams_total sFlow samples from agents absent from the POP registry"
+        "# HELP blackwall_flow_unknown_agent_observations_total sFlow sample observations from agents not in the POP map."
     );
     let _ = writeln!(
         out,
-        "# TYPE blackwall_flow_unknown_agent_datagrams_total counter"
+        "# TYPE blackwall_flow_unknown_agent_observations_total counter"
     );
     let _ = writeln!(
         out,
-        "blackwall_flow_unknown_agent_datagrams_total {unknown}"
+        "blackwall_flow_unknown_agent_observations_total {unknown}"
     );
 
     Some(out)
