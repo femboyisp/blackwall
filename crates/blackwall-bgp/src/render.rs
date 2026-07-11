@@ -156,8 +156,41 @@ mod tests {
         assert!(out.contains(
             "flow4 { import filter { if flow4.dst ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; };"
         ));
+        assert!(out.contains("hold time 600; keepalive time 200;"));
         assert!(!out.contains("password"));
         assert!(!out.contains("ttl security"));
+    }
+
+    #[test]
+    fn renders_v4_only() {
+        // v4 prefixes + a v4 peer, no ipv6 line: only the v4 channels render.
+        let cfg = "interface wan eth0\n\
+             ipv4 203.0.113.0/24\n\
+             rtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 \
+             next-hop-v4=192.0.2.1 max=256 hold-down=60s local-addr=10.0.0.3\n";
+        let out = render_bird_ibgp(&policy_from(cfg)).unwrap();
+        assert!(out.contains("define OWN_V4"));
+        assert!(!out.contains("define OWN_V6"));
+        assert!(out.contains("ipv4 { import filter {"));
+        assert!(out.contains("flow4 { import filter {"));
+        assert!(!out.contains("ipv6 { import filter {"));
+        assert!(!out.contains("flow6 { import filter {"));
+    }
+
+    #[test]
+    fn renders_v6_only() {
+        // v6 prefixes + a v6 peer, no ipv4 line: only the v6 channels render.
+        let cfg = "interface wan eth0\n\
+             ipv6 2001:db8::/48\n\
+             rtbh peer=[2001:db8::2]:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 \
+             next-hop-v6=2001:db8::1 max=256 hold-down=60s local-addr=2001:db8::9\n";
+        let out = render_bird_ibgp(&policy_from(cfg)).unwrap();
+        assert!(out.contains("define OWN_V6"));
+        assert!(!out.contains("define OWN_V4"));
+        assert!(out.contains("ipv6 { import filter {"));
+        assert!(out.contains("flow6 { import filter {"));
+        assert!(!out.contains("ipv4 { import filter {"));
+        assert!(!out.contains("flow4 { import filter {"));
     }
 
     #[test]
