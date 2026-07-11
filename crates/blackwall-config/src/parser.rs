@@ -221,6 +221,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             | "community"
                             | "md5"
                             | "gtsm-hops"
+                            | "local-addr"
                     ) {
                         return Err(ConfigError::BadValue {
                             line: line.number,
@@ -335,6 +336,10 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         .get("md5")
                         .map(|s| blackwall_core::Md5Secret::new((*s).to_owned())),
                     gtsm_hops,
+                    local_addr: kv
+                        .get("local-addr")
+                        .map(|v| v.parse().map_err(|_| bad("local-addr", v)))
+                        .transpose()?,
                 });
             }
             "flowspec" => {
@@ -1609,6 +1614,31 @@ tenant t {
     fn rtbh_md5_absent_is_none() {
         let src = "interface wan eth0\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s\n";
         assert!(parse_text(src).unwrap().rtbh.unwrap().md5.is_none());
+    }
+
+    #[test]
+    fn parses_rtbh_local_addr() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s local-addr=10.0.0.3\n",
+        ).unwrap();
+        let rtbh = p.rtbh.expect("rtbh");
+        assert_eq!(rtbh.local_addr, Some("10.0.0.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn rtbh_local_addr_defaults_none() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s\n",
+        ).unwrap();
+        assert_eq!(p.rtbh.unwrap().local_addr, None);
+    }
+
+    #[test]
+    fn rtbh_rejects_bad_local_addr() {
+        let err = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s local-addr=notanip\n",
+        );
+        assert!(err.is_err());
     }
 
     #[test]
