@@ -7,6 +7,15 @@
 //! Skips cleanly (prints a message, does not fail) when `bird` isn't on
 //! `PATH`, so it doesn't break `cargo test` on dev boxes without BIRD
 //! installed. CI has `/usr/bin/bird` (BIRD 2.17.1), so it runs there.
+//!
+//! NOTE: `bird -p` is a **parse + type-check only** — it proves the config is
+//! syntactically valid BIRD2, but does NOT execute any filter, so it cannot
+//! catch filter-logic (runtime-match) bugs. For example, a flow import filter
+//! written `if net ~ [...]` type-checks fine here yet silently rejects every
+//! FlowSpec route at runtime (the correct accessor is `net.dst`). Semantic
+//! correctness of the filters is proven only by the live lab scenario
+//! (`crates/blackwall-lab/scenarios/bird-gen.kdl`), which runs a real session
+//! and asserts routes actually propagate through them.
 
 use blackwall_bgp::render_bird_ibgp;
 use blackwall_core::Policy;

@@ -90,13 +90,15 @@ pub fn render_bird_ibgp(policy: &Policy) -> Result<String, BirdGenError> {
             out,
             "    ipv4 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; next hop self; }};"
         );
-        // BIRD2 has no `flow4.dst`/`flow6.dst` accessor; a flowspec route's
-        // destination-prefix component is matched the same way as a plain
-        // route's network, via `net ~ [ prefix-set ]` (confirmed against real
-        // BIRD 2.17.1 with `bird -p`).
+        // On a flowspec channel `net` is the whole flow spec, not a plain
+        // prefix — its destination-prefix component is reached via `net.dst`.
+        // `net ~ [ prefix-set ]` type-checks (so `bird -p` passes) but at
+        // RUNTIME never matches a flow route, silently rejecting every
+        // FlowSpec rule; `net.dst ~ [ prefix-set ]` is the correct form
+        // (confirmed against real BIRD 2.17.1 by the bird-gen lab scenario).
         let _ = writeln!(
             out,
-            "    flow4 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; }};"
+            "    flow4 {{ import filter {{ if net.dst ~ [ {m} ] then accept; reject; }}; export none; }};"
         );
     }
     if !v6.is_empty() {
@@ -107,7 +109,7 @@ pub fn render_bird_ibgp(policy: &Policy) -> Result<String, BirdGenError> {
         );
         let _ = writeln!(
             out,
-            "    flow6 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; }};"
+            "    flow6 {{ import filter {{ if net.dst ~ [ {m} ] then accept; reject; }}; export none; }};"
         );
     }
     let _ = writeln!(out, "    hold time 600; keepalive time 200;");
@@ -172,7 +174,7 @@ mod tests {
             "ipv4 { import filter { if net ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; next hop self; };"
         ));
         assert!(out.contains(
-            "flow4 { import filter { if net ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; };"
+            "flow4 { import filter { if net.dst ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; };"
         ));
         assert!(out.contains("hold time 600; keepalive time 200;"));
         assert!(!out.contains("password"));

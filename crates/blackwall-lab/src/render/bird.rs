@@ -138,6 +138,15 @@ fn render_bird_with_include(
     } else {
         ""
     };
+    // Same RFC 8955 §6 "safe update" requirement as the derived path: a
+    // FlowSpec route is only accepted if its covering unicast route's next
+    // hop resolves, which needs the connected /30 imported via `protocol
+    // direct`. Only added when flowspec, matching `render_bird`.
+    let direct_proto = if flowspec {
+        "protocol direct {\n    ipv4;\n    ipv6;\n    interface \"*\";\n}\n\n"
+    } else {
+        ""
+    };
     Ok(format!(
         "log stderr all;\n\
 router id {router_id};\n\
@@ -151,6 +160,7 @@ protocol kernel {{\n\
     ipv4 {{ import none; export none; }};\n\
 }}\n\
 \n\
+{direct_proto}\
 {included}"
     ))
 }
