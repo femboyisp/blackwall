@@ -66,9 +66,30 @@ sudo -E scripts/smoke-flow.sh        # BGP mitigation end to end
 sudo -E scripts/smoke-deception.sh   # routed deception → honeypot
 ```
 
+## Shadow mode (run detection-only, act on nothing)
+For a first deployment on a live network, run the mitigation plane in **shadow
+mode** before arming it. Add a bare `shadow` line to the config:
+```
+shadow            # log + record + meter every RTBH/FlowSpec/XDP mitigation, apply none
+```
+With `shadow` set, `blackwalld flow` starts with a loud `WARN: SHADOW MODE —
+mitigations are LOGGED, NOT APPLIED` banner. Detection, selection, and the
+RTBH/FlowSpec/XDP controllers all run normally, but every mitigation the daemon
+*would* apply is instead:
+- logged at INFO (`shadow: would announce 203.0.113.7/32 …`),
+- counted in `blackwall_shadow_would_mitigate_total{plane,action}` (Prometheus), and
+- written to the audit log (visible via the read API's `/v1/audit` endpoint).
+
+No BGP session is opened, nothing is announced, and no XDP map is written — the
+persistent mirror stays empty, so a later restart can't rehydrate never-vetted
+entries. Run it for a day or a week, review the intended mitigations, and **arm
+by removing the `shadow` line and re-applying**. Shadow is the mitigation-plane
+interlock; the deception engine is unaffected.
+
 ## Enable (staged)
 Bring the services up **deliberately**, watching `/metrics` and Postgres. Start
-`flow` in detection-only mode (no rtbh/flowspec blocks in the config) first:
+`flow` in detection-only mode (no rtbh/flowspec blocks in the config, or with
+`shadow` set — see above) first:
 ```bash
 # systemd
 sudo systemctl enable --now blackwalld-flow
@@ -223,13 +244,34 @@ POP's firewall/routes must permit outbound UDP to the collector over the WG
 interface, and the home box's config must accept it (`flow --listen
 0.0.0.0:6343` or scoped to the mesh interface).
 
+## Generate BIRD's side of the session (`bird-config`)
+Blackwall's native speaker peers *into* your BIRD; the BIRD side of that iBGP
+session (the `protocol bgp` stanza + the `OWN_V4/OWN_V6` prefix defines its
+export filters reference) is generated from the same `blackwall.conf`, so you
+don't hand-maintain the prefix/session lists twice:
+```bash
+blackwalld bird-config --config /etc/blackwall/blackwall.conf > /etc/bird/blackwall.conf
+```
+Add `include "blackwall.conf";` to your `bird.conf` and `birdc configure`. This
+requires `local-addr=<ip>` on the `rtbh` directive — blackwall's own BGP source
+address, which the generator emits as BIRD's `neighbor` and the speaker binds as
+its source so the session matches by construction (its family must match the
+`peer=` address). If the `rtbh` block sets `md5=`, the generated file references
+`include "blackwall-secret.conf";` instead of embedding the secret — keep that
+one-line `password "…";` file `0600` alongside your other BIRD secrets. The
+generated file is otherwise non-sensitive and safe to commit. BIRD remains the
+fan-out point: blackwall injects a blackhole/FlowSpec once, and BIRD
+re-advertises it to every upstream via your existing per-peer export filters —
+so adding or retuning upstreams stays a pure BIRD-side operation.
+
 ## Not yet implemented (know before you rely on it)
-- **No AF_XDP zero-copy path yet.** B1 (XDP source-drop + rate-limit) and B2
-  (stateless SYN cookies, both the userspace tier and the in-XDP fast path
-  above) are shipped; a zero-copy AF_XDP userspace path (B3) and xdpcap
-  observability + a DDoS-lab XDP gate (B4) are the remaining sub-project B
-  work. The nftables flowtable (`flowtable devices=…`) offloads established
-  forwarded real-service flows, but there is no kernel-bypass offload for the
-  deception/inspection path yet. Fine for moderate rates and on-box
-  source-drop/SYN-cookie absorption; line-rate volumetric attack traffic is
-  still best pushed to your router via BGP mitigation.
+- **XDP data plane is complete but its scale ceiling is real.** Sub-project B is
+  shipped end to end: B1 (XDP source-drop + rate-limit), B2 (stateless SYN
+  cookies — userspace tier + in-XDP fast path), B3 (zero-copy AF_XDP UDP
+  responder), and B4 (xdpcap capture + the DDoS-lab XDP gates). Multi-queue
+  AF_XDP scaling is deferred (needs multi-queue-NIC hardware), and realistic
+  DDoS-scale stress testing is tracked separately (issue #67). The nftables
+  flowtable (`flowtable devices=…`) offloads established forwarded real-service
+  flows. Fine for moderate rates and on-box source-drop/SYN-cookie absorption;
+  line-rate volumetric attack traffic is still best pushed to your router via
+  BGP mitigation.
