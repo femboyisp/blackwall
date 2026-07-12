@@ -1,0 +1,47 @@
+// bird-gen gate: peers real BIRD2 against blackwall's *actual generated*
+// iBGP include (`blackwalld bird-config` / `blackwall_bgp::render_bird_ibgp`)
+// rather than the lab's own hand-rolled `daemon "bird"` config the other
+// *-bird gates use. This is the strongest proof available that the renderer
+// emits config real BIRD accepts *and* that establishes a working session —
+// `bird -p` (blackwall-bgp's `bird_validate` tests) only proves it parses;
+// this proves it also binds/negotiates correctly (it caught a real local/
+// neighbor address swap that `bird -p` could not, since both sides of a
+// swapped `local`/`neighbor` pair are individually valid syntax).
+//
+// The include must be generated *before* this scenario runs (topology
+// realization reads `include-file` synchronously; there is no in-scenario
+// step that runs early enough to produce it first):
+//   target/debug/blackwalld bird-config \
+//     --config crates/blackwall-lab/scenarios/fixtures/bird-gen.conf \
+//     > /tmp/blackwall-lab-bird-gen-include.conf
+//
+// The fixture's `rtbh peer=10.0.0.1:179 local-addr=10.0.0.2` is hardcoded to
+// match this topology's link (`subnet="10.0.0.0/30"` allocates `.1` to the
+// first-declared endpoint, "peer", and `.2` to "speaker" — see
+// `blackwall-lab/src/addr.rs::allocate`). From blackwall's Policy
+// perspective, `peer` names BIRD's own address (so BIRD's box is "peer",
+// running the generated config) and `local-addr` names blackwall's own
+// speaker's address (so the speaker, "speaker", binds its BGP source to it
+// via `BW_BGP_LOCAL_ADDR`).
+topology "bird-gen" {
+    node "peer" {
+        daemon "bird" include-file="/tmp/blackwall-lab-bird-gen-include.conf" flowspec="yes"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="target/debug/lab-tests/blackwall-rtbh-interop blackholes_a_detected_target --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179 BW_BGP_LOCAL_ADDR={speaker.addr}"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "generated-include-establishes-session" {
+    // Proves the generated `protocol bgp blackwall { local ...; neighbor ...; }`
+    // binds and negotiates against real BIRD2 (the address-swap bug this
+    // gate exists to catch would leave this stuck in `start`/`Active`).
+    step wait   node="peer" until="bgp-established" timeout="20s"
+    // Proves the generated `+`-form OWN import filter accepts blackwall's
+    // /32 blackhole (community 65535:666, RFC 7999).
+    step assert node="peer" cmd="birdc show route 203.0.113.7/32 all" \
+         contains="(65535,666)" timeout="15s"
+}

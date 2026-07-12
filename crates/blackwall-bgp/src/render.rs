@@ -65,9 +65,18 @@ pub fn render_bird_ibgp(policy: &Policy) -> Result<String, BirdGenError> {
         return Err(BirdGenError::FamilyMismatch { local, peer });
     }
 
+    // This snippet is installed on and executed *by* the BIRD box itself
+    // (the box at `rtbh.peer_addr`, from blackwall's point of view) — so
+    // BIRD's own `local` clause must be an address *it* owns: `peer_addr`.
+    // `neighbor` is the box BIRD expects the session from: blackwall's own
+    // speaker, at `rtbh.local_addr`. Getting this backwards type-checks
+    // fine (both sides are just `IP as ASN`) but breaks at runtime — BIRD
+    // refuses to bind a `local` address it doesn't own (confirmed live
+    // against BIRD 2.17.1: "Socket error: bind: Cannot assign requested
+    // address"), which only a live-session test catches, not `bird -p`.
     let _ = writeln!(out, "\nprotocol bgp blackwall {{");
-    let _ = writeln!(out, "    local {local} as {};", rtbh.local_asn);
-    let _ = writeln!(out, "    neighbor {peer} as {};", rtbh.peer_asn);
+    let _ = writeln!(out, "    local {peer} as {};", rtbh.peer_asn);
+    let _ = writeln!(out, "    neighbor {local} as {};", rtbh.local_asn);
     let _ = writeln!(out, "    allow local as {};", rtbh.local_asn);
     if rtbh.md5.is_some() {
         let _ = writeln!(out, "    include \"blackwall-secret.conf\";");
@@ -81,9 +90,13 @@ pub fn render_bird_ibgp(policy: &Policy) -> Result<String, BirdGenError> {
             out,
             "    ipv4 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; next hop self; }};"
         );
+        // BIRD2 has no `flow4.dst`/`flow6.dst` accessor; a flowspec route's
+        // destination-prefix component is matched the same way as a plain
+        // route's network, via `net ~ [ prefix-set ]` (confirmed against real
+        // BIRD 2.17.1 with `bird -p`).
         let _ = writeln!(
             out,
-            "    flow4 {{ import filter {{ if flow4.dst ~ [ {m} ] then accept; reject; }}; export none; }};"
+            "    flow4 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; }};"
         );
     }
     if !v6.is_empty() {
@@ -94,7 +107,7 @@ pub fn render_bird_ibgp(policy: &Policy) -> Result<String, BirdGenError> {
         );
         let _ = writeln!(
             out,
-            "    flow6 {{ import filter {{ if flow6.dst ~ [ {m} ] then accept; reject; }}; export none; }};"
+            "    flow6 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; }};"
         );
     }
     let _ = writeln!(out, "    hold time 600; keepalive time 200;");
@@ -148,13 +161,18 @@ mod tests {
         assert!(out.contains("define OWN_V4 = [ 203.0.113.0/24 ];"));
         assert!(out.contains("define OWN_V6 = [ 2001:db8::/48 ];"));
         assert!(out.contains("protocol bgp blackwall {"));
-        assert!(out.contains("local 10.0.0.3 as 65000;"));
-        assert!(out.contains("neighbor 10.0.0.2 as 65000;"));
+        // The snippet runs *on* the BIRD box (peer_addr, 10.0.0.2): its own
+        // `local` clause must be an address it owns, and `neighbor` is
+        // blackwall's own speaker address (local_addr, 10.0.0.3) — getting
+        // this backwards parses fine but fails to bind at runtime (confirmed
+        // live against BIRD 2.17.1).
+        assert!(out.contains("local 10.0.0.2 as 65000;"));
+        assert!(out.contains("neighbor 10.0.0.3 as 65000;"));
         assert!(out.contains(
             "ipv4 { import filter { if net ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; next hop self; };"
         ));
         assert!(out.contains(
-            "flow4 { import filter { if flow4.dst ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; };"
+            "flow4 { import filter { if net ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; };"
         ));
         assert!(out.contains("hold time 600; keepalive time 200;"));
         assert!(!out.contains("password"));
