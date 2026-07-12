@@ -3,6 +3,7 @@
 use crate::addr::AddressMap;
 use crate::error::LabError;
 use crate::topology::model::{DaemonKind, Node, Topology};
+use std::net::IpAddr;
 
 /// Render the BIRD config for `node`'s `bird` daemon.
 ///
@@ -12,15 +13,34 @@ use crate::topology::model::{DaemonKind, Node, Topology};
 /// When `flowspec="yes"`, the `protocol bgp` block also gets `flow4`/`flow6`
 /// channels (RFC 8955/8956) so the peer negotiates FlowSpec SAFI 133.
 ///
+/// When the daemon has an `include-file` setting instead, the `protocol bgp`
+/// block is *not* derived from `local-as`/`neighbor-node`/etc. at all: the
+/// file's contents (blackwall's own generated `protocol bgp blackwall { ... }`
+/// include — see `blackwalld bird-config` / `blackwall_bgp::render_bird_ibgp`)
+/// are spliced in verbatim after the same router id / table / base-protocol
+/// preamble. This is how the `bird-gen` lab scenario proves the *actual*
+/// generated include establishes a real BIRD2 session, rather than the
+/// lab's own hand-rolled approximation of one.
+///
 /// # Errors
 /// Returns [`LabError::Plan`] if the node has no `bird` daemon, a required
-/// setting is missing, or an address cannot be resolved.
+/// setting is missing, an address cannot be resolved, or (`include-file`
+/// mode) the file cannot be read.
 pub fn render_bird(node: &Node, _topo: &Topology, map: &AddressMap) -> Result<String, LabError> {
     let daemon = node
         .daemons
         .iter()
         .find(|d| d.kind == DaemonKind::Bird)
         .ok_or_else(|| LabError::Plan(format!("node `{}` has no bird daemon", node.name)))?;
+
+    let router_id = map
+        .node_primary(&node.name)
+        .ok_or_else(|| LabError::Plan(format!("no router id for `{}`", node.name)))?;
+    let flowspec = daemon.settings.get("flowspec").is_some_and(|v| v == "yes");
+
+    if let Some(path) = daemon.settings.get("include-file") {
+        return render_bird_with_include(node, router_id, path, flowspec);
+    }
 
     let get = |key: &str| {
         daemon
@@ -30,15 +50,11 @@ pub fn render_bird(node: &Node, _topo: &Topology, map: &AddressMap) -> Result<St
             .ok_or_else(|| LabError::Plan(format!("bird on `{}` missing `{key}`", node.name)))
     };
 
-    let router_id = map
-        .node_primary(&node.name)
-        .ok_or_else(|| LabError::Plan(format!("no router id for `{}`", node.name)))?;
     let local_as = get("local-as")?;
     let neighbor_node = get("neighbor-node")?;
     let neighbor_as = get("neighbor-as")?;
     let import = get("import")?;
     let passive = daemon.settings.get("passive").map_or("no", String::as_str);
-    let flowspec = daemon.settings.get("flowspec").is_some_and(|v| v == "yes");
     // Optional TCP-MD5 (RFC 2385): a `password="…"` setting emits BIRD's
     // `password` clause so the neighbor requires an authenticated session.
     let password = daemon
@@ -97,6 +113,55 @@ protocol bgp peer_{neighbor_node} {{\n\
     }};\n\
 {flow_channels}\
 }}\n"
+    ))
+}
+
+/// Build the same router id / table / base-protocol preamble as
+/// [`render_bird`]'s derived path, then splice in `include_path`'s raw
+/// contents verbatim as the `protocol bgp` block — used by the `bird-gen`
+/// scenario to peer real BIRD2 against blackwall's *actual* generated
+/// include rather than a lab-approximated one.
+fn render_bird_with_include(
+    node: &Node,
+    router_id: IpAddr,
+    include_path: &str,
+    flowspec: bool,
+) -> Result<String, LabError> {
+    let included = std::fs::read_to_string(include_path).map_err(|e| {
+        LabError::Plan(format!(
+            "bird on `{}`: reading include-file `{include_path}`: {e}",
+            node.name
+        ))
+    })?;
+    let flow_tables = if flowspec {
+        "flow4 table flow4tab;\nflow6 table flow6tab;\n\n"
+    } else {
+        ""
+    };
+    // Same RFC 8955 §6 "safe update" requirement as the derived path: a
+    // FlowSpec route is only accepted if its covering unicast route's next
+    // hop resolves, which needs the connected /30 imported via `protocol
+    // direct`. Only added when flowspec, matching `render_bird`.
+    let direct_proto = if flowspec {
+        "protocol direct {\n    ipv4;\n    ipv6;\n    interface \"*\";\n}\n\n"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "log stderr all;\n\
+router id {router_id};\n\
+\n\
+{flow_tables}\
+protocol device {{\n\
+    scan time 5;\n\
+}}\n\
+\n\
+protocol kernel {{\n\
+    ipv4 {{ import none; export none; }};\n\
+}}\n\
+\n\
+{direct_proto}\
+{included}"
     ))
 }
 
@@ -232,6 +297,57 @@ protocol bgp peer_speaker {\n\
         let map = allocate(&topo).unwrap();
         assert!(matches!(
             render_bird(&topo.nodes[1], &topo, &map),
+            Err(LabError::Plan(_))
+        ));
+    }
+
+    #[test]
+    fn include_file_splices_in_verbatim_and_skips_derived_settings() {
+        // `include-file` mode ignores local-as/neighbor-node/etc entirely —
+        // only `router_id`/`flowspec` (for the table preamble) still apply.
+        let mut topo = proof_topo();
+        let dir = std::env::temp_dir().join(format!(
+            "blackwall-lab-render-bird-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blackwall-gen.conf");
+        std::fs::write(
+            &path,
+            "protocol bgp blackwall {\n    local 10.0.0.1 as 65000;\n}\n",
+        )
+        .unwrap();
+
+        topo.nodes[0].daemons[0].settings.clear();
+        topo.nodes[0].daemons[0].settings.insert(
+            "include-file".to_owned(),
+            path.to_string_lossy().into_owned(),
+        );
+        topo.nodes[0].daemons[0]
+            .settings
+            .insert("flowspec".to_owned(), "yes".to_owned());
+
+        let map = allocate(&topo).unwrap();
+        let out = render_bird(&topo.nodes[0], &topo, &map).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(out.contains("router id 10.0.0.1;"));
+        assert!(out.contains("flow4 table flow4tab;"));
+        assert!(out.contains("protocol bgp blackwall {\n    local 10.0.0.1 as 65000;\n}\n"));
+        assert!(!out.contains("protocol bgp peer_"));
+    }
+
+    #[test]
+    fn include_file_missing_errors() {
+        let mut topo = proof_topo();
+        topo.nodes[0].daemons[0].settings.clear();
+        topo.nodes[0].daemons[0].settings.insert(
+            "include-file".to_owned(),
+            "/nonexistent/blackwall-gen.conf".to_owned(),
+        );
+        let map = allocate(&topo).unwrap();
+        assert!(matches!(
+            render_bird(&topo.nodes[0], &topo, &map),
             Err(LabError::Plan(_))
         ));
     }

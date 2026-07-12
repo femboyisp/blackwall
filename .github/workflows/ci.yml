@@ -81,7 +81,10 @@ jobs:
           sudo mkdir -p /opt/host-sflow
           sudo cp /tmp/host-sflow/src/Linux/hsflowd /tmp/host-sflow/src/Linux/mod_pcap.so /opt/host-sflow/
       - name: Build the lab + interop tests (pre-built binaries the gates run directly)
-        run: cargo build -p blackwall-lab && cargo build -p blackwall-trafficgen && bash scripts/build-lab-tests.sh
+        # blackwalld is built here too: the bird-gen gate shells out to
+        # `blackwalld bird-config` (not `cargo run`) to generate the include
+        # it feeds real BIRD, matching the "pre-built binaries only" rule.
+        run: cargo build -p blackwall-lab && cargo build -p blackwall-trafficgen && cargo build -p blackwalld && bash scripts/build-lab-tests.sh
       - name: Run the lab gate
         timeout-minutes: 6
         run: |
@@ -190,6 +193,22 @@ jobs:
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/rtbh-bird.kdl lab-junit-rtbh.xml
+      - name: Run the lab gate (bird-gen)
+        # Peers real BIRD2 against blackwall's *actual* generated iBGP
+        # include (not the lab's own hand-rolled approximation the other
+        # *-bird gates use) — see crates/blackwall-lab/scenarios/bird-gen.kdl
+        # for why this catches bugs `bird -p` alone cannot (e.g. a swapped
+        # local/neighbor address, individually valid but unbindable).
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          ./target/debug/blackwalld bird-config \
+            --config crates/blackwall-lab/scenarios/fixtures/bird-gen.conf \
+            > /tmp/blackwall-lab-bird-gen-include.conf
+          sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/bird-gen.kdl lab-junit-bird-gen.xml
       - name: Run the lab gate (flowspec)
         # Re-enabled: its wedge was cross-gate residue left by the preceding
         # deception-resilience gate's engine (broken tproxy → unclean teardown →
@@ -280,5 +299,6 @@ jobs:
             lab-junit-syncookie.xml
             lab-junit-syncookie-v6.xml
             lab-junit-rtbh.xml
+            lab-junit-bird-gen.xml
             lab-junit-flowspec.xml
             lab-junit-flowspec-auto.xml

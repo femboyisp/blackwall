@@ -1,8 +1,13 @@
 //! Manual/netns interop exercise: drives an `RtbhManager` (auto-detection +
 //! operator-manual paths) against a real BGP peer to announce /32 blackholes
 //! (community 65535:666) via the native speaker. Ignored in CI; run by the
-//! lab's rtbh-bird scenario.
+//! lab's rtbh-bird and bird-gen scenarios.
 //!   BW_BGP_PEER=10.0.0.1:179 cargo test -p blackwall-rtbh --test interop -- --ignored --nocapture
+//!
+//! `BW_BGP_LOCAL_ADDR` is optional: when set, the speaker binds its BGP
+//! source to it (`PeerConfig::local_addr`) instead of letting the kernel
+//! pick — needed by bird-gen, whose generated BIRD-side config pins a
+//! specific `neighbor` address the speaker must connect *from*.
 
 use async_trait::async_trait;
 use blackwall_bgp::{spawn, PeerConfig};
@@ -48,6 +53,9 @@ async fn blackholes_a_detected_target() {
         hold_time: 90,
         md5: None,
         gtsm_hops: None,
+        local_addr: std::env::var("BW_BGP_LOCAL_ADDR")
+            .ok()
+            .map(|s| s.parse().expect("BW_BGP_LOCAL_ADDR must be an IP address")),
     })
     .expect("valid iBGP config");
     tokio::time::sleep(Duration::from_secs(3)).await; // let the session establish

@@ -41,6 +41,12 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Parse a config and print the generated BIRD iBGP include.
+    BirdConfig {
+        /// Path to the Blackwall config file.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Parse a config, persist it, and apply the ruleset to the kernel.
     Apply {
         /// Path to the Blackwall config file.
@@ -1291,6 +1297,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{json}");
             Ok(())
         }
+        Command::BirdConfig { config } => {
+            let policy = blackwall_config::parse_file(&config)?;
+            match blackwall_bgp::render_bird_ibgp(&policy) {
+                Ok(s) => {
+                    print!("{s}");
+                    Ok(())
+                }
+                Err(e) => Err(format!("bird-config: {e}").into()),
+            }
+        }
         Command::Speedtest {
             librespeed_server,
             max_bytes,
@@ -1414,6 +1430,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             hold_time: 90,
                             md5: rtbh.md5.as_ref().map(|s| s.reveal().to_owned()),
                             gtsm_hops: rtbh.gtsm_hops,
+                            local_addr: rtbh.local_addr,
                         };
                         // `BgpHandle` is a cloneable mpsc sender; both the RTBH
                         // and (optionally) FlowSpec managers share the one

@@ -30,6 +30,7 @@ async fn flowspec_rule_reaches_bird() {
         hold_time: 90,
         md5: None,
         gtsm_hops: None,
+        local_addr: None,
     })
     .expect("valid iBGP config");
     tokio::time::sleep(Duration::from_secs(3)).await; // let the session establish

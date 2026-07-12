@@ -15,6 +15,11 @@
 //! destination is covered by a unicast route from the same origin AS, so we
 //! announce a covering `203.0.113.0/24` route before the FlowSpec rule.
 //!   BW_BGP_PEER=10.0.0.1:179 cargo test -p blackwall-rtbh --test flowspec_auto_interop -- --ignored --nocapture
+//!
+//! `BW_BGP_LOCAL_ADDR` is optional: when set, the speaker binds its BGP
+//! source to it (`PeerConfig::local_addr`) instead of letting the kernel
+//! pick — needed by the bird-gen scenario, whose generated BIRD-side config
+//! pins a specific `neighbor` address the speaker must connect *from*.
 
 use async_trait::async_trait;
 use blackwall_bgp::{spawn, FlowSpecRule, Origin, PeerConfig, Route};
@@ -123,6 +128,9 @@ async fn selection_routes_to_flowspec_and_rtbh_on_real_bird() {
         hold_time: 90,
         md5: None,
         gtsm_hops: None,
+        local_addr: std::env::var("BW_BGP_LOCAL_ADDR")
+            .ok()
+            .map(|s| s.parse().expect("BW_BGP_LOCAL_ADDR must be an IP address")),
     })
     .expect("valid iBGP config");
     tokio::time::sleep(Duration::from_secs(3)).await; // let the session establish

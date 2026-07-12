@@ -36,6 +36,10 @@ pub struct RtbhPolicy {
     /// directly connected peer, TTL 255) and sends with TTL 255; `None`
     /// disables the TTL check.
     pub gtsm_hops: Option<u8>,
+    /// Blackwall's own BGP source address — bound by the speaker as the TCP
+    /// source and emitted as BIRD's `neighbor`. `None` = OS-chosen source (no
+    /// generated BIRD session possible). Its family should match `peer_addr`.
+    pub local_addr: Option<std::net::IpAddr>,
 }
 
 #[cfg(test)]
@@ -56,6 +60,7 @@ mod tests {
             max_ttl: Some(std::time::Duration::from_secs(7200)),
             md5: Some(crate::Md5Secret::new("pw".into())),
             gtsm_hops: Some(1),
+            local_addr: Some("10.222.255.2".parse().unwrap()),
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: RtbhPolicy = serde_json::from_str(&json).unwrap();

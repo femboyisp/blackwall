@@ -255,6 +255,8 @@ dependencies = [
 name = "blackwall-bgp"
 version = "0.1.0"
 dependencies = [
+ "blackwall-config",
+ "blackwall-core",
  "ipnet",
  "libc",
  "socket2 0.5.10",
