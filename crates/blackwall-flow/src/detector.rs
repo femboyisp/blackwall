@@ -204,6 +204,13 @@ pub struct DetectorConfig {
     /// up to `expected * max_sampling_factor`, and only clamped down beyond
     /// that ceiling. Does not affect the low-side clamp (a reported rate
     /// below `expected / 4` is always clamped up to `expected`).
+    ///
+    /// Values below 4 are treated as 4 (the trust band is incoherent below
+    /// the 4× trigger): [`ThresholdDetector::new`] floors the stored value,
+    /// so a misconfigured `0` (which would clamp every high-rate flood's
+    /// volume to zero) or `1..=3` (which would clamp a legitimately-high
+    /// reported rate back down, reintroducing the under-count this clamp
+    /// exists to prevent) can't mask an attack.
     pub max_sampling_factor: u32,
 }
 
@@ -254,7 +261,13 @@ impl ThresholdDetector {
             window_ms: config.window_ms,
             hold_down_ms: config.hold_down_ms,
             min_samples: config.min_samples,
-            max_sampling_factor: config.max_sampling_factor,
+            // Floor at 4: the trust band (see `DetectorConfig::max_sampling_factor`
+            // rustdoc) is only coherent when the ceiling is at least `expected * 4`,
+            // the same threshold that triggers the high-rate branch. A misconfigured
+            // 0 would collapse the ceiling to 0 (masking a real flood's volume); a
+            // misconfigured 1..=3 would clamp a legitimately-high reported rate back
+            // down, reintroducing the under-count this clamp exists to prevent.
+            max_sampling_factor: config.max_sampling_factor.max(4),
             state: HashMap::new(),
             agents,
             agent_last_seen: HashMap::new(),
@@ -1188,6 +1201,35 @@ mod tests {
         det.observe(&obs_from(agent_ip(1), 500_000, 1_000), 1_000);
         let _ = det.tick(1_100);
         assert_eq!(det.sampling_near_ceiling().get(&agent_ip(1)), Some(&1));
+    }
+
+    #[test]
+    fn max_sampling_factor_zero_does_not_mask_flood() {
+        // Misconfigured max_sampling_factor=0 must NOT collapse the ceiling to 0
+        // (which would clamp a real flood's volume down to 0 and mask the attack).
+        // The detector floors the effective factor at 4, so the ceiling is
+        // expected*4, and a reported rate above expected*4 is trusted up to that
+        // floor ceiling rather than being clamped to 0.
+        let agents = registry_with(agent_ip(1), 1000);
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            DetectorConfig {
+                max_sampling_factor: 0,
+                ..test_cfg_factor(3_000.0, 1e18, 1, 0).with_window_ms(1_000)
+            },
+            agents,
+        );
+        // reported N=20_000 > expected*4=4_000 → high-rate branch. Without the
+        // floor, ceiling = expected*0 = 0, clamping volume to 0 pps (no detection,
+        // masking the flood). With the floor, ceiling = expected*4 = 4_000, trusted
+        // rate = min(20_000, 4_000) = 4_000 pps > pps_threshold(3_000) → opens.
+        det.observe(&obs_from(agent_ip(1), 20_000, 1_000), 1_000);
+        assert!(
+            det.tick(1_100)
+                .iter()
+                .any(|e| matches!(e, DetectionEvent::Opened(_))),
+            "max_sampling_factor=0 must not mask a real high-rate flood"
+        );
     }
 
     #[test]
