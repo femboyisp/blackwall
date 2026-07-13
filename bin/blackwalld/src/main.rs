@@ -89,7 +89,9 @@ enum Command {
         /// Per-destination packets-per-second threshold.
         #[arg(long)]
         pps_threshold: f64,
-        /// Per-destination bits-per-second threshold.
+        /// Per-destination bits-per-second threshold. NOTE: computed from the sFlow
+        /// L2 frame length (includes the Ethernet header), so calibrate against L2
+        /// bytes, not L3 payload.
         #[arg(long)]
         bps_threshold: f64,
         /// Sliding window in seconds.

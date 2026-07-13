@@ -360,6 +360,9 @@ impl Detector for ThresholdDetector {
         }
 
         let est_packets = u64::from(effective_rate);
+        // `obs.frame_len` is the sFlow-reported L2 frame length (includes the
+        // Ethernet header), so `est_bytes` — and the resulting bps used against
+        // `bps_threshold` — is on an L2 basis, not L3 payload bytes.
         let est_bytes = u64::from(effective_rate) * u64::from(obs.frame_len);
 
         let entry = self.state.entry(obs.dst).or_insert_with(|| DstState {
