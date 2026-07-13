@@ -240,7 +240,8 @@ fn xdp_block(sources: &MetricsSources) -> Option<String> {
 }
 
 /// Render the per-POP telemetry blocks (`blackwall_flow_pop_last_seen_seconds`,
-/// `blackwall_flow_agent_sampling_mismatch_total`) plus the
+/// `blackwall_flow_agent_sampling_mismatch_total`,
+/// `blackwall_flow_sampling_near_ceiling_total`) plus the
 /// `blackwall_flow_unknown_agent_observations_total` and
 /// `blackwall_flow_min_sample_suppressed_total` scalars, or `None` when the
 /// flow daemon has no per-agent snapshot wired up (`sources.agent_stats` is
@@ -288,6 +289,21 @@ fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
                 out,
                 "blackwall_flow_agent_sampling_mismatch_total{{pop=\"{}\"}} {}",
                 s.pop, s.mismatches
+            );
+        }
+        let _ = writeln!(
+            out,
+            "\n# HELP blackwall_flow_sampling_near_ceiling_total Samples per POP whose trusted sampling rate landed at or above half the max-sampling-factor ceiling"
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE blackwall_flow_sampling_near_ceiling_total counter"
+        );
+        for s in &stats {
+            let _ = writeln!(
+                out,
+                "blackwall_flow_sampling_near_ceiling_total{{pop=\"{}\"}} {}",
+                s.pop, s.near_ceiling
             );
         }
     }

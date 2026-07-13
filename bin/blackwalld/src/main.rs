@@ -102,6 +102,14 @@ enum Command {
         /// sampling-variance false positives). 0 disables the gate.
         #[arg(long, default_value_t = 8)]
         min_samples: usize,
+        /// Ceiling multiplier applied to an agent's expected sampling rate when
+        /// its reported rate is high. A reported rate above `expected * 4` is
+        /// trusted (adaptive samplers legitimately raise their rate under load)
+        /// up to `expected * max_sampling_factor`, and only clamped down beyond
+        /// that ceiling — never clamped down to `expected` itself, which would
+        /// mask a real flood as a false negative.
+        #[arg(long, default_value_t = 64)]
+        max_sampling_factor: u32,
     },
     /// Apply the ruleset and start the deception engine (requires CAP_NET_ADMIN).
     Run {
@@ -1358,6 +1366,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             window_secs,
             hold_down_secs,
             min_samples,
+            max_sampling_factor,
         } => {
             let policy = blackwall_config::parse_file(&config)?;
             if policy.shadow {
@@ -1376,6 +1385,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 window_ms: window_secs * 1000,
                 hold_down_ms: hold_down_secs * 1000,
                 min_samples,
+                max_sampling_factor,
             };
             let detector = blackwall_flow::ThresholdDetector::new(
                 policy.prefixes.clone(),

@@ -108,6 +108,7 @@ async fn detects_volumetric_attack() {
             window_ms: 1000,
             hold_down_ms: 2000,
             min_samples: 0,
+            max_sampling_factor: 64,
         },
         AgentRegistry::default(),
     );
@@ -154,6 +155,7 @@ async fn detects_live_sflow_attack() {
             window_ms: 1000,
             hold_down_ms: 2000,
             min_samples: 0,
+            max_sampling_factor: 64,
         },
         AgentRegistry::default(),
     ));
