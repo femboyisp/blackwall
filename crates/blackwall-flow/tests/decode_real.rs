@@ -23,7 +23,8 @@ fn decodes_real_hsflowd_expanded_flow_samples() {
     let victim = IpAddr::V4(Ipv4Addr::new(10, 9, 0, 2));
     let mut total = 0;
     for (bytes, expected) in FIXTURES {
-        let obs = decode_datagram(bytes).expect("decode real hsflowd datagram");
+        let (obs, sample_errors) = decode_datagram(bytes).expect("decode real hsflowd datagram");
+        assert_eq!(sample_errors, 0, "real captures have no malformed samples");
         assert_eq!(obs.len(), *expected, "observation count for a fixture");
         for o in &obs {
             assert_eq!(o.dst, victim, "all flood packets target the victim");

@@ -15,7 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct CollectorMetrics {
     datagrams: AtomicU64,
     decode_errors: AtomicU64,
+    sample_decode_errors: AtomicU64,
     unknown_agent_observations: AtomicU64,
+    min_sample_suppressed: AtomicU64,
+    detections_opened: AtomicU64,
+    detections_cleared: AtomicU64,
 }
 
 impl CollectorMetrics {
@@ -47,6 +51,28 @@ impl CollectorMetrics {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Total individual flow/counter *samples* (within an otherwise-decoded
+    /// datagram) that failed to decode and were skipped.
+    ///
+    /// Distinct from [`Self::decode_errors`]: that counter tracks whole
+    /// datagrams whose envelope framing was unreadable (discarding every
+    /// observation in the datagram), while this one tracks samples inside a
+    /// datagram whose envelope decoded fine — e.g. hsflowd batches many flow
+    /// samples per datagram, and one malformed sample no longer discards the
+    /// rest. Keeping the two separate lets an operator tell "this POP is
+    /// sending malformed datagrams" (`decode_errors`) apart from "this POP is
+    /// dropping/corrupting individual samples" (`sample_decode_errors`).
+    #[must_use]
+    pub fn sample_decode_errors(&self) -> u64 {
+        self.sample_decode_errors.load(Ordering::Relaxed)
+    }
+
+    /// Record one sample that failed to decode within an otherwise-valid
+    /// datagram. See [`Self::sample_decode_errors`].
+    pub fn incr_sample_decode_errors(&self) {
+        self.sample_decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Total sample observations attributed to agents absent from the POP
     /// registry (`Detector::unknown_agent_observations`).
     #[must_use]
@@ -65,6 +91,49 @@ impl CollectorMetrics {
         self.unknown_agent_observations
             .store(value, Ordering::Relaxed);
     }
+
+    /// Total detections suppressed solely by the detector's minimum-sample
+    /// gate (`Detector::min_sample_suppressed`).
+    #[must_use]
+    pub fn min_sample_suppressed(&self) -> u64 {
+        self.min_sample_suppressed.load(Ordering::Relaxed)
+    }
+
+    /// Publish the detector's current cumulative minimum-sample-suppressed
+    /// count. Mirrors [`Self::set_unknown_agent_observations`]: the detector
+    /// already accumulates this total internally
+    /// (`Detector::min_sample_suppressed`), so the collector calls this once
+    /// per tick with that total rather than incrementing per event.
+    pub fn set_min_sample_suppressed(&self, value: u64) {
+        self.min_sample_suppressed.store(value, Ordering::Relaxed);
+    }
+
+    /// Total detections opened (`Detector::detections_opened`).
+    #[must_use]
+    pub fn detections_opened(&self) -> u64 {
+        self.detections_opened.load(Ordering::Relaxed)
+    }
+
+    /// Publish the detector's current cumulative detections-opened count.
+    /// Mirrors [`Self::set_min_sample_suppressed`]: the detector already
+    /// accumulates this total internally (`Detector::detections_opened`), so
+    /// the collector calls this once per tick with that total rather than
+    /// incrementing per event.
+    pub fn set_detections_opened(&self, value: u64) {
+        self.detections_opened.store(value, Ordering::Relaxed);
+    }
+
+    /// Total detections cleared (`Detector::detections_cleared`).
+    #[must_use]
+    pub fn detections_cleared(&self) -> u64 {
+        self.detections_cleared.load(Ordering::Relaxed)
+    }
+
+    /// Publish the detector's current cumulative detections-cleared count.
+    /// Mirrors [`Self::set_detections_opened`].
+    pub fn set_detections_cleared(&self, value: u64) {
+        self.detections_cleared.store(value, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -76,7 +145,20 @@ mod tests {
         let m = CollectorMetrics::new();
         assert_eq!(m.datagrams(), 0);
         assert_eq!(m.decode_errors(), 0);
+        assert_eq!(m.sample_decode_errors(), 0);
         assert_eq!(m.unknown_agent_observations(), 0);
+        assert_eq!(m.min_sample_suppressed(), 0);
+        assert_eq!(m.detections_opened(), 0);
+        assert_eq!(m.detections_cleared(), 0);
+    }
+
+    #[test]
+    fn set_min_sample_suppressed_overwrites_rather_than_accumulates() {
+        let m = CollectorMetrics::new();
+        m.set_min_sample_suppressed(3);
+        assert_eq!(m.min_sample_suppressed(), 3);
+        m.set_min_sample_suppressed(5);
+        assert_eq!(m.min_sample_suppressed(), 5);
     }
 
     #[test]
@@ -90,6 +172,19 @@ mod tests {
     }
 
     #[test]
+    fn set_detections_opened_cleared_overwrite_rather_than_accumulate() {
+        let m = CollectorMetrics::new();
+        m.set_detections_opened(3);
+        m.set_detections_cleared(2);
+        assert_eq!(m.detections_opened(), 3);
+        assert_eq!(m.detections_cleared(), 2);
+        m.set_detections_opened(5);
+        m.set_detections_cleared(4);
+        assert_eq!(m.detections_opened(), 5);
+        assert_eq!(m.detections_cleared(), 4);
+    }
+
+    #[test]
     fn increment_bumps_counters() {
         let m = CollectorMetrics::new();
         m.incr_datagrams();
@@ -97,6 +192,17 @@ mod tests {
         m.incr_decode_errors();
         assert_eq!(m.datagrams(), 2);
         assert_eq!(m.decode_errors(), 1);
+    }
+
+    #[test]
+    fn incr_sample_decode_errors_is_distinct_from_decode_errors() {
+        let m = CollectorMetrics::new();
+        m.incr_decode_errors();
+        m.incr_sample_decode_errors();
+        m.incr_sample_decode_errors();
+        m.incr_sample_decode_errors();
+        assert_eq!(m.decode_errors(), 1, "per-datagram counter unaffected");
+        assert_eq!(m.sample_decode_errors(), 3);
     }
 
     #[test]

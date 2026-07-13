@@ -89,7 +89,9 @@ enum Command {
         /// Per-destination packets-per-second threshold.
         #[arg(long)]
         pps_threshold: f64,
-        /// Per-destination bits-per-second threshold.
+        /// Per-destination bits-per-second threshold. NOTE: computed from the sFlow
+        /// L2 frame length (includes the Ethernet header), so calibrate against L2
+        /// bytes, not L3 payload.
         #[arg(long)]
         bps_threshold: f64,
         /// Sliding window in seconds.
@@ -98,6 +100,18 @@ enum Command {
         /// Hold-down in seconds before clearing a detection.
         #[arg(long, default_value_t = 30)]
         hold_down_secs: u64,
+        /// Minimum raw sFlow samples in-window before a detection may open (guards
+        /// sampling-variance false positives). 0 disables the gate.
+        #[arg(long, default_value_t = 8)]
+        min_samples: usize,
+        /// Ceiling multiplier applied to an agent's expected sampling rate when
+        /// its reported rate is high. A reported rate above `expected * 4` is
+        /// trusted (adaptive samplers legitimately raise their rate under load)
+        /// up to `expected * max_sampling_factor`, and only clamped down beyond
+        /// that ceiling — never clamped down to `expected` itself, which would
+        /// mask a real flood as a false negative.
+        #[arg(long, default_value_t = 64)]
+        max_sampling_factor: u32,
     },
     /// Apply the ruleset and start the deception engine (requires CAP_NET_ADMIN).
     Run {
@@ -1298,7 +1312,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::BirdConfig { config } => {
-            let policy = blackwall_config::parse_file(&config)?;
+            let policy = blackwall_config::parse_and_resolve(&config)?;
             match blackwall_bgp::render_bird_ibgp(&policy) {
                 Ok(s) => {
                     print!("{s}");
@@ -1353,8 +1367,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             bps_threshold,
             window_secs,
             hold_down_secs,
+            min_samples,
+            max_sampling_factor,
         } => {
-            let policy = blackwall_config::parse_file(&config)?;
+            let policy = blackwall_config::parse_and_resolve(&config)?;
             if policy.shadow {
                 tracing::warn!(
                     "SHADOW MODE — mitigations are LOGGED, NOT APPLIED (RTBH/FlowSpec/XDP)"
@@ -1365,12 +1381,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let store = std::sync::Arc::new(blackwall_state::Store::connect(&database_url).await?);
             store.migrate().await?;
             let agents = blackwall_flow::AgentRegistry::from_entries(&policy.pops);
-            let detector = blackwall_flow::ThresholdDetector::new(
-                policy.prefixes.clone(),
+            let detector_config = blackwall_flow::DetectorConfig {
                 pps_threshold,
                 bps_threshold,
-                window_secs * 1000,
-                hold_down_secs * 1000,
+                window_ms: window_secs * 1000,
+                hold_down_ms: hold_down_secs * 1000,
+                min_samples,
+                max_sampling_factor,
+            };
+            let detector = blackwall_flow::ThresholdDetector::new(
+                policy.prefixes.clone(),
+                detector_config,
                 agents,
             );
 

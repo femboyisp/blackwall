@@ -7,16 +7,20 @@ use crate::metrics::CollectorMetrics;
 use crate::sflow::decode_datagram;
 use crate::sink::MitigationSink;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::net::UdpSocket;
 
+/// Process-start baseline for the monotonic detector clock.
+fn clock_base() -> Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// Milliseconds since process start (monotonic). Used for all detector windowing,
+/// eviction, and hold-down math — never affected by NTP/wall-clock steps.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
+    u64::try_from(clock_base().elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Run the collector until the process ends. Binds `listen`, decodes each
@@ -24,8 +28,11 @@ fn now_ms() -> u64 {
 /// window and forwards events to `sink`. Decode errors are logged and skipped.
 ///
 /// When `metrics` is `Some`, the collector increments `datagrams` per received
-/// datagram and `decode_errors` per decode failure, and (after each tick)
-/// publishes the detector's cumulative unknown-agent observation count, for
+/// datagram, `decode_errors` per envelope-level decode failure (the whole
+/// datagram discarded), and `sample_decode_errors` once per malformed sample
+/// inside an otherwise-decoded datagram (the valid samples in that datagram
+/// are still kept), and (after each tick) publishes the detector's cumulative
+/// unknown-agent observation count and minimum-sample-suppressed count, for
 /// the `/metrics` endpoint. Callers with no metrics endpoint pass `None`.
 ///
 /// When `agent_snapshot` is `Some`, the collector overwrites it with
@@ -53,7 +60,10 @@ pub async fn run_collector(
                     Ok((n, _from)) => {
                         if let Some(m) = &metrics { m.incr_datagrams(); }
                         match decode_datagram(&buf[..n]) {
-                            Ok(observations) => {
+                            Ok((observations, sample_errors)) => {
+                                if let Some(m) = &metrics {
+                                    for _ in 0..sample_errors { m.incr_sample_decode_errors(); }
+                                }
                                 let t = now_ms();
                                 for o in &observations { detector.observe(o, t); }
                             }
@@ -73,6 +83,9 @@ pub async fn run_collector(
                 }
                 if let Some(m) = &metrics {
                     m.set_unknown_agent_observations(detector.unknown_agent_observations());
+                    m.set_min_sample_suppressed(detector.min_sample_suppressed());
+                    m.set_detections_opened(detector.detections_opened());
+                    m.set_detections_cleared(detector.detections_cleared());
                 }
                 for event in events {
                     sink.handle(&event).await;

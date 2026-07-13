@@ -24,7 +24,11 @@ pub fn lex(input: &str) -> Vec<Line> {
     let mut pending: Option<(usize, Vec<String>)> = None;
 
     for (idx, raw) in input.lines().enumerate() {
-        let without_comment = match raw.find('#') {
+        let comment_start = raw
+            .char_indices()
+            .find(|&(i, c)| c == '#' && (i == 0 || raw[..i].ends_with(|p: char| p.is_whitespace())))
+            .map(|(i, _)| i);
+        let without_comment = match comment_start {
             Some(pos) => &raw[..pos],
             None => raw,
         };
@@ -109,5 +113,24 @@ mod tests {
         let lines = lex("interface wan eth0 \\\n");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].words, vec!["interface", "wan", "eth0"]);
+    }
+
+    #[test]
+    fn hash_inside_token_is_literal() {
+        let out = lex("rtbh md5=sec#ret\n");
+        assert_eq!(out[0].words, vec!["rtbh", "md5=sec#ret"]);
+    }
+
+    #[test]
+    fn key_equals_hash_value_is_literal() {
+        let out = lex("k key=#val\n");
+        assert_eq!(out[0].words, vec!["k", "key=#val"]);
+    }
+
+    #[test]
+    fn whitespace_preceded_hash_still_comments() {
+        assert_eq!(lex("foo # comment\n")[0].words, vec!["foo"]);
+        assert!(lex("# comment only\n").is_empty());
+        assert!(lex("    # indented comment\n").is_empty());
     }
 }

@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use blackwall_flow::{
-    run_collector, AgentRegistry, DetectionEvent, MitigationSink, ThresholdDetector,
+    run_collector, AgentRegistry, DetectionEvent, DetectorConfig, MitigationSink, ThresholdDetector,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,10 +102,14 @@ async fn detects_volumetric_attack() {
     // prefix 203.0.113.0/24; pps 100k; bps effectively off; window 1s; hold-down 2s.
     let detector = ThresholdDetector::new(
         vec!["203.0.113.0/24".parse().unwrap()],
-        100_000.0,
-        1e15,
-        1000,
-        2000,
+        DetectorConfig {
+            pps_threshold: 100_000.0,
+            bps_threshold: 1e15,
+            window_ms: 1000,
+            hold_down_ms: 2000,
+            min_samples: 0,
+            max_sampling_factor: 64,
+        },
         AgentRegistry::default(),
     );
     let collector = tokio::spawn(run_collector(
@@ -145,10 +149,14 @@ async fn detects_live_sflow_attack() {
     // Monitor the victim's prefix; threshold below the lab flood's estimated pps.
     let detector = Box::new(ThresholdDetector::new(
         vec!["10.0.0.0/30".parse().expect("prefix")],
-        20_000.0,      // pps; pinned in Task 5 validation
-        f64::INFINITY, // bps not gated here
-        1000,          // window_ms
-        2000,          // hold_down_ms
+        DetectorConfig {
+            pps_threshold: 20_000.0,      // pps; pinned in Task 5 validation
+            bps_threshold: f64::INFINITY, // bps not gated here
+            window_ms: 1000,
+            hold_down_ms: 2000,
+            min_samples: 0,
+            max_sampling_factor: 64,
+        },
         AgentRegistry::default(),
     ));
     let sink = Arc::new(CountingSink::default());

@@ -50,20 +50,36 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Decode an sFlow v5 UDP payload into a list of [`FlowObservation`]s.
+/// Decode an sFlow v5 UDP payload into a list of [`FlowObservation`]s, plus a
+/// count of samples that failed to decode.
 ///
 /// Each raw Ethernet header record inside a flow sample that can be parsed
 /// to an IP packet yields one observation.  Counter samples, non-Ethernet
 /// header protocols, and headers that etherparse cannot decode to an IP
 /// layer are silently skipped.
 ///
+/// hsflowd (and other real agents) batch many flow samples into one
+/// datagram; one structurally malformed sample must not discard the valid
+/// observations already decoded from the same datagram. The outer per-sample
+/// framing (`sample_type`/`sample_length`) is read and validated first — once
+/// that succeeds, the exact bounds of the sample body are known regardless of
+/// what is inside it, so a failure *within* a sample (e.g. a record length
+/// past the sample body) cannot desynchronize parsing of the samples that
+/// follow. Such per-sample/record errors are therefore caught, counted in the
+/// returned `u32`, and skipped — decoding continues with the next sample.
+///
 /// # Errors
 ///
-/// Returns [`FlowError::Decode`] only when the datagram is structurally
-/// truncated (a length field would read past the end of the buffer).
-pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> {
+/// Returns [`FlowError::Decode`] only for **envelope-level** framing errors:
+/// the fixed datagram header (version, agent address, sample count) or a
+/// per-sample header (`sample_type`/`sample_length`) running past the end of
+/// the buffer. These corrupt the cursor position itself, so — unlike a bad
+/// record inside an already-bounded sample body — decoding cannot safely
+/// continue past them.
+pub fn decode_datagram(bytes: &[u8]) -> Result<(Vec<FlowObservation>, u32), FlowError> {
     let mut cur = Cursor::new(bytes);
     let mut observations = Vec::new();
+    let mut sample_errors: u32 = 0;
 
     // Datagram envelope.
     let _version = cur.read_u32()?;
@@ -98,15 +114,21 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<Vec<FlowObservation>, FlowError> 
 
         // Flow samples: regular (format 1) and expanded (format 3, used by
         // real agents such as hsflowd). Other sample types (counters) are
-        // skipped.
-        match sample_type & 0xFFF {
-            1 => decode_flow_sample(sample_body, agent, &mut observations)?,
-            3 => decode_expanded_flow_sample(sample_body, agent, &mut observations)?,
+        // skipped. A decode error inside a sample is caught and counted
+        // rather than propagated: the outer `take` above already bounded
+        // this sample's exact extent, so the cursor is safe to continue with
+        // the next sample regardless of what went wrong inside this one.
+        let result = match sample_type & 0xFFF {
+            1 => decode_flow_sample(sample_body, agent, &mut observations),
+            3 => decode_expanded_flow_sample(sample_body, agent, &mut observations),
             _ => continue,
+        };
+        if result.is_err() {
+            sample_errors += 1;
         }
     }
 
-    Ok(observations)
+    Ok((observations, sample_errors))
 }
 
 /// Parse a flow-sample body and append any decoded observations.
@@ -436,7 +458,8 @@ mod tests {
     fn decodes_flow_sample_ipv4_udp() {
         let header = sample_eth_ipv4_udp();
         let dg = sflow_datagram(&header, 1024);
-        let obs = decode_datagram(&dg).unwrap();
+        let (obs, sample_errors) = decode_datagram(&dg).unwrap();
+        assert_eq!(sample_errors, 0);
         assert_eq!(obs.len(), 1);
         let o = obs[0];
         assert_eq!(o.src, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)));
@@ -453,7 +476,8 @@ mod tests {
         let header = sample_eth_ipv4_udp();
         // Expanded (type 3) — must produce one observation identical to type 1.
         let dg_expanded = sflow_datagram_expanded(&header, 512);
-        let obs = decode_datagram(&dg_expanded).unwrap();
+        let (obs, sample_errors) = decode_datagram(&dg_expanded).unwrap();
+        assert_eq!(sample_errors, 0);
         assert_eq!(obs.len(), 1, "expanded flow sample yields one observation");
         let o = obs[0];
         assert_eq!(o.dst, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
@@ -463,7 +487,8 @@ mod tests {
 
         // Regular (type 1) — regression: must still decode after the dispatch change.
         let dg_regular = sflow_datagram(&header, 256);
-        let obs_reg = decode_datagram(&dg_regular).unwrap();
+        let (obs_reg, sample_errors_reg) = decode_datagram(&dg_regular).unwrap();
+        assert_eq!(sample_errors_reg, 0);
         assert_eq!(
             obs_reg.len(),
             1,
@@ -492,13 +517,20 @@ mod tests {
         dd.extend_from_slice(&1u32.to_be_bytes()); // seq
         dd.extend_from_slice(&1000u32.to_be_bytes()); // uptime
         dd.extend_from_slice(&0u32.to_be_bytes()); // num_samples = 0
-        assert!(decode_datagram(&dd).unwrap().is_empty());
+        let (obs, sample_errors) = decode_datagram(&dd).unwrap();
+        assert!(obs.is_empty());
+        assert_eq!(sample_errors, 0);
     }
 
     #[test]
     fn inner_record_length_past_sample_errors() {
         // Build a datagram whose flow sample has num_records=1, record_length=9999
-        // (far past the sample body end) — must propagate as Err.
+        // (far past the sample body end). The outer per-sample framing
+        // (sample_type/sample_length) is intact — only the record *inside*
+        // the sample is malformed — so this is a per-sample error, not an
+        // envelope-level one: the datagram must still decode (0 valid
+        // observations from the bad sample, 1 sample-error counted), not
+        // propagate as `Err`.
         let mut d = Vec::new();
         d.extend_from_slice(&be(5)); // version
         d.extend_from_slice(&be(1)); // agent type ipv4
@@ -525,7 +557,63 @@ mod tests {
         d.extend_from_slice(&be(u32::try_from(flow.len()).unwrap()));
         d.extend_from_slice(&flow);
 
-        assert!(decode_datagram(&d).is_err());
+        let (obs, sample_errors) = decode_datagram(&d).expect("envelope framing is intact");
+        assert!(obs.is_empty(), "the malformed record yields no observation");
+        assert_eq!(sample_errors, 1, "the malformed sample is counted");
+    }
+
+    #[test]
+    fn one_bad_sample_does_not_discard_the_datagram() {
+        // A datagram with [valid flow sample, malformed flow sample] must yield
+        // the valid observation (not lose the whole datagram) plus a
+        // sample-error count of 1 for the malformed one.
+        let header = sample_eth_ipv4_udp();
+        let valid_flow = flow_sample_body(&header, 1024);
+
+        // Malformed flow sample: num_records=1, record_length=9999 (far past
+        // the sample body) — a per-sample/record structural error.
+        let mut malformed_flow = Vec::new();
+        malformed_flow.extend_from_slice(&be(1)); // flow seq
+        malformed_flow.extend_from_slice(&be(0)); // source_id
+        malformed_flow.extend_from_slice(&be(1)); // sampling_rate
+        malformed_flow.extend_from_slice(&be(0)); // sample_pool
+        malformed_flow.extend_from_slice(&be(0)); // drops
+        malformed_flow.extend_from_slice(&be(0)); // input
+        malformed_flow.extend_from_slice(&be(0)); // output
+        malformed_flow.extend_from_slice(&be(1)); // num_records
+        malformed_flow.extend_from_slice(&be(1)); // record_type = raw header
+        malformed_flow.extend_from_slice(&be(9999)); // record_length — far past body
+
+        let mut d = Vec::new();
+        d.extend_from_slice(&be(5)); // version
+        d.extend_from_slice(&be(1)); // agent type ipv4
+        d.extend_from_slice(&[10, 0, 0, 1]); // agent addr
+        d.extend_from_slice(&be(0)); // sub agent
+        d.extend_from_slice(&be(1)); // seq
+        d.extend_from_slice(&be(1000)); // uptime
+        d.extend_from_slice(&be(2)); // num_samples = 2
+
+        d.extend_from_slice(&be(1)); // sample_type = flow sample (valid)
+        d.extend_from_slice(&be(u32::try_from(valid_flow.len()).unwrap()));
+        d.extend_from_slice(&valid_flow);
+
+        d.extend_from_slice(&be(1)); // sample_type = flow sample (malformed)
+        d.extend_from_slice(&be(u32::try_from(malformed_flow.len()).unwrap()));
+        d.extend_from_slice(&malformed_flow);
+
+        let (obs, sample_errors) = decode_datagram(&d).expect("envelope ok");
+        assert_eq!(obs.len(), 1, "the valid sample's observation survives");
+        assert_eq!(
+            sample_errors, 1,
+            "the malformed sample is counted, not propagated as Err"
+        );
+    }
+
+    #[test]
+    fn envelope_truncation_still_errors() {
+        // A datagram cut off inside the fixed envelope header (before even the
+        // sample count can be read) is a framing error and must still be Err.
+        assert!(decode_datagram(&[0, 0, 0, 5]).is_err());
     }
 
     #[test]
@@ -548,7 +636,8 @@ mod tests {
         // Build a datagram with agent 10.222.3.8 (addr type 1) containing one
         // raw-header flow sample (reuse the existing sample-building helper).
         let dg = build_test_datagram_v4_agent([10, 222, 3, 8]);
-        let obs = decode_datagram(&dg).unwrap();
+        let (obs, sample_errors) = decode_datagram(&dg).unwrap();
+        assert_eq!(sample_errors, 0);
         assert!(!obs.is_empty());
         assert!(obs
             .iter()
@@ -559,7 +648,8 @@ mod tests {
     fn decodes_agent_address_v6() {
         let dg =
             build_test_datagram_v6_agent([0x2a, 0x12, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8]);
-        let obs = decode_datagram(&dg).unwrap();
+        let (obs, sample_errors) = decode_datagram(&dg).unwrap();
+        assert_eq!(sample_errors, 0);
         assert!(!obs.is_empty());
         assert!(obs.iter().all(|o| matches!(o.agent, IpAddr::V6(_))));
     }
