@@ -582,6 +582,15 @@ mod tests {
         }
     }
 
+    /// Build a `FlowObservation` destined to a host in `203.0.113.0/24`, for the
+    /// monotonic-clock windowing regression test below. `ms` is accepted (and
+    /// named into the call site) purely for readability, pairing with the
+    /// `now_ms` argument passed separately to `observe`/`tick` — `FlowObservation`
+    /// itself carries no timestamp field.
+    fn obs_at(_ms: u64) -> FlowObservation {
+        obs([203, 0, 113, 7], [198, 51, 100, 9], 1, 100)
+    }
+
     fn agent_ip(o: u8) -> std::net::IpAddr {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 222, 0, o))
     }
@@ -1121,5 +1130,28 @@ mod tests {
             d.top_source_blocks[0].0,
             "198.51.100.0/24".parse::<ipnet::IpNet>().unwrap()
         );
+    }
+
+    #[test]
+    fn detection_windowing_is_monotonic_not_wall_clock() {
+        // Two ticks 5s apart on a MONOTONIC scale must evict correctly even if the
+        // caller's wall clock jumped backward between them. The detector only sees the
+        // ms values it is handed; this documents that the collector must hand it a
+        // monotonic source (regression guard for the collector wiring).
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            100.0,
+            1_000_000_000.0,
+            10_000,
+            30_000,
+            crate::agents::AgentRegistry::from_entries(&[]),
+        );
+        // sample at t=1000 (monotonic), window 10s
+        det.observe(&obs_at(1_000), 1_000); // helper builds a FlowObservation for 203.0.113.7
+                                            // a wall-clock backstep would make a naive now() < 1000; monotonic keeps rising:
+        let events = det.tick(2_000); // still within window; no spurious clear
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, DetectionEvent::Cleared { .. })));
     }
 }

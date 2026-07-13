@@ -7,16 +7,20 @@ use crate::metrics::CollectorMetrics;
 use crate::sflow::decode_datagram;
 use crate::sink::MitigationSink;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::net::UdpSocket;
 
+/// Process-start baseline for the monotonic detector clock.
+fn clock_base() -> Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// Milliseconds since process start (monotonic). Used for all detector windowing,
+/// eviction, and hold-down math — never affected by NTP/wall-clock steps.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
+    u64::try_from(clock_base().elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Run the collector until the process ends. Binds `listen`, decodes each
