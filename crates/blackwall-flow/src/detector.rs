@@ -115,6 +115,18 @@ pub trait Detector {
     fn min_sample_suppressed(&self) -> u64 {
         0
     }
+
+    /// Count of detections opened (`DetectionEvent::Opened`) since start;
+    /// default zero for detectors without such a notion.
+    fn detections_opened(&self) -> u64 {
+        0
+    }
+
+    /// Count of detections cleared (`DetectionEvent::Cleared`) since start;
+    /// default zero for detectors without such a notion.
+    fn detections_cleared(&self) -> u64 {
+        0
+    }
 }
 
 /// Per-POP telemetry snapshot for the metrics endpoint: one entry per agent
@@ -216,6 +228,8 @@ pub struct ThresholdDetector {
     sampling_near_ceiling: HashMap<IpAddr, u64>,
     unknown_agent_observations: u64,
     min_sample_suppressed: u64,
+    detections_opened: u64,
+    detections_cleared: u64,
 }
 
 impl ThresholdDetector {
@@ -248,6 +262,8 @@ impl ThresholdDetector {
             sampling_near_ceiling: HashMap::new(),
             unknown_agent_observations: 0,
             min_sample_suppressed: 0,
+            detections_opened: 0,
+            detections_cleared: 0,
         }
     }
 
@@ -278,6 +294,20 @@ impl ThresholdDetector {
     #[must_use]
     pub fn min_sample_suppressed(&self) -> u64 {
         self.min_sample_suppressed
+    }
+
+    /// Count of detections opened (`DetectionEvent::Opened`) since start.
+    /// Surfaced as `blackwall_flow_detections_opened_total`.
+    #[must_use]
+    pub fn detections_opened(&self) -> u64 {
+        self.detections_opened
+    }
+
+    /// Count of detections cleared (`DetectionEvent::Cleared`) since start.
+    /// Surfaced as `blackwall_flow_detections_cleared_total`.
+    #[must_use]
+    pub fn detections_cleared(&self) -> u64 {
+        self.detections_cleared
     }
 }
 
@@ -370,6 +400,12 @@ impl Detector for ThresholdDetector {
         // field access would otherwise conflict with the `&mut self.state`
         // borrow held by the loop below.
         let mut suppressed: u64 = 0;
+        // Same reasoning as `suppressed` above: accumulated locally and
+        // folded into `self.detections_opened`/`self.detections_cleared`
+        // after the loop, to avoid conflicting with the `&mut self.state`
+        // borrow.
+        let mut opened: u64 = 0;
+        let mut cleared: u64 = 0;
 
         for (dst, state) in &mut self.state {
             // Evict samples outside the window.
@@ -383,6 +419,7 @@ impl Detector for ThresholdDetector {
                         at_ms: now_ms,
                     });
                     to_remove.push(*dst);
+                    cleared = cleared.saturating_add(1);
                 }
                 continue;
             }
@@ -449,6 +486,7 @@ impl Detector for ThresholdDetector {
                         agents: &self.agents,
                     });
                     events.push(DetectionEvent::Opened(detection));
+                    opened = opened.saturating_add(1);
                 }
             } else if state.open {
                 // Under threshold — check hold-down.
@@ -458,6 +496,7 @@ impl Detector for ThresholdDetector {
                         at_ms: now_ms,
                     });
                     to_remove.push(*dst);
+                    cleared = cleared.saturating_add(1);
                 }
             }
         }
@@ -467,6 +506,8 @@ impl Detector for ThresholdDetector {
         }
 
         self.min_sample_suppressed = self.min_sample_suppressed.saturating_add(suppressed);
+        self.detections_opened = self.detections_opened.saturating_add(opened);
+        self.detections_cleared = self.detections_cleared.saturating_add(cleared);
 
         events
     }
@@ -489,6 +530,14 @@ impl Detector for ThresholdDetector {
 
     fn min_sample_suppressed(&self) -> u64 {
         self.min_sample_suppressed
+    }
+
+    fn detections_opened(&self) -> u64 {
+        self.detections_opened
+    }
+
+    fn detections_cleared(&self) -> u64 {
+        self.detections_cleared
     }
 }
 
@@ -1401,5 +1450,24 @@ mod tests {
             .iter()
             .any(|e| matches!(e, DetectionEvent::Opened(_))));
         assert_eq!(det.min_sample_suppressed(), 0);
+    }
+
+    #[test]
+    fn detections_opened_cleared_counters_track_events() {
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            DetectorConfig {
+                hold_down_ms: 1_000,
+                ..test_cfg_factor(1.0, 1e18, 0, 64)
+            },
+            crate::agents::AgentRegistry::from_entries(&[]),
+        );
+        for i in 0..10 {
+            det.observe(&obs_rate_at(1000, 1_000 + i), 1_000 + i);
+        }
+        det.tick(2_000); // opens
+        assert_eq!(det.detections_opened(), 1);
+        det.tick(20_000); // window empty + past hold-down → clears
+        assert_eq!(det.detections_cleared(), 1);
     }
 }

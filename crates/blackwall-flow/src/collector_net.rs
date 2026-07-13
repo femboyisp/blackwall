@@ -84,6 +84,8 @@ pub async fn run_collector(
                 if let Some(m) = &metrics {
                     m.set_unknown_agent_observations(detector.unknown_agent_observations());
                     m.set_min_sample_suppressed(detector.min_sample_suppressed());
+                    m.set_detections_opened(detector.detections_opened());
+                    m.set_detections_cleared(detector.detections_cleared());
                 }
                 for event in events {
                     sink.handle(&event).await;

@@ -18,6 +18,8 @@ pub struct CollectorMetrics {
     sample_decode_errors: AtomicU64,
     unknown_agent_observations: AtomicU64,
     min_sample_suppressed: AtomicU64,
+    detections_opened: AtomicU64,
+    detections_cleared: AtomicU64,
 }
 
 impl CollectorMetrics {
@@ -105,6 +107,33 @@ impl CollectorMetrics {
     pub fn set_min_sample_suppressed(&self, value: u64) {
         self.min_sample_suppressed.store(value, Ordering::Relaxed);
     }
+
+    /// Total detections opened (`Detector::detections_opened`).
+    #[must_use]
+    pub fn detections_opened(&self) -> u64 {
+        self.detections_opened.load(Ordering::Relaxed)
+    }
+
+    /// Publish the detector's current cumulative detections-opened count.
+    /// Mirrors [`Self::set_min_sample_suppressed`]: the detector already
+    /// accumulates this total internally (`Detector::detections_opened`), so
+    /// the collector calls this once per tick with that total rather than
+    /// incrementing per event.
+    pub fn set_detections_opened(&self, value: u64) {
+        self.detections_opened.store(value, Ordering::Relaxed);
+    }
+
+    /// Total detections cleared (`Detector::detections_cleared`).
+    #[must_use]
+    pub fn detections_cleared(&self) -> u64 {
+        self.detections_cleared.load(Ordering::Relaxed)
+    }
+
+    /// Publish the detector's current cumulative detections-cleared count.
+    /// Mirrors [`Self::set_detections_opened`].
+    pub fn set_detections_cleared(&self, value: u64) {
+        self.detections_cleared.store(value, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +148,8 @@ mod tests {
         assert_eq!(m.sample_decode_errors(), 0);
         assert_eq!(m.unknown_agent_observations(), 0);
         assert_eq!(m.min_sample_suppressed(), 0);
+        assert_eq!(m.detections_opened(), 0);
+        assert_eq!(m.detections_cleared(), 0);
     }
 
     #[test]
@@ -138,6 +169,19 @@ mod tests {
         // A later tick with a lower or higher cumulative total simply overwrites.
         m.set_unknown_agent_observations(5);
         assert_eq!(m.unknown_agent_observations(), 5);
+    }
+
+    #[test]
+    fn set_detections_opened_cleared_overwrite_rather_than_accumulate() {
+        let m = CollectorMetrics::new();
+        m.set_detections_opened(3);
+        m.set_detections_cleared(2);
+        assert_eq!(m.detections_opened(), 3);
+        assert_eq!(m.detections_cleared(), 2);
+        m.set_detections_opened(5);
+        m.set_detections_cleared(4);
+        assert_eq!(m.detections_opened(), 5);
+        assert_eq!(m.detections_cleared(), 4);
     }
 
     #[test]

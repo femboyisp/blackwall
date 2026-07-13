@@ -355,6 +355,42 @@ fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
         "blackwall_flow_min_sample_suppressed_total {min_sample_suppressed}"
     );
 
+    // Always emitted alongside the other scalars above, same reasoning:
+    // distinguishes "quiet network" (both zero) from "POP silently dropping
+    // samples" (decode/suppression counters moving but detections never open).
+    let detections_opened = sources
+        .collector
+        .as_ref()
+        .map_or(0, |c| c.detections_opened());
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_flow_detections_opened_total Detections opened by the flow detector"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_flow_detections_opened_total counter");
+    let _ = writeln!(
+        out,
+        "blackwall_flow_detections_opened_total {detections_opened}"
+    );
+
+    let detections_cleared = sources
+        .collector
+        .as_ref()
+        .map_or(0, |c| c.detections_cleared());
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_flow_detections_cleared_total Detections cleared by the flow detector"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_flow_detections_cleared_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "blackwall_flow_detections_cleared_total {detections_cleared}"
+    );
+
     Some(out)
 }
 
