@@ -45,10 +45,18 @@ pub struct SelectionConfig {
 /// fully offline. Otherwise (diffuse, no ports, or no protocol) falls back to RTBH.
 #[must_use]
 pub fn select(d: &Detection, cfg: &SelectionConfig) -> Mitigation {
-    if d.proto == 0 || d.top_ports.is_empty() {
+    if d.proto == 0 || d.top_ports.is_empty() || d.top_ports.iter().all(|(p, _)| *p == 0) {
         return Mitigation::Rtbh;
     }
-    let mut ports = d.top_ports.clone();
+    let mut ports: Vec<(u16, f64)> = d
+        .top_ports
+        .iter()
+        .copied()
+        .filter(|(p, _)| *p != 0)
+        .collect();
+    if ports.is_empty() {
+        return Mitigation::Rtbh;
+    }
     ports.sort_by(|a, b| b.1.total_cmp(&a.1)); // weight desc
     let mut cumulative = 0.0_f64;
     let mut chosen: Vec<u16> = Vec::new();
@@ -186,6 +194,32 @@ mod tests {
     fn empty_ports_or_no_proto_is_rtbh() {
         assert_eq!(select(&det(17, vec![]), &cfg()), Mitigation::Rtbh);
         assert_eq!(select(&det(0, vec![(53, 0.99)]), &cfg()), Mitigation::Rtbh);
+    }
+
+    #[test]
+    fn all_port_zero_selects_rtbh() {
+        let m = select(&det(6, vec![(0, 1.0)]), &cfg());
+        assert!(matches!(m, Mitigation::Rtbh));
+    }
+
+    #[test]
+    fn mixed_port_zero_stripped_real_port_flowspec() {
+        // port 0 = 0.2, port 80 = 0.8 -> strip port 0, port 80 concentrates -> FlowSpec{80} only.
+        let m = select(&det(6, vec![(0, 0.2), (80, 0.8)]), &cfg());
+        match m {
+            Mitigation::FlowSpec(rules) => {
+                assert_eq!(rules.len(), 1);
+                assert_eq!(rules[0].dst_port, 80);
+            }
+            other => panic!("expected FlowSpec{{80}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_port_zero_dominant_falls_back_to_rtbh() {
+        // port 0 = 0.7, port 80 = 0.3 -> strip port 0; port 80 alone doesn't reach 0.8 -> RTBH.
+        let m = select(&det(6, vec![(0, 0.7), (80, 0.3)]), &cfg());
+        assert!(matches!(m, Mitigation::Rtbh));
     }
 
     #[test]
