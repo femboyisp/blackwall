@@ -14,6 +14,20 @@ use std::sync::Arc;
 /// Default row cap for the `sessions`/`audit` feeds.
 const DEFAULT_LIMIT: i64 = 100;
 
+/// Upper bound on the `sessions`/`audit` feed `?limit=`, regardless of what
+/// the caller requests.
+const MAX_LIMIT: i64 = 1000;
+
+/// Clamp a requested feed `limit` to `[1, MAX_LIMIT]`, defaulting to
+/// `DEFAULT_LIMIT` when absent.
+///
+/// Guards the `LIMIT $1` bind in the feed queries: a negative or zero value
+/// would otherwise reach Postgres and error out, and an unbounded value
+/// would dump the entire table.
+fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
 /// `?limit=` query for the capped feeds.
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
@@ -178,7 +192,7 @@ pub async fn list_sessions(
     State(s): St,
     Query(q): Query<LimitQuery>,
 ) -> ApiResult<Json<Vec<SessionDto>>> {
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = clamp_limit(q.limit);
     Ok(Json(
         s.sessions(limit)
             .await?
@@ -200,7 +214,7 @@ pub async fn list_audit(
     State(s): St,
     Query(q): Query<LimitQuery>,
 ) -> ApiResult<Json<Vec<AuditDto>>> {
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = clamp_limit(q.limit);
     Ok(Json(
         s.audit(limit)
             .await?
@@ -208,4 +222,18 @@ pub async fn list_audit(
             .map(AuditDto::from)
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_is_clamped() {
+        assert_eq!(clamp_limit(Some(-1)), 1);
+        assert_eq!(clamp_limit(Some(0)), 1);
+        assert_eq!(clamp_limit(Some(i64::MAX)), MAX_LIMIT);
+        assert_eq!(clamp_limit(None), DEFAULT_LIMIT);
+        assert_eq!(clamp_limit(Some(50)), 50);
+    }
 }
