@@ -14,7 +14,8 @@ mod sink;
 pub use agents::AgentRegistry;
 pub use collector_net::run_collector;
 pub use detector::{
-    AgentStat, AttackKind, Detection, DetectionEvent, Detector, Severity, ThresholdDetector,
+    AgentStat, AttackKind, Detection, DetectionEvent, Detector, DetectorConfig, Severity,
+    ThresholdDetector,
 };
 pub use error::FlowError;
 pub use metrics::CollectorMetrics;

@@ -98,6 +98,10 @@ enum Command {
         /// Hold-down in seconds before clearing a detection.
         #[arg(long, default_value_t = 30)]
         hold_down_secs: u64,
+        /// Minimum raw sFlow samples in-window before a detection may open (guards
+        /// sampling-variance false positives). 0 disables the gate.
+        #[arg(long, default_value_t = 8)]
+        min_samples: usize,
     },
     /// Apply the ruleset and start the deception engine (requires CAP_NET_ADMIN).
     Run {
@@ -1353,6 +1357,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             bps_threshold,
             window_secs,
             hold_down_secs,
+            min_samples,
         } => {
             let policy = blackwall_config::parse_file(&config)?;
             if policy.shadow {
@@ -1365,12 +1370,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let store = std::sync::Arc::new(blackwall_state::Store::connect(&database_url).await?);
             store.migrate().await?;
             let agents = blackwall_flow::AgentRegistry::from_entries(&policy.pops);
-            let detector = blackwall_flow::ThresholdDetector::new(
-                policy.prefixes.clone(),
+            let detector_config = blackwall_flow::DetectorConfig {
                 pps_threshold,
                 bps_threshold,
-                window_secs * 1000,
-                hold_down_secs * 1000,
+                window_ms: window_secs * 1000,
+                hold_down_ms: hold_down_secs * 1000,
+                min_samples,
+            };
+            let detector = blackwall_flow::ThresholdDetector::new(
+                policy.prefixes.clone(),
+                detector_config,
                 agents,
             );
 

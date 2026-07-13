@@ -109,6 +109,12 @@ pub trait Detector {
     fn unknown_agent_observations(&self) -> u64 {
         0
     }
+
+    /// Count of detections suppressed solely by the minimum-sample gate;
+    /// default zero for detectors without such a gate.
+    fn min_sample_suppressed(&self) -> u64 {
+        0
+    }
 }
 
 /// Per-POP telemetry snapshot for the metrics endpoint: one entry per agent
@@ -152,6 +158,31 @@ struct DstState {
 }
 
 // ---------------------------------------------------------------------------
+// DetectorConfig
+// ---------------------------------------------------------------------------
+
+/// Scalar knobs for [`ThresholdDetector::new`], grouped into a struct so
+/// adding future knobs (e.g. D3's `max_sampling_factor`) doesn't push the
+/// constructor's arity past `clippy::too_many_arguments`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetectorConfig {
+    /// Packets per second above which an attack is declared.
+    pub pps_threshold: f64,
+    /// Bits per second above which an attack is declared.
+    pub bps_threshold: f64,
+    /// Sliding window size in milliseconds for rate computation.
+    pub window_ms: u64,
+    /// Milliseconds below threshold before a detection is cleared.
+    pub hold_down_ms: u64,
+    /// Minimum raw in-window sample count before a detection may open. Guards
+    /// against sampling-variance false positives, where a tiny number of
+    /// samples at a high configured sampling rate extrapolate to an
+    /// over-threshold estimated rate despite carrying almost no statistical
+    /// weight. `0` disables the gate.
+    pub min_samples: usize,
+}
+
+// ---------------------------------------------------------------------------
 // ThresholdDetector
 // ---------------------------------------------------------------------------
 
@@ -163,11 +194,13 @@ pub struct ThresholdDetector {
     bps_threshold: f64,
     window_ms: u64,
     hold_down_ms: u64,
+    min_samples: usize,
     state: HashMap<IpAddr, DstState>,
     agents: crate::agents::AgentRegistry,
     agent_last_seen: HashMap<IpAddr, u64>,
     sampling_mismatches: HashMap<IpAddr, u64>,
     unknown_agent_observations: u64,
+    min_sample_suppressed: u64,
 }
 
 impl ThresholdDetector {
@@ -176,31 +209,28 @@ impl ThresholdDetector {
     /// # Parameters
     ///
     /// - `prefixes` — only destinations within these prefixes are monitored.
-    /// - `pps_threshold` — packets per second above which an attack is declared.
-    /// - `bps_threshold` — bits per second above which an attack is declared.
-    /// - `window_ms` — sliding window size in milliseconds for rate computation.
-    /// - `hold_down_ms` — milliseconds below threshold before a detection is cleared.
+    /// - `config` — the scalar thresholds/timings/minimum-sample gate (see
+    ///   [`DetectorConfig`]).
     /// - `agents` — registry of known sFlow agents and their expected sampling
     ///   rates, used for liveness tracking and the sampling-sanity clamp.
     pub fn new(
         prefixes: Vec<IpNet>,
-        pps_threshold: f64,
-        bps_threshold: f64,
-        window_ms: u64,
-        hold_down_ms: u64,
+        config: DetectorConfig,
         agents: crate::agents::AgentRegistry,
     ) -> Self {
         Self {
             prefixes,
-            pps_threshold,
-            bps_threshold,
-            window_ms,
-            hold_down_ms,
+            pps_threshold: config.pps_threshold,
+            bps_threshold: config.bps_threshold,
+            window_ms: config.window_ms,
+            hold_down_ms: config.hold_down_ms,
+            min_samples: config.min_samples,
             state: HashMap::new(),
             agents,
             agent_last_seen: HashMap::new(),
             sampling_mismatches: HashMap::new(),
             unknown_agent_observations: 0,
+            min_sample_suppressed: 0,
         }
     }
 
@@ -213,6 +243,14 @@ impl ThresholdDetector {
     /// because it deviated far from the agent's configured expected rate.
     pub fn sampling_mismatches(&self) -> &HashMap<IpAddr, u64> {
         &self.sampling_mismatches
+    }
+
+    /// Count of detections suppressed solely by the minimum-sample gate
+    /// (rate crossed threshold but the raw in-window sample count was below
+    /// `min_samples`). Surfaced as `blackwall_flow_min_sample_suppressed_total`.
+    #[must_use]
+    pub fn min_sample_suppressed(&self) -> u64 {
+        self.min_sample_suppressed
     }
 }
 
@@ -277,6 +315,7 @@ impl Detector for ThresholdDetector {
         let pps_threshold = self.pps_threshold;
         let bps_threshold = self.bps_threshold;
         let hold_down_ms = self.hold_down_ms;
+        let min_samples = self.min_samples;
 
         #[expect(
             clippy::cast_precision_loss,
@@ -286,6 +325,11 @@ impl Detector for ThresholdDetector {
 
         let mut events = Vec::new();
         let mut to_remove = Vec::new();
+        // Accumulated locally and folded into `self.min_sample_suppressed`
+        // after the loop — `self.min_samples`/`self.min_sample_suppressed`
+        // field access would otherwise conflict with the `&mut self.state`
+        // borrow held by the loop below.
+        let mut suppressed: u64 = 0;
 
         for (dst, state) in &mut self.state {
             // Evict samples outside the window.
@@ -326,7 +370,11 @@ impl Detector for ThresholdDetector {
             )]
             let bps = (total_bytes as f64) * 8.0 / window_secs;
 
-            let over_threshold = pps > pps_threshold || bps > bps_threshold;
+            let rate_over = pps > pps_threshold || bps > bps_threshold;
+            let over_threshold = rate_over && state.samples.len() >= min_samples;
+            if rate_over && !over_threshold {
+                suppressed = suppressed.saturating_add(1);
+            }
 
             if over_threshold {
                 state.last_over_ms = now_ms;
@@ -378,6 +426,8 @@ impl Detector for ThresholdDetector {
             self.state.remove(&dst);
         }
 
+        self.min_sample_suppressed = self.min_sample_suppressed.saturating_add(suppressed);
+
         events
     }
 
@@ -394,6 +444,10 @@ impl Detector for ThresholdDetector {
 
     fn unknown_agent_observations(&self) -> u64 {
         self.unknown_agent_observations
+    }
+
+    fn min_sample_suppressed(&self) -> u64 {
+        self.min_sample_suppressed
     }
 }
 
@@ -595,6 +649,28 @@ mod tests {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 222, 0, o))
     }
 
+    /// A `DetectorConfig` for tests: fixed `window_ms: 10_000, hold_down_ms:
+    /// 30_000` defaults, with the caller supplying the values that vary
+    /// per-test (thresholds + minimum-sample gate).
+    fn test_cfg(pps: f64, bps: f64, min_samples: usize) -> DetectorConfig {
+        DetectorConfig {
+            pps_threshold: pps,
+            bps_threshold: bps,
+            window_ms: 10_000,
+            hold_down_ms: 30_000,
+            min_samples,
+        }
+    }
+
+    /// Build a `FlowObservation` destined to a host in `203.0.113.0/24` with
+    /// the given `sampling_rate`. `t_ms` is accepted (and named into the call
+    /// site) purely for readability at the call site, pairing with the
+    /// `now_ms` argument passed separately to `observe` — `FlowObservation`
+    /// itself carries no timestamp field.
+    fn obs_rate_at(rate: u32, _t_ms: u64) -> FlowObservation {
+        obs([203, 0, 113, 7], [198, 51, 100, 9], rate, 100)
+    }
+
     /// Test helper for agent-aware observations (distinct from `obs` above,
     /// which predates agent-awareness and is kept for the existing tests).
     fn agent_obs(
@@ -621,10 +697,13 @@ mod tests {
         // prefix 203.0.113.0/24; pps threshold 100k; bps very high; window 1s; hold-down 2s
         ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            100_000.0,
-            1e15,
-            1000,
-            2000,
+            DetectorConfig {
+                pps_threshold: 100_000.0,
+                bps_threshold: 1e15,
+                window_ms: 1000,
+                hold_down_ms: 2000,
+                min_samples: 0,
+            },
             AgentRegistry::default(),
         )
     }
@@ -776,10 +855,13 @@ mod tests {
         // window_ms = 0 must be clamped to 1 ms, not produce inf rates.
         let mut d = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1e15, // impossibly high pps threshold
-            1e15, // impossibly high bps threshold
-            0,    // zero window — the fix clamps this to 1ms
-            2000,
+            DetectorConfig {
+                pps_threshold: 1e15, // impossibly high pps threshold
+                bps_threshold: 1e15, // impossibly high bps threshold
+                window_ms: 0,        // zero window — the fix clamps this to 1ms
+                hold_down_ms: 2000,
+                min_samples: 0,
+            },
             AgentRegistry::default(),
         );
         // A modest number of samples that should not cross 1e15 threshold.
@@ -799,10 +881,13 @@ mod tests {
         // Set very high pps threshold but low bps threshold.
         let mut d = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1e12,   // pps impossibly high
-            1000.0, // bps very low
-            1000,
-            2000,
+            DetectorConfig {
+                pps_threshold: 1e12,   // pps impossibly high
+                bps_threshold: 1000.0, // bps very low
+                window_ms: 1000,
+                hold_down_ms: 2000,
+                min_samples: 0,
+            },
             AgentRegistry::default(),
         );
         // 1 sample * rate=1 * frame_len=200 → est_bytes=200 → bps = 200*8/1 = 1600 > 1000
@@ -819,10 +904,13 @@ mod tests {
         // With u128 saturating sums this must NOT panic and must produce a finite, very large rate.
         let mut d = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0, // very low pps threshold so a detection opens
-            1.0, // very low bps threshold
-            1000,
-            2000,
+            DetectorConfig {
+                pps_threshold: 1.0, // very low pps threshold so a detection opens
+                bps_threshold: 1.0, // very low bps threshold
+                window_ms: 1000,
+                hold_down_ms: 2000,
+                min_samples: 0,
+            },
             AgentRegistry::default(),
         );
         let max_rate = u32::MAX;
@@ -862,10 +950,13 @@ mod tests {
         let mk = || {
             ThresholdDetector::new(
                 vec!["203.0.113.0/24".parse().unwrap()],
-                1.0,
-                1.0,
-                window_ms,
-                30_000,
+                DetectorConfig {
+                    pps_threshold: 1.0,
+                    bps_threshold: 1.0,
+                    window_ms,
+                    hold_down_ms: 30_000,
+                    min_samples: 0,
+                },
                 AgentRegistry::from_entries(&[PopEntry {
                     name: "ord".into(),
                     agent: agent_ip(8),
@@ -916,10 +1007,7 @@ mod tests {
         }]);
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0,
-            1.0,
-            10_000,
-            30_000,
+            test_cfg(1.0, 1.0, 0),
             reg,
         );
         det.observe(
@@ -941,10 +1029,7 @@ mod tests {
         }]);
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0,
-            1.0,
-            10_000,
-            30_000,
+            test_cfg(1.0, 1.0, 0),
             reg,
         );
 
@@ -976,10 +1061,7 @@ mod tests {
         ]);
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0,
-            1.0,
-            10_000,
-            30_000,
+            test_cfg(1.0, 1.0, 0),
             reg,
         );
 
@@ -1007,10 +1089,7 @@ mod tests {
         }]);
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0,
-            1.0,
-            10_000,
-            30_000,
+            test_cfg(1.0, 1.0, 0),
             reg,
         );
         // Rogue rate (1) vs expected 1000 -> clamped, one mismatch recorded.
@@ -1035,10 +1114,7 @@ mod tests {
         }]);
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0,
-            1.0,
-            10_000,
-            30_000,
+            test_cfg(1.0, 1.0, 0),
             reg,
         );
         det.observe(
@@ -1057,10 +1133,7 @@ mod tests {
         }]);
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0,
-            1.0,
-            10_000,
-            30_000,
+            test_cfg(1.0, 1.0, 0),
             reg,
         );
         assert_eq!(det.unknown_agent_observations(), 0);
@@ -1100,10 +1173,7 @@ mod tests {
         ]);
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            1.0,
-            1.0,
-            10_000,
-            30_000,
+            test_cfg(1.0, 1.0, 0),
             reg,
         );
         // Two POPs each see traffic to the same victim from the same /24.
@@ -1140,10 +1210,7 @@ mod tests {
         // monotonic source (regression guard for the collector wiring).
         let mut det = ThresholdDetector::new(
             vec!["203.0.113.0/24".parse().unwrap()],
-            100.0,
-            1_000_000_000.0,
-            10_000,
-            30_000,
+            test_cfg(100.0, 1_000_000_000.0, 0),
             crate::agents::AgentRegistry::from_entries(&[]),
         );
         // sample at t=1000 (monotonic), window 10s
@@ -1153,5 +1220,46 @@ mod tests {
         assert!(events
             .iter()
             .all(|e| !matches!(e, DetectionEvent::Cleared { .. })));
+    }
+
+    #[test]
+    fn min_sample_gate_blocks_variance_false_positive() {
+        // 2 samples @ 1-in-65536 extrapolate to ~131k pps (2 * 65536 / 1s) > 100k
+        // threshold, but with min_samples=8 the gate suppresses the detection and
+        // counts it. window_ms overridden to 1_000 (from test_cfg's 10_000 default)
+        // so the 1-second rate math matches; tick at 1_100 (not yet past the
+        // window) so both samples are still in-window when evaluated.
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            DetectorConfig {
+                window_ms: 1_000,
+                ..test_cfg(100_000.0, 1e18, 8) // pps, bps, min_samples
+            },
+            crate::agents::AgentRegistry::from_entries(&[]),
+        );
+        det.observe(&obs_rate_at(65_536, 1_000), 1_000); // sampling_rate=65536, t=1000
+        det.observe(&obs_rate_at(65_536, 1_100), 1_100);
+        let events = det.tick(1_100);
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, DetectionEvent::Opened(_))));
+        assert_eq!(det.min_sample_suppressed(), 1);
+    }
+
+    #[test]
+    fn min_sample_gate_allows_real_flood() {
+        let mut det = ThresholdDetector::new(
+            vec!["203.0.113.0/24".parse().unwrap()],
+            test_cfg(100_000.0, 1e18, 8),
+            crate::agents::AgentRegistry::from_entries(&[]),
+        );
+        for i in 0..20 {
+            det.observe(&obs_rate_at(65_536, 1_000 + i), 1_000 + i); // 20 samples ≥ 8
+        }
+        let events = det.tick(2_000);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DetectionEvent::Opened(_))));
+        assert_eq!(det.min_sample_suppressed(), 0);
     }
 }

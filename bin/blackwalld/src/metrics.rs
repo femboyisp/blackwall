@@ -241,7 +241,8 @@ fn xdp_block(sources: &MetricsSources) -> Option<String> {
 
 /// Render the per-POP telemetry blocks (`blackwall_flow_pop_last_seen_seconds`,
 /// `blackwall_flow_agent_sampling_mismatch_total`) plus the
-/// `blackwall_flow_unknown_agent_observations_total` scalar, or `None` when the
+/// `blackwall_flow_unknown_agent_observations_total` and
+/// `blackwall_flow_min_sample_suppressed_total` scalars, or `None` when the
 /// flow daemon has no per-agent snapshot wired up (`sources.agent_stats` is
 /// `None` — the deception engine, which has no sFlow collector).
 ///
@@ -311,6 +312,25 @@ fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
     let _ = writeln!(
         out,
         "blackwall_flow_unknown_agent_observations_total {unknown}"
+    );
+
+    // Always emitted alongside `unknown_agent_observations_total`, same reasoning.
+    let min_sample_suppressed = sources
+        .collector
+        .as_ref()
+        .map_or(0, |c| c.min_sample_suppressed());
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_flow_min_sample_suppressed_total Detections suppressed by the minimum-sample gate"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_flow_min_sample_suppressed_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "blackwall_flow_min_sample_suppressed_total {min_sample_suppressed}"
     );
 
     Some(out)

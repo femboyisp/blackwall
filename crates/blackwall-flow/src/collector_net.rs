@@ -29,8 +29,9 @@ fn now_ms() -> u64 {
 ///
 /// When `metrics` is `Some`, the collector increments `datagrams` per received
 /// datagram and `decode_errors` per decode failure, and (after each tick)
-/// publishes the detector's cumulative unknown-agent observation count, for
-/// the `/metrics` endpoint. Callers with no metrics endpoint pass `None`.
+/// publishes the detector's cumulative unknown-agent observation count and
+/// minimum-sample-suppressed count, for the `/metrics` endpoint. Callers with
+/// no metrics endpoint pass `None`.
 ///
 /// When `agent_snapshot` is `Some`, the collector overwrites it with
 /// `detector.agent_stats()` after each tick, so `/metrics` can render
@@ -77,6 +78,7 @@ pub async fn run_collector(
                 }
                 if let Some(m) = &metrics {
                     m.set_unknown_agent_observations(detector.unknown_agent_observations());
+                    m.set_min_sample_suppressed(detector.min_sample_suppressed());
                 }
                 for event in events {
                     sink.handle(&event).await;

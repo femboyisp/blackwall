@@ -16,6 +16,7 @@ pub struct CollectorMetrics {
     datagrams: AtomicU64,
     decode_errors: AtomicU64,
     unknown_agent_observations: AtomicU64,
+    min_sample_suppressed: AtomicU64,
 }
 
 impl CollectorMetrics {
@@ -65,6 +66,22 @@ impl CollectorMetrics {
         self.unknown_agent_observations
             .store(value, Ordering::Relaxed);
     }
+
+    /// Total detections suppressed solely by the detector's minimum-sample
+    /// gate (`Detector::min_sample_suppressed`).
+    #[must_use]
+    pub fn min_sample_suppressed(&self) -> u64 {
+        self.min_sample_suppressed.load(Ordering::Relaxed)
+    }
+
+    /// Publish the detector's current cumulative minimum-sample-suppressed
+    /// count. Mirrors [`Self::set_unknown_agent_observations`]: the detector
+    /// already accumulates this total internally
+    /// (`Detector::min_sample_suppressed`), so the collector calls this once
+    /// per tick with that total rather than incrementing per event.
+    pub fn set_min_sample_suppressed(&self, value: u64) {
+        self.min_sample_suppressed.store(value, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +94,16 @@ mod tests {
         assert_eq!(m.datagrams(), 0);
         assert_eq!(m.decode_errors(), 0);
         assert_eq!(m.unknown_agent_observations(), 0);
+        assert_eq!(m.min_sample_suppressed(), 0);
+    }
+
+    #[test]
+    fn set_min_sample_suppressed_overwrites_rather_than_accumulates() {
+        let m = CollectorMetrics::new();
+        m.set_min_sample_suppressed(3);
+        assert_eq!(m.min_sample_suppressed(), 3);
+        m.set_min_sample_suppressed(5);
+        assert_eq!(m.min_sample_suppressed(), 5);
     }
 
     #[test]
