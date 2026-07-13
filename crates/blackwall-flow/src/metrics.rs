@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct CollectorMetrics {
     datagrams: AtomicU64,
     decode_errors: AtomicU64,
+    sample_decode_errors: AtomicU64,
     unknown_agent_observations: AtomicU64,
     min_sample_suppressed: AtomicU64,
 }
@@ -46,6 +47,28 @@ impl CollectorMetrics {
     /// Record one datagram that failed to decode.
     pub fn incr_decode_errors(&self) {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total individual flow/counter *samples* (within an otherwise-decoded
+    /// datagram) that failed to decode and were skipped.
+    ///
+    /// Distinct from [`Self::decode_errors`]: that counter tracks whole
+    /// datagrams whose envelope framing was unreadable (discarding every
+    /// observation in the datagram), while this one tracks samples inside a
+    /// datagram whose envelope decoded fine — e.g. hsflowd batches many flow
+    /// samples per datagram, and one malformed sample no longer discards the
+    /// rest. Keeping the two separate lets an operator tell "this POP is
+    /// sending malformed datagrams" (`decode_errors`) apart from "this POP is
+    /// dropping/corrupting individual samples" (`sample_decode_errors`).
+    #[must_use]
+    pub fn sample_decode_errors(&self) -> u64 {
+        self.sample_decode_errors.load(Ordering::Relaxed)
+    }
+
+    /// Record one sample that failed to decode within an otherwise-valid
+    /// datagram. See [`Self::sample_decode_errors`].
+    pub fn incr_sample_decode_errors(&self) {
+        self.sample_decode_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Total sample observations attributed to agents absent from the POP
@@ -93,6 +116,7 @@ mod tests {
         let m = CollectorMetrics::new();
         assert_eq!(m.datagrams(), 0);
         assert_eq!(m.decode_errors(), 0);
+        assert_eq!(m.sample_decode_errors(), 0);
         assert_eq!(m.unknown_agent_observations(), 0);
         assert_eq!(m.min_sample_suppressed(), 0);
     }
@@ -124,6 +148,17 @@ mod tests {
         m.incr_decode_errors();
         assert_eq!(m.datagrams(), 2);
         assert_eq!(m.decode_errors(), 1);
+    }
+
+    #[test]
+    fn incr_sample_decode_errors_is_distinct_from_decode_errors() {
+        let m = CollectorMetrics::new();
+        m.incr_decode_errors();
+        m.incr_sample_decode_errors();
+        m.incr_sample_decode_errors();
+        m.incr_sample_decode_errors();
+        assert_eq!(m.decode_errors(), 1, "per-datagram counter unaffected");
+        assert_eq!(m.sample_decode_errors(), 3);
     }
 
     #[test]

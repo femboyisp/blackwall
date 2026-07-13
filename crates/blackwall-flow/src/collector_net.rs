@@ -28,10 +28,12 @@ fn now_ms() -> u64 {
 /// window and forwards events to `sink`. Decode errors are logged and skipped.
 ///
 /// When `metrics` is `Some`, the collector increments `datagrams` per received
-/// datagram and `decode_errors` per decode failure, and (after each tick)
-/// publishes the detector's cumulative unknown-agent observation count and
-/// minimum-sample-suppressed count, for the `/metrics` endpoint. Callers with
-/// no metrics endpoint pass `None`.
+/// datagram, `decode_errors` per envelope-level decode failure (the whole
+/// datagram discarded), and `sample_decode_errors` once per malformed sample
+/// inside an otherwise-decoded datagram (the valid samples in that datagram
+/// are still kept), and (after each tick) publishes the detector's cumulative
+/// unknown-agent observation count and minimum-sample-suppressed count, for
+/// the `/metrics` endpoint. Callers with no metrics endpoint pass `None`.
 ///
 /// When `agent_snapshot` is `Some`, the collector overwrites it with
 /// `detector.agent_stats()` after each tick, so `/metrics` can render
@@ -58,7 +60,10 @@ pub async fn run_collector(
                     Ok((n, _from)) => {
                         if let Some(m) = &metrics { m.incr_datagrams(); }
                         match decode_datagram(&buf[..n]) {
-                            Ok(observations) => {
+                            Ok((observations, sample_errors)) => {
+                                if let Some(m) = &metrics {
+                                    for _ in 0..sample_errors { m.incr_sample_decode_errors(); }
+                                }
                                 let t = now_ms();
                                 for o in &observations { detector.observe(o, t); }
                             }

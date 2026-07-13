@@ -100,6 +100,12 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             kind: MetricKind::Counter,
             value: u64_to_f64(collector.decode_errors()),
         });
+        m.push(Metric {
+            name: "blackwall_flow_sample_decode_errors_total",
+            help: "sFlow samples that failed to decode within an otherwise-valid datagram",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(collector.sample_decode_errors()),
+        });
     }
     if let Some(inflight) = &sources.inflight {
         m.push(Metric {
