@@ -1312,7 +1312,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::BirdConfig { config } => {
-            let policy = blackwall_config::parse_file(&config)?;
+            let policy = blackwall_config::parse_and_resolve(&config)?;
             match blackwall_bgp::render_bird_ibgp(&policy) {
                 Ok(s) => {
                     print!("{s}");
@@ -1370,7 +1370,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             min_samples,
             max_sampling_factor,
         } => {
-            let policy = blackwall_config::parse_file(&config)?;
+            let policy = blackwall_config::parse_and_resolve(&config)?;
             if policy.shadow {
                 tracing::warn!(
                     "SHADOW MODE — mitigations are LOGGED, NOT APPLIED (RTBH/FlowSpec/XDP)"

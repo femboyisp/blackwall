@@ -34,4 +34,12 @@ pub enum ConfigError {
     /// The config file could not be read.
     #[error("reading config: {0}")]
     Io(#[from] std::io::Error),
+    /// The config parsed successfully but is semantically invalid: an owned
+    /// address falls outside every managed prefix, two tenants claim the
+    /// same address, or the same service is defined more than once. Surfaced
+    /// by [`crate::parse_and_resolve`] so load-time paths (`flow`,
+    /// `bird-config`) fail before ever running, instead of misbehaving
+    /// silently at apply time.
+    #[error("config failed validation: {0}")]
+    Resolve(#[from] blackwall_core::PolicyError),
 }
