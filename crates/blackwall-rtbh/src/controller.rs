@@ -220,6 +220,22 @@ impl RtbhController {
             .any(|p| p.contains(&target))
     }
 
+    /// Whether `target` falls inside a configured protected prefix (own
+    /// anycast VIP or similar always-safe destination that must never be
+    /// mitigated).
+    ///
+    /// Pure accessor over [`RtbhConfig::protected_prefixes`]; mirrors
+    /// [`Self::is_eligible`] so a caller (e.g. the manager) can classify a
+    /// rejected `manual_add` without duplicating the controller's
+    /// self-protection logic.
+    #[must_use]
+    pub fn is_protected(&self, target: IpAddr) -> bool {
+        self.config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+    }
+
     /// Whether a next-hop is configured for `target`'s address family.
     ///
     /// Pure accessor over [`RtbhConfig::next_hop_v4`] / `next_hop_v6`; lets a

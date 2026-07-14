@@ -293,6 +293,22 @@ impl FlowSpecController {
             .any(|p| p.contains(&target))
     }
 
+    /// Whether `target`'s host route falls inside a configured protected
+    /// prefix (own anycast VIP or similar always-safe destination that must
+    /// never be mitigated).
+    ///
+    /// Pure accessor over [`FlowSpecConfig::protected_prefixes`]; mirrors
+    /// [`Self::is_eligible`] so a caller (e.g. the manager) can classify a
+    /// rejected `manual_add` without duplicating the controller's
+    /// self-protection logic.
+    #[must_use]
+    pub fn is_protected(&self, target: IpAddr) -> bool {
+        self.config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+    }
+
     /// Number of targets skipped because they fell inside a configured
     /// [`FlowSpecConfig::protected_prefixes`] entry (own anycast VIP or
     /// similar always-safe destination) — the anycast self-protection guard

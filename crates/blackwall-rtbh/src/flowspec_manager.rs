@@ -172,8 +172,9 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     /// Returns [`ApplyOutcome::Applied`] if newly installed or upgraded from
     /// `Auto` to `Manual` (re-journaled as `Manual` in the latter case),
     /// [`ApplyOutcome::Deferred`] if the manager is at capacity, or
-    /// [`ApplyOutcome::Rejected`] if the target is ineligible. Unlike RTBH,
-    /// FlowSpec carries no next-hop, so there is no next-hop rejection case.
+    /// [`ApplyOutcome::Rejected`] if the target is protected or ineligible.
+    /// Unlike RTBH, FlowSpec carries no next-hop, so there is no next-hop
+    /// rejection case.
     pub async fn apply_add(
         &mut self,
         rule: FlowSpecRule,
@@ -204,6 +205,15 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
                 });
             }
             return ApplyOutcome::Applied;
+        }
+        // Checked before eligibility: a protected target is typically ALSO
+        // eligible (that's the point — protected VIPs live inside eligible
+        // prefixes), so it must be rejected outright here rather than falling
+        // through to Deferred, which would retry forever and never resolve.
+        if self.controller.is_protected(target) {
+            return ApplyOutcome::Rejected(format!(
+                "{target} is inside a protected prefix and is never mitigated"
+            ));
         }
         if !self.controller.is_eligible(target) {
             return ApplyOutcome::Rejected(format!("{target} is outside eligible prefixes"));
@@ -751,6 +761,41 @@ mod tests {
         assert_eq!(
             m.apply_add(rule("203.0.113.1/32", 6, 443, 0.0), 0, 0).await,
             ApplyOutcome::Deferred
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_add_protected_target_is_rejected_not_deferred() {
+        // Target sits inside BOTH an eligible prefix and a protected prefix —
+        // exactly the overlap the protected-prefix guard exists for (an
+        // anycast VIP inside a customer-eligible block). A manual add must be
+        // classified as Rejected, not Deferred: a Deferred outcome leaves the
+        // request row 'pending' forever, retried every tick, indistinguishable
+        // from a transient capacity wait that will never resolve (C1 follow-up).
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(FlowSpecConfig {
+                protected_prefixes: vec!["203.0.113.53/32".parse().unwrap()],
+                ..cfg()
+            }),
+            FakeBgp::default(),
+            FakeJournal::default(),
+        );
+        let outcome = m
+            .apply_add(rule("203.0.113.53/32", 17, 53, 0.0), 0, 0)
+            .await;
+        match &outcome {
+            ApplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("protected"),
+                    "reason should mention 'protected': {reason}"
+                );
+            }
+            other => panic!("protected target must be Rejected, not {other:?}"),
+        }
+        assert!(m.active().is_empty());
+        assert!(
+            m.bgp().announced.lock().unwrap().is_empty(),
+            "no Announce may be executed for a protected target"
         );
     }
 
