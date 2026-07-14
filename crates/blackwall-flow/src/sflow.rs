@@ -8,7 +8,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use etherparse::{LaxNetSlice, LaxSlicedPacket, TransportSlice};
 
 use crate::{FlowError, FlowObservation};
 
@@ -233,17 +233,24 @@ fn decode_raw_header_record(
         return None;
     }
 
-    let sliced = SlicedPacket::from_ethernet(header_bytes).ok()?;
+    // Real agents (hsflowd header-sampling) truncate the packet to a snaplen, so
+    // the captured header's IP total-length field exceeds the bytes present. The
+    // strict `SlicedPacket::from_ethernet` rejects that with a `LenError` and the
+    // sample is silently dropped (the detector goes blind to all real sFlow); the
+    // lax parser reads the headers that ARE present, which is all the volume math
+    // and flow-key need (ports/addrs live in the captured header, and `frame_len`
+    // comes from the sFlow record below, not the truncated slice).
+    let sliced = LaxSlicedPacket::from_ethernet(header_bytes).ok()?;
 
     let (src, dst, proto) = match sliced.net.as_ref()? {
-        NetSlice::Ipv4(ipv4) => {
+        LaxNetSlice::Ipv4(ipv4) => {
             let hdr = ipv4.header();
             let src = IpAddr::V4(hdr.source_addr());
             let dst = IpAddr::V4(hdr.destination_addr());
             let proto = hdr.protocol().0;
             (src, dst, proto)
         }
-        NetSlice::Ipv6(ipv6) => {
+        LaxNetSlice::Ipv6(ipv6) => {
             let hdr = ipv6.header();
             let src = IpAddr::V6(hdr.source_addr());
             let dst = IpAddr::V6(hdr.destination_addr());
@@ -251,7 +258,7 @@ fn decode_raw_header_record(
             let proto = ipv6.payload().ip_number.0;
             (src, dst, proto)
         }
-        NetSlice::Arp(_) => return None,
+        _ => return None,
     };
 
     let (src_port, dst_port, tcp_flags) = match sliced.transport.as_ref() {
@@ -494,6 +501,49 @@ mod tests {
             1,
             "regular flow sample still decodes (regression)"
         );
+    }
+
+    /// Build an Ethernet+IPv4+TCP frame with a 100-byte payload (so the IPv4
+    /// total-length field is 140), then truncate the bytes to a snaplen that
+    /// keeps only eth(14)+ipv4(20)+tcp(20)=54 bytes — mirroring how a real
+    /// `hsflowd` header-sampling agent captures only the packet header. The IPv4
+    /// total-length field inside the captured bytes still says 140 while only 40
+    /// bytes of IP are present: the strict parser rejects this (LenError), the
+    /// lax parser reads the headers that ARE present.
+    fn truncated_snaplen_eth_ipv4_tcp() -> Vec<u8> {
+        use etherparse::PacketBuilder;
+        let builder = PacketBuilder::ethernet2([1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12])
+            .ipv4([198, 51, 100, 9], [203, 0, 113, 7], 64)
+            .tcp(40000, 443, 1, 1024);
+        let payload = [0u8; 100];
+        let mut buf = Vec::new();
+        builder.write(&mut buf, &payload).unwrap();
+        buf.truncate(54); // eth + ipv4 + tcp headers only; payload dropped
+        buf
+    }
+
+    #[test]
+    fn truncated_snaplen_header_still_decodes() {
+        // Regression for the M0 kc pilot: a real hsflowd snaplen-truncated header
+        // (IPv4 total-length > captured bytes) must still yield an observation.
+        // Before the lax-parser fix this produced ZERO observations (the detector
+        // was blind to all real sFlow) while reporting no decode error.
+        let header = truncated_snaplen_eth_ipv4_tcp();
+        let dg = sflow_datagram_expanded(&header, 1000);
+        let (obs, sample_errors) = decode_datagram(&dg).unwrap();
+        assert_eq!(sample_errors, 0, "truncation is not a decode error");
+        assert_eq!(
+            obs.len(),
+            1,
+            "a snaplen-truncated header must still decode to one observation"
+        );
+        let o = obs[0];
+        assert_eq!(o.src, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)));
+        assert_eq!(o.dst, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+        assert_eq!(o.proto, 6, "TCP");
+        assert_eq!(o.src_port, 40000);
+        assert_eq!(o.dst_port, 443);
+        assert_eq!(o.frame_len, 1500, "volume math uses the sFlow frame_length");
     }
 
     #[test]
