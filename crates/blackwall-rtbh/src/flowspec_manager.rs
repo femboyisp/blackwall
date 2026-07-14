@@ -71,14 +71,19 @@ impl MirrorOp {
 ///
 /// Owns the pure [`FlowSpecController`] plus the I/O boundary: it executes the
 /// controller's decisions on a [`BgpExecutor`] and mirrors auto/manual rule
-/// state via a [`FlowSpecJournal`]. A BGP failure is logged and the action is
-/// not journaled — but note this is a known limitation, not a retry
-/// mechanism: on a failed first announce the controller entry is kept in
-/// memory while the rule itself is never re-announced automatically. A
-/// journal failure after a successful BGP operation is logged, never causes a
-/// live rule to be withdrawn, and is queued as a `MirrorOp` for a bounded
-/// self-heal retry on the next [`FlowSpecManager::tick`] — the BGP outcome is
-/// never re-issued, only the mirror write.
+/// state via a [`FlowSpecJournal`]. A BGP announce failure is logged, the
+/// action is not journaled, and the controller's freshly-inserted active
+/// entry is rolled back via [`FlowSpecController::rollback`] (C2:
+/// commit-after-confirm) — the control plane never believes an unconfirmed
+/// announce succeeded, so a future detection for the same rule is not deduped
+/// against a phantom entry. There is no retry queue for this: while the
+/// underlying attack persists, the detector naturally re-emits the detection
+/// on its next tick and the manager re-attempts through the same path. This
+/// differs from a *journal* failure after a successful BGP operation, which
+/// is logged, never causes a live rule to be withdrawn, and is queued as a
+/// `MirrorOp` for a bounded self-heal retry on the next
+/// [`FlowSpecManager::tick`] — the BGP outcome is never re-issued, only the
+/// mirror write.
 pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     controller: FlowSpecController,
     bgp: B,
@@ -87,6 +92,9 @@ pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     /// succeeded; retried (never re-issued to BGP) by
     /// `FlowSpecManager::retry_pending_mirror` on the next tick.
     pending_mirror: Vec<MirrorOp>,
+    /// Count of announces that failed at the BGP executor, each rolled back
+    /// (see [`Self::apply_failures`]).
+    apply_failures: u64,
 }
 
 impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
@@ -97,6 +105,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             bgp,
             journal,
             pending_mirror: Vec::new(),
+            apply_failures: 0,
         }
     }
 
@@ -275,6 +284,17 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         self.controller.protected_skipped()
     }
 
+    /// Count of announces that failed at the [`BgpExecutor`] (C2). Each
+    /// failure rolls back the controller's freshly-inserted active entry
+    /// (see [`FlowSpecController::rollback`]) so the control plane never
+    /// believes an unconfirmed announce is active. Surfaced for `/metrics`
+    /// as `blackwall_flowspec_apply_failures_total`, mirroring
+    /// [`crate::manager::RtbhManager::apply_failures`].
+    #[must_use]
+    pub fn apply_failures(&self) -> u64 {
+        self.apply_failures
+    }
+
     fn is_active(&self, key: FlowKey) -> bool {
         self.controller
             .active_rules()
@@ -326,7 +346,9 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     ) {
         let key = key_of(&rule);
         if let Err(e) = self.bgp.announce_flowspec(rule.clone()).await {
-            tracing::warn!(?key, error = %e, "FlowSpec: BGP announce failed; not journaling");
+            tracing::warn!(?key, error = %e, "FlowSpec: BGP announce failed; rolling back active entry, not journaling");
+            self.controller.rollback(key);
+            self.apply_failures = self.apply_failures.saturating_add(1);
             return;
         }
         if let Err(e) = self
@@ -666,6 +688,54 @@ mod tests {
             m.bgp().announced.lock().unwrap().is_empty(),
             "and of course BGP itself recorded nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_announce_does_not_leave_a_phantom_active_entry() {
+        // BGP fails: the router never took the rule, so the control plane
+        // must NOT believe it did (C2) — the freshly-inserted active entry
+        // must be rolled back, not left as a phantom "active" rule.
+        let mut m = mgr(true, false); // BGP fails
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key),
+            "a failed announce must not leave a phantom active entry"
+        );
+        assert_eq!(m.apply_failures(), 1);
+
+        // A subsequent identical detection re-attempts (not deduped against
+        // a phantom active entry) — no retry queue, just the natural
+        // re-detection on the next tick.
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            2_000,
+            2_000,
+        )
+        .await;
+        assert_eq!(m.apply_failures(), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_announce_activates_and_journals_no_apply_failures() {
+        let mut m = mgr(false, false);
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key));
+        assert_eq!(m.apply_failures(), 0);
     }
 
     #[tokio::test]

@@ -369,6 +369,25 @@ impl FlowSpecController {
         );
         vec![FlowSpecAction::Announce(rule)]
     }
+
+    /// Undo a just-inserted active entry after its BGP announce failed (C2:
+    /// commit-after-confirm).
+    ///
+    /// Removes `key` from the active set and emits nothing — the router
+    /// never took the rule, so there is nothing to withdraw. Must only be
+    /// called immediately after a [`FlowSpecAction::Announce`] was returned
+    /// for `key` (by [`Self::install`], [`Self::manual_add`], or
+    /// [`Self::resume`]): [`Self::insert_rule`] emits `Announce` only when it
+    /// performs a brand-new insert — a re-assertion, an Auto-to-Manual
+    /// upgrade, an at-cap key, or an ineligible/protected target all return
+    /// an empty vector instead and never reach this call. So at the point of
+    /// a failed announce, `active[key]` is guaranteed to still be exactly the
+    /// entry this call is undoing — never a pre-existing `Manual` rule or one
+    /// touched by anything else in between. Mirrors
+    /// [`crate::controller::RtbhController::rollback`].
+    pub fn rollback(&mut self, key: FlowKey) {
+        self.active.remove(&key);
+    }
 }
 
 /// Derive the `FlowKey` a rule is stored/looked-up under.

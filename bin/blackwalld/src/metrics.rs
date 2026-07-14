@@ -45,6 +45,11 @@ pub(crate) struct MetricsSources {
     /// configured. Copied from the manager once per tick, mirroring how
     /// `protected_skipped` reaches this endpoint.
     pub rtbh_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// FlowSpec announces that failed at the BGP executor and were rolled
+    /// back (C2, `FlowSpecManager::apply_failures`); `None` when no
+    /// `flowspec` block is configured. Copied from the manager once per
+    /// tick, mirroring `rtbh_apply_failures`.
+    pub flowspec_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -131,6 +136,14 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             help: "RTBH announces that failed at the BGP executor and were rolled back (C2)",
             kind: MetricKind::Counter,
             value: u64_to_f64(rtbh_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(flowspec_apply_failures) = &sources.flowspec_apply_failures {
+        m.push(Metric {
+            name: "blackwall_flowspec_apply_failures_total",
+            help: "FlowSpec announces that failed at the BGP executor and were rolled back (C2)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(flowspec_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
 

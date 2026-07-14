@@ -923,6 +923,7 @@ async fn flowspec_manager_task<B, J>(
     mut rx: mpsc::Receiver<blackwall_flow::FlowMitigationEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
     protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
+    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
     J: blackwall_rtbh::flowspec_manager::FlowSpecJournal + Send + 'static,
@@ -954,6 +955,10 @@ async fn flowspec_manager_task<B, J>(
 
                 protected_metrics.flowspec.store(
                     manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                apply_failure_metrics.store(
+                    manager.apply_failures(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -1450,6 +1455,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // block is configured.
             let rtbh_apply_failure_metrics =
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // FlowSpec announces that failed at the BGP executor and were
+            // rolled back (C2): copied from `FlowSpecManager::apply_failures`
+            // on every tick, mirroring `rtbh_apply_failure_metrics` above.
+            // Built unconditionally — harmless all-zero counter when no
+            // `flowspec` block is configured.
+            let flowspec_apply_failure_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
             {
@@ -1583,6 +1595,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_rx,
                                         store.clone(),
                                         protected_skipped_metrics.clone(),
+                                        flowspec_apply_failure_metrics.clone(),
                                     ));
                                 }
                                 Some(bgp) => {
@@ -1624,6 +1637,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_rx,
                                         store.clone(),
                                         protected_skipped_metrics.clone(),
+                                        flowspec_apply_failure_metrics.clone(),
                                     ));
                                 }
                             }
@@ -1866,6 +1880,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     shadow: Some(shadow_metrics.clone()),
                     protected_skipped: Some(protected_skipped_metrics.clone()),
                     rtbh_apply_failures: Some(rtbh_apply_failure_metrics.clone()),
+                    flowspec_apply_failures: Some(flowspec_apply_failure_metrics.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -2121,6 +2136,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     shadow: None,
                     protected_skipped: None,
                     rtbh_apply_failures: None,
+                    flowspec_apply_failures: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
