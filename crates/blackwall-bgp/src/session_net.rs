@@ -100,16 +100,17 @@ pub enum PeerConfigError {
 #[error("BGP session task is not running; command dropped")]
 pub struct BgpSendError;
 
-// ── C3: capability-gated announces ──────────────────────────────────────────
+// ── C3: capability-gated announces/withdraws ────────────────────────────────
 
-/// Which negotiated AFI/SAFI an announce needs, per RFC 4760 MP-BGP
-/// capabilities (RFC 8955/8956 §133 for FlowSpec).
+/// Which negotiated AFI/SAFI an announce or withdraw needs, per RFC 4760
+/// MP-BGP capabilities (RFC 8955/8956 §133 for FlowSpec).
 ///
-/// [`announce_allowed`] gates a pending announce against the peer's
-/// [`OpenMsg`] before it is written to the wire — sending an UPDATE for a
-/// SAFI the peer never advertised in its own OPEN causes some
-/// implementations (and our own bird-config default) to NOTIFICATION-reset
-/// the session, dropping every other active mitigation.
+/// [`announce_allowed`] gates a pending announce *or withdraw* against the
+/// peer's [`OpenMsg`] before it is written to the wire — sending an UPDATE
+/// (MP_REACH_NLRI or MP_UNREACH_NLRI alike) for a SAFI the peer never
+/// advertised in its own OPEN causes some implementations (and our own
+/// bird-config default) to NOTIFICATION-reset the session, dropping every
+/// other active mitigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnounceSafi {
     /// AFI 1 / SAFI 1 — unconditionally allowed; see [`announce_allowed`].
@@ -152,7 +153,7 @@ impl AnnounceSafi {
 }
 
 /// Pure gate: does `peer`'s negotiated capability set (decoded from its OPEN)
-/// allow an announce needing `safi`?
+/// allow an announce or withdraw needing `safi`?
 ///
 /// IPv4 unicast is unconditionally allowed — every peer we support negotiates
 /// it, and it is not the SAFI the C3 bug concerns. IPv6 unicast and both
@@ -178,16 +179,20 @@ struct EstablishedCtx<'a> {
     unnegotiated_skipped: &'a UnnegotiatedSkipCounters,
 }
 
-/// A snapshot of unnegotiated-SAFI announce-skip counts (C3), for the
-/// `/metrics` endpoint (`blackwall_bgp_unnegotiated_announce_skipped_total{safi}`).
+/// A snapshot of unnegotiated-SAFI announce/withdraw-skip counts (C3), for
+/// the `/metrics` endpoint (`blackwall_bgp_unnegotiated_announce_skipped_total{safi}`).
+/// The metric name predates the withdraw-side gate (C3 follow-up) but its
+/// semantics — "an UPDATE for this SAFI was skipped because the peer never
+/// negotiated it" — cover both directions, so it is reused rather than
+/// split.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnnegotiatedSkipCounts {
-    /// FlowSpec v4 (AFI 1 / SAFI 133) announces skipped because the peer
-    /// never negotiated that SAFI.
+    /// FlowSpec v4 (AFI 1 / SAFI 133) announces/withdraws skipped because the
+    /// peer never negotiated that SAFI.
     pub flowspec_v4: u64,
-    /// FlowSpec v6 (AFI 2 / SAFI 133) announces skipped.
+    /// FlowSpec v6 (AFI 2 / SAFI 133) announces/withdraws skipped.
     pub flowspec_v6: u64,
-    /// IPv6 unicast (AFI 2 / SAFI 1) announces skipped.
+    /// IPv6 unicast (AFI 2 / SAFI 1) announces/withdraws skipped.
     pub ipv6_unicast: u64,
 }
 
@@ -206,8 +211,9 @@ pub(crate) struct UnnegotiatedSkipCounters {
 }
 
 impl UnnegotiatedSkipCounters {
-    /// Record one skipped announce for `safi`. `Ipv4Unicast` is never gated
-    /// (see [`announce_allowed`]) and is intentionally not counted.
+    /// Record one skipped announce or withdraw for `safi`. `Ipv4Unicast` is
+    /// never gated (see [`announce_allowed`]) and is intentionally not
+    /// counted.
     fn record(&self, safi: AnnounceSafi) {
         let counter = match safi {
             AnnounceSafi::FlowSpecV4 => &self.flowspec_v4,
@@ -311,9 +317,10 @@ impl BgpHandle {
         self.reconnects.load(Ordering::Relaxed)
     }
 
-    /// FlowSpec/IPv6 announces skipped because the peer never negotiated the
-    /// required SAFI in its OPEN (C3) — see [`announce_allowed`]. For the
-    /// `/metrics` endpoint's `blackwall_bgp_unnegotiated_announce_skipped_total{safi}`.
+    /// FlowSpec/IPv6 announces or withdraws skipped because the peer never
+    /// negotiated the required SAFI in its OPEN (C3, C3 follow-up) — see
+    /// [`announce_allowed`]. For the `/metrics` endpoint's
+    /// `blackwall_bgp_unnegotiated_announce_skipped_total{safi}`.
     #[must_use]
     pub fn unnegotiated_skip_counts(&self) -> UnnegotiatedSkipCounts {
         self.unnegotiated_skipped.snapshot()
@@ -1052,14 +1059,26 @@ async fn established_loop(
                         }
                     }
                     Some(SessionCommand::Withdraw(prefix)) => {
+                        // C3 follow-up: gate withdraws the same way announces are
+                        // gated — MP_UNREACH_NLRI for a SAFI the peer never
+                        // negotiated is just as session-reset-worthy as MP_REACH.
                         active.remove(&prefix);
-                        let pkt = build_withdraw(&prefix);
-                        if let Err(e) = stream.write_all(&pkt).await {
-                            return SessionOutcome::Reconnect(
-                                format!("withdraw write failed: {e}")
+                        let safi = AnnounceSafi::for_route(&prefix);
+                        if !announce_allowed(peer_open, safi) {
+                            unnegotiated_skipped.record(safi);
+                            warn!(
+                                peer = %cfg.peer_addr, %prefix, safi = safi.label(),
+                                "skipping withdraw: peer did not negotiate this SAFI"
                             );
+                        } else {
+                            let pkt = build_withdraw(&prefix);
+                            if let Err(e) = stream.write_all(&pkt).await {
+                                return SessionOutcome::Reconnect(
+                                    format!("withdraw write failed: {e}")
+                                );
+                            }
+                            debug!(peer = %cfg.peer_addr, %prefix, "withdrawn");
                         }
-                        debug!(peer = %cfg.peer_addr, %prefix, "withdrawn");
                     }
                     Some(SessionCommand::AnnounceFlowSpec(rule)) => {
                         let key = crate::flowspec::encode_flowspec_nlri(&rule);
@@ -1087,15 +1106,26 @@ async fn established_loop(
                         }
                     }
                     Some(SessionCommand::WithdrawFlowSpec(rule)) => {
+                        // C3 follow-up: same gate as AnnounceFlowSpec — a
+                        // withdraw is still an MP_UNREACH_NLRI for SAFI 133.
                         let key = crate::flowspec::encode_flowspec_nlri(&rule);
                         active_flowspec.remove(&key);
-                        let pkt = build_flowspec_withdraw(&rule);
-                        if let Err(e) = stream.write_all(&pkt).await {
-                            return SessionOutcome::Reconnect(
-                                format!("FlowSpec withdraw write failed: {e}")
+                        let safi = AnnounceSafi::for_flowspec(&rule.dst);
+                        if !announce_allowed(peer_open, safi) {
+                            unnegotiated_skipped.record(safi);
+                            warn!(
+                                peer = %cfg.peer_addr, dst = %rule.dst, safi = safi.label(),
+                                "skipping FlowSpec withdraw: peer did not negotiate this SAFI"
                             );
+                        } else {
+                            let pkt = build_flowspec_withdraw(&rule);
+                            if let Err(e) = stream.write_all(&pkt).await {
+                                return SessionOutcome::Reconnect(
+                                    format!("FlowSpec withdraw write failed: {e}")
+                                );
+                            }
+                            debug!(peer = %cfg.peer_addr, "FlowSpec rule withdrawn");
                         }
-                        debug!(peer = %cfg.peer_addr, "FlowSpec rule withdrawn");
                     }
                 }
             }
@@ -1533,5 +1563,170 @@ mod tests {
                 ipv6_unicast: 1,
             }
         );
+    }
+
+    // ── C3 follow-up: capability-gated withdraws ────────────────────────────
+
+    use crate::{FlowAction, Origin};
+
+    /// Drives [`established_loop`] over a real loopback TCP pair with exactly
+    /// one queued command, then returns the bytes written to the peer side
+    /// plus the final unnegotiated-skip snapshot.
+    ///
+    /// `hold_secs = 0` parks the keepalive/hold `select!` arms on `pending()`,
+    /// and dropping the command sender right after queuing ends the loop via
+    /// `CommandsExhausted` on the next iteration — so this needs no sleeps or
+    /// timeouts to bound `established_loop` itself.
+    async fn run_one_command(
+        peer_open: &OpenMsg,
+        active: &mut HashMap<IpNet, Route>,
+        active_flowspec: &mut HashMap<Vec<u8>, FlowSpecRule>,
+        command: SessionCommand,
+    ) -> (Vec<u8>, UnnegotiatedSkipCounts) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener local_addr");
+        let (mut server, mut client) = tokio::join!(
+            async { listener.accept().await.expect("accept").0 },
+            async { TcpStream::connect(addr).await.expect("connect") }
+        );
+
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(command).await.expect("queue command");
+        drop(tx);
+
+        let peer_cfg = cfg(65001, 65001, 0);
+        let unnegotiated_skipped = UnnegotiatedSkipCounters::default();
+        let ctx = EstablishedCtx {
+            cfg: &peer_cfg,
+            peer_open,
+            unnegotiated_skipped: &unnegotiated_skipped,
+        };
+        let mut buf = Vec::new();
+        let outcome = established_loop(
+            &ctx,
+            &mut rx,
+            active,
+            active_flowspec,
+            &mut client,
+            &mut buf,
+            0,
+        )
+        .await;
+        match outcome {
+            SessionOutcome::CommandsExhausted => {}
+            SessionOutcome::Reconnect(reason) => panic!("unexpected reconnect: {reason}"),
+        }
+
+        // Bound the read: a skip writes nothing, so the server side never
+        // sees data or EOF — a short timeout distinguishes "nothing was ever
+        // sent" from a hang, without racing the (already-awaited) write.
+        let mut received = Vec::new();
+        let mut tmp = [0u8; 256];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(50), server.read(&mut tmp)).await
+        {
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&tmp[..n]);
+        }
+        (received, unnegotiated_skipped.snapshot())
+    }
+
+    fn flowspec_rule() -> FlowSpecRule {
+        FlowSpecRule {
+            dst: "203.0.113.0/24".parse().unwrap(),
+            protocol: Some(17),
+            dst_port: Some(53),
+            action: FlowAction::TrafficRate(0.0),
+        }
+    }
+
+    #[tokio::test]
+    async fn flowspec_withdraw_skipped_when_peer_did_not_negotiate_safi_133() {
+        let peer_open = peer_stub(); // flowspec_v4 = false
+        let mut active = HashMap::new();
+        let mut active_flowspec = HashMap::new();
+        let rule = flowspec_rule();
+        active_flowspec.insert(crate::flowspec::encode_flowspec_nlri(&rule), rule.clone());
+
+        let (received, counts) = run_one_command(
+            &peer_open,
+            &mut active,
+            &mut active_flowspec,
+            SessionCommand::WithdrawFlowSpec(rule),
+        )
+        .await;
+
+        assert!(
+            received.is_empty(),
+            "no MP_UNREACH bytes should reach a peer that never negotiated FlowSpec v4"
+        );
+        assert_eq!(counts.flowspec_v4, 1);
+        assert!(
+            active_flowspec.is_empty(),
+            "withdrawn rule still drops from the active set"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_withdraw_skipped_when_peer_did_not_negotiate_ipv6_unicast() {
+        let peer_open = peer_stub(); // ipv6_unicast = false
+        let mut active = HashMap::new();
+        let mut active_flowspec = HashMap::new();
+        let prefix: IpNet = "2001:db8::1/128".parse().unwrap();
+        active.insert(
+            prefix,
+            Route {
+                prefix,
+                next_hop: "2001:db8::ffff".parse().unwrap(),
+                origin: Origin::Igp,
+                communities: vec![],
+                large_communities: vec![],
+            },
+        );
+
+        let (received, counts) = run_one_command(
+            &peer_open,
+            &mut active,
+            &mut active_flowspec,
+            SessionCommand::Withdraw(prefix),
+        )
+        .await;
+
+        assert!(
+            received.is_empty(),
+            "no MP_UNREACH bytes should reach a peer that never negotiated IPv6 unicast"
+        );
+        assert_eq!(counts.ipv6_unicast, 1);
+        assert!(
+            active.is_empty(),
+            "withdrawn prefix still drops from the active set"
+        );
+    }
+
+    #[tokio::test]
+    async fn flowspec_withdraw_written_when_negotiated() {
+        // Non-regression: a peer that *did* negotiate FlowSpec v4 must still
+        // get the withdraw on the wire, unaffected by the new gate.
+        let mut peer_open = peer_stub();
+        peer_open.flowspec_v4 = true;
+        let mut active = HashMap::new();
+        let mut active_flowspec = HashMap::new();
+        let rule = flowspec_rule();
+        active_flowspec.insert(crate::flowspec::encode_flowspec_nlri(&rule), rule.clone());
+
+        let (received, counts) = run_one_command(
+            &peer_open,
+            &mut active,
+            &mut active_flowspec,
+            SessionCommand::WithdrawFlowSpec(rule.clone()),
+        )
+        .await;
+
+        assert_eq!(received, build_flowspec_withdraw(&rule));
+        assert_eq!(counts.flowspec_v4, 0);
     }
 }

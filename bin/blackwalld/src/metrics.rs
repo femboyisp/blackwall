@@ -504,10 +504,10 @@ fn protected_skipped_block(sources: &MetricsSources) -> Option<String> {
     Some(out)
 }
 
-/// Render `blackwall_bgp_unnegotiated_announce_skipped_total{safi}` (C3) from
-/// the live `BgpHandle`, or `None` when no `rtbh`/`flowspec` block is
-/// configured (no BGP session to report — mirrors `sources.bgp` used by
-/// [`gather`]'s session-state/reconnect metrics). Labels are a fixed,
+/// Render `blackwall_bgp_unnegotiated_announce_skipped_total{safi}` (C3, C3
+/// follow-up) from the live `BgpHandle`, or `None` when no `rtbh`/`flowspec`
+/// block is configured (no BGP session to report — mirrors `sources.bgp`
+/// used by [`gather`]'s session-state/reconnect metrics). Labels are a fixed,
 /// known-at-compile-time set, but still hand-written since [`Metric`] only
 /// carries unlabelled series — mirrors [`shadow_block`]/[`protected_skipped_block`].
 fn unnegotiated_announce_skipped_block(sources: &MetricsSources) -> Option<String> {
@@ -516,7 +516,7 @@ fn unnegotiated_announce_skipped_block(sources: &MetricsSources) -> Option<Strin
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# HELP blackwall_bgp_unnegotiated_announce_skipped_total FlowSpec/IPv6 announces skipped because the peer never negotiated that SAFI in its OPEN (C3)"
+        "# HELP blackwall_bgp_unnegotiated_announce_skipped_total FlowSpec/IPv6 announces or withdraws skipped because the peer never negotiated that SAFI in its OPEN (C3, C3 follow-up)"
     );
     let _ = writeln!(
         out,
