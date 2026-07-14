@@ -10,17 +10,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Current wall-clock time in ms since epoch; `0` if the clock is somehow
-/// before the epoch. Used only to compute the per-POP last-seen-seconds
-/// gauge at scrape time.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
-}
-
 /// Everything the scrape handler reads at request time. Cheap to clone (an
 /// `Arc<Store>`, a cloneable `BgpHandle`, an `Arc<CollectorMetrics>`).
 #[derive(Clone)]
@@ -245,6 +234,62 @@ fn xdp_block(sources: &MetricsSources) -> Option<String> {
     }))
 }
 
+/// Render only the per-POP telemetry blocks (`blackwall_flow_pop_last_seen_seconds`,
+/// `blackwall_flow_agent_sampling_mismatch_total`,
+/// `blackwall_flow_sampling_near_ceiling_total`) from an already-sorted `stats`
+/// slice. Pure and DB-free (so it is unit-testable). `now_ms` must be the same
+/// monotonic clock as `AgentStat.last_seen_ms` — see [`agent_stats_block`].
+fn render_agent_pop_stats(stats: &[blackwall_flow::AgentStat], now_ms: u64) -> String {
+    let mut out = String::new();
+    if stats.is_empty() {
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_flow_pop_last_seen_seconds Seconds since this POP's sFlow agent was last observed"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_flow_pop_last_seen_seconds gauge");
+    for s in stats {
+        let age_secs = now_ms.saturating_sub(s.last_seen_ms) / 1000;
+        let _ = writeln!(
+            out,
+            "blackwall_flow_pop_last_seen_seconds{{pop=\"{}\"}} {age_secs}",
+            s.pop
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\n# HELP blackwall_flow_agent_sampling_mismatch_total Sampling-rate mismatches clamped per POP"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_flow_agent_sampling_mismatch_total counter"
+    );
+    for s in stats {
+        let _ = writeln!(
+            out,
+            "blackwall_flow_agent_sampling_mismatch_total{{pop=\"{}\"}} {}",
+            s.pop, s.mismatches
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\n# HELP blackwall_flow_sampling_near_ceiling_total Samples per POP whose trusted sampling rate landed at or above half the max-sampling-factor ceiling"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_flow_sampling_near_ceiling_total counter"
+    );
+    for s in stats {
+        let _ = writeln!(
+            out,
+            "blackwall_flow_sampling_near_ceiling_total{{pop=\"{}\"}} {}",
+            s.pop, s.near_ceiling
+        );
+    }
+    out
+}
+
 /// Render the per-POP telemetry blocks (`blackwall_flow_pop_last_seen_seconds`,
 /// `blackwall_flow_agent_sampling_mismatch_total`,
 /// `blackwall_flow_sampling_near_ceiling_total`) plus the
@@ -256,8 +301,10 @@ fn xdp_block(sources: &MetricsSources) -> Option<String> {
 /// POP names are dynamic labels unknown at compile time, so — like
 /// [`xdp_block`]'s `reason` label — this hand-writes the exposition text
 /// directly rather than going through [`Metric`], which only carries a
-/// `&'static str` name. `now_ms` is the current wall-clock time, used to
-/// turn each POP's last-seen timestamp into an age in seconds.
+/// `&'static str` name. `now_ms` MUST be [`blackwall_flow::monotonic_now_ms`]
+/// (the same monotonic clock the collector stamps `AgentStat.last_seen_ms`
+/// with), so the per-POP last-seen age is real seconds — NOT wall-clock epoch,
+/// which would make every age a nonsense ~epoch-sized value.
 fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
     let snapshot = sources.agent_stats.as_ref()?;
     let mut stats: Vec<blackwall_flow::AgentStat> = match snapshot.lock() {
@@ -267,52 +314,7 @@ fn agent_stats_block(sources: &MetricsSources, now_ms: u64) -> Option<String> {
     // Deterministic scrape output regardless of HashMap iteration order.
     stats.sort_by(|a, b| a.pop.cmp(&b.pop));
 
-    let mut out = String::new();
-    if !stats.is_empty() {
-        let _ = writeln!(
-            out,
-            "# HELP blackwall_flow_pop_last_seen_seconds Seconds since this POP's sFlow agent was last observed"
-        );
-        let _ = writeln!(out, "# TYPE blackwall_flow_pop_last_seen_seconds gauge");
-        for s in &stats {
-            let age_secs = now_ms.saturating_sub(s.last_seen_ms) / 1000;
-            let _ = writeln!(
-                out,
-                "blackwall_flow_pop_last_seen_seconds{{pop=\"{}\"}} {age_secs}",
-                s.pop
-            );
-        }
-        let _ = writeln!(
-            out,
-            "\n# HELP blackwall_flow_agent_sampling_mismatch_total Sampling-rate mismatches clamped per POP"
-        );
-        let _ = writeln!(
-            out,
-            "# TYPE blackwall_flow_agent_sampling_mismatch_total counter"
-        );
-        for s in &stats {
-            let _ = writeln!(
-                out,
-                "blackwall_flow_agent_sampling_mismatch_total{{pop=\"{}\"}} {}",
-                s.pop, s.mismatches
-            );
-        }
-        let _ = writeln!(
-            out,
-            "\n# HELP blackwall_flow_sampling_near_ceiling_total Samples per POP whose trusted sampling rate landed at or above half the max-sampling-factor ceiling"
-        );
-        let _ = writeln!(
-            out,
-            "# TYPE blackwall_flow_sampling_near_ceiling_total counter"
-        );
-        for s in &stats {
-            let _ = writeln!(
-                out,
-                "blackwall_flow_sampling_near_ceiling_total{{pop=\"{}\"}} {}",
-                s.pop, s.near_ceiling
-            );
-        }
-    }
+    let mut out = render_agent_pop_stats(&stats, now_ms);
 
     // Always emitted (a single scalar, not per-label) so the series exists
     // even before any known agent has been observed.
@@ -467,7 +469,7 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
             }
             body.push_str(&xdp);
         }
-        if let Some(agent) = agent_stats_block(sources, now_ms()) {
+        if let Some(agent) = agent_stats_block(sources, blackwall_flow::monotonic_now_ms()) {
             if !body.is_empty() {
                 body.push('\n');
             }
@@ -493,9 +495,38 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
 
 #[cfg(test)]
 mod tests {
-    use super::stateless_metrics;
+    use super::{render_agent_pop_stats, stateless_metrics};
     use blackwall_deception::transport::StatelessMetrics;
     use blackwall_metrics::render_prometheus;
+
+    #[test]
+    fn pop_last_seen_age_uses_monotonic_clock_not_epoch() {
+        // Regression for the clock-domain bug: the collector stamps
+        // `AgentStat.last_seen_ms` from the monotonic clock, so the renderer must
+        // compute the age against the SAME clock. A just-seen agent must read
+        // ~0 s, not ~epoch (the old bug rendered ~1.78e9 by subtracting a
+        // monotonic timestamp from an epoch "now").
+        let stats = vec![blackwall_flow::AgentStat {
+            pop: "kc".to_string(),
+            last_seen_ms: blackwall_flow::monotonic_now_ms(), // just observed
+            mismatches: 0,
+            near_ceiling: 0,
+        }];
+        let body = render_agent_pop_stats(&stats, blackwall_flow::monotonic_now_ms());
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("blackwall_flow_pop_last_seen_seconds{pop=\"kc\"}"))
+            .expect("pop_last_seen line present");
+        let age: u64 = line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("age value parses");
+        assert!(
+            age < 5,
+            "a just-seen agent's last-seen age must be ~0s, got {age} (clock-domain regression)"
+        );
+    }
 
     #[test]
     fn stateless_metrics_renders_all_four_counters_with_expected_values() {

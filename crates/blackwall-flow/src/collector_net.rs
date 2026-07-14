@@ -19,8 +19,18 @@ fn clock_base() -> Instant {
 
 /// Milliseconds since process start (monotonic). Used for all detector windowing,
 /// eviction, and hold-down math — never affected by NTP/wall-clock steps.
-fn now_ms() -> u64 {
+///
+/// Exposed publicly so the `/metrics` renderer can compute each POP's last-seen
+/// age against the **same** clock the collector stamps observations with:
+/// `AgentStat.last_seen_ms` is a monotonic timestamp, so subtracting it from an
+/// epoch "now" yields a nonsense (~epoch-sized) age.
+#[must_use]
+pub fn monotonic_now_ms() -> u64 {
     u64::try_from(clock_base().elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn now_ms() -> u64 {
+    monotonic_now_ms()
 }
 
 /// Run the collector until the process ends. Binds `listen`, decodes each
@@ -92,5 +102,24 @@ pub async fn run_collector(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::monotonic_now_ms;
+
+    #[test]
+    fn monotonic_now_ms_is_process_uptime_not_epoch() {
+        let a = monotonic_now_ms();
+        let b = monotonic_now_ms();
+        assert!(b >= a, "monotonic clock must be non-decreasing");
+        // Process uptime in ms stays far below epoch-ms scale (~1.78e12) for
+        // years; this guards against a regression back to a wall-clock source,
+        // which is what made pop_last_seen_seconds read ~epoch.
+        assert!(
+            a < 1_000_000_000,
+            "must be process-uptime ms, not epoch ms; got {a}"
+        );
     }
 }
