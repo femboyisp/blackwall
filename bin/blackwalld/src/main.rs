@@ -661,6 +661,7 @@ fn rtbh_config_from(
         max_blackholes: rtbh.max_blackholes,
         hold_down: rtbh.hold_down,
         max_ttl: rtbh.max_ttl,
+        protected_prefixes: policy.protected_prefixes.clone(),
     }
 }
 
@@ -677,6 +678,7 @@ fn flowspec_config_from(
         max_rules: fs.max_rules,
         hold_down: fs.hold_down,
         max_ttl: fs.max_ttl,
+        protected_prefixes: policy.protected_prefixes.clone(),
     }
 }
 

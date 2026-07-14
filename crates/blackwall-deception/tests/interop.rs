@@ -123,6 +123,7 @@ async fn serves_deception_banner() {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: Vec::new(),
+        protected_prefixes: Vec::new(),
         shadow: false,
     };
 
@@ -190,6 +191,7 @@ async fn serves_deception_under_load() {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: Vec::new(),
+        protected_prefixes: Vec::new(),
         shadow: false,
     };
 
@@ -279,6 +281,7 @@ fn serves_stateless_syn_cookie() {
         // The stateless-tier port under test (Component 2c wiring): deception
         // TCP on 8080 is routed to the engine's NFQUEUE instead of tproxy.
         stateless_tcp_ports: vec![8080],
+        protected_prefixes: Vec::new(),
         shadow: false,
     };
 
@@ -364,6 +367,7 @@ fn serves_stateless_syn_cookie_v6() {
         flowtable: None,
         xdp: None,
         stateless_tcp_ports: vec![8080],
+        protected_prefixes: Vec::new(),
         shadow: false,
     };
 

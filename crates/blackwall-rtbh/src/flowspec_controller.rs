@@ -43,6 +43,10 @@ pub struct FlowSpecConfig {
     /// Maximum lifetime of an auto rule (hygiene backstop against a dropped
     /// or missed clear); `None` disables the TTL.
     pub max_ttl: Option<Duration>,
+    /// Prefixes that must never have FlowSpec rules installed against them
+    /// (own anycast VIPs and similar always-safe destinations), from
+    /// `Policy.protected_prefixes`. Empty (the default) protects nothing extra.
+    pub protected_prefixes: Vec<IpNet>,
 }
 
 /// A decision the [`FlowSpecController`] emits for the sink to execute.
@@ -344,6 +348,7 @@ mod tests {
             max_rules: 3,
             hold_down: Duration::from_secs(10),
             max_ttl: None,
+            protected_prefixes: Vec::new(),
         }
     }
 

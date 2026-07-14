@@ -46,6 +46,10 @@ pub struct RtbhConfig {
     /// Maximum lifetime of an auto blackhole (hygiene backstop against a dropped
     /// or missed `Cleared`); `None` disables the TTL.
     pub max_ttl: Option<Duration>,
+    /// Prefixes that must never be blackholed (own anycast VIPs and similar
+    /// always-safe destinations), from `Policy.protected_prefixes`. Empty
+    /// (the default) protects nothing extra.
+    pub protected_prefixes: Vec<IpNet>,
 }
 
 /// A decision the [`RtbhController`] emits for the sink to execute.
@@ -330,6 +334,7 @@ mod tests {
             max_blackholes: 2,
             hold_down: Duration::from_secs(10),
             max_ttl: None,
+            protected_prefixes: Vec::new(),
         }
     }
 

@@ -29,6 +29,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut stateless_tcp_ports: Vec<u16> = Vec::new();
     let mut pops: Vec<PopEntry> = Vec::new();
     let mut shadow = false;
+    let mut protected_prefixes: Vec<ipnet::IpNet> = Vec::new();
 
     let mut i = 0;
     while i < lines.len() {
@@ -42,6 +43,10 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
             "ipv4" | "ipv6" => {
                 expect_len(line, 2, "<family> <cidr>")?;
                 prefixes.push(parse_cidr(line, &line.words[1])?);
+            }
+            "protect" => {
+                expect_len(line, 2, "protect <cidr>")?;
+                protected_prefixes.push(parse_cidr(line, &line.words[1])?);
             }
             "default" => {
                 expect_len(line, 2, "default deception|drop")?;
@@ -833,6 +838,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         xdp,
         stateless_tcp_ports,
         shadow,
+        protected_prefixes,
     })
 }
 
@@ -2260,5 +2266,24 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
         };
         assert!(e.to_string().contains("line 7"));
         assert!(e.to_string().contains("xyz"));
+    }
+
+    #[test]
+    fn parses_protect_prefixes() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nprotect 203.0.113.53/32\nprotect 2001:db8::53/128\n",
+        ).unwrap();
+        assert_eq!(
+            p.protected_prefixes,
+            vec![
+                "203.0.113.53/32".parse::<ipnet::IpNet>().unwrap(),
+                "2001:db8::53/128".parse::<ipnet::IpNet>().unwrap(),
+            ]
+        );
+    }
+    #[test]
+    fn protect_defaults_empty() {
+        let p = parse_text("interface wan eth0\nipv4 203.0.113.0/24\n").unwrap();
+        assert!(p.protected_prefixes.is_empty());
     }
 }

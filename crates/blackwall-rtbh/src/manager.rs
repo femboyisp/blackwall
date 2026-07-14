@@ -481,6 +481,7 @@ mod tests {
             max_blackholes: 2,
             hold_down: Duration::from_secs(10),
             max_ttl: None,
+            protected_prefixes: Vec::new(),
         }
     }
     fn det(ip: &str) -> Detection {

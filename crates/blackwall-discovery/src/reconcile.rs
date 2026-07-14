@@ -131,6 +131,7 @@ mod tests {
             flowtable: None,
             xdp: None,
             stateless_tcp_ports: Vec::new(),
+            protected_prefixes: Vec::new(),
             shadow: false,
         }
     }
