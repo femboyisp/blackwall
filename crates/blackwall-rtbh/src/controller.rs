@@ -73,6 +73,9 @@ pub enum RtbhAction {
 pub struct RtbhController {
     config: RtbhConfig,
     active: HashMap<IpAddr, ActiveEntry>,
+    /// Count of targets skipped by the protected-prefix guard (see
+    /// [`Self::protected_skipped`]).
+    protected_skipped: u64,
 }
 
 impl RtbhController {
@@ -82,6 +85,7 @@ impl RtbhController {
         Self {
             config,
             active: HashMap::new(),
+            protected_skipped: 0,
         }
     }
 
@@ -229,6 +233,16 @@ impl RtbhController {
         }
     }
 
+    /// Number of targets skipped because they fell inside a configured
+    /// [`RtbhConfig::protected_prefixes`] entry (own anycast VIP or similar
+    /// always-safe destination) — the anycast self-protection guard in
+    /// [`Self::insert_blackhole`]. Surfaced for `/metrics`
+    /// (`blackwall_mitigations_protected_skipped_total{plane="rtbh"}`).
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.protected_skipped
+    }
+
     fn request_clear(&mut self, target: IpAddr, now: u64) -> Vec<RtbhAction> {
         let hold_ms = u64::try_from(self.config.hold_down.as_millis()).unwrap_or(u64::MAX);
         match self.active.get_mut(&target) {
@@ -256,6 +270,19 @@ impl RtbhController {
         announced_at: u64,
         origin: BlackholeOrigin,
     ) -> Vec<RtbhAction> {
+        // Anycast self-protection (C1): a protected prefix (own VIP) must
+        // never be blackholed, even when it also falls inside an eligible
+        // prefix — checked BEFORE eligibility, and decisive.
+        if self
+            .config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+        {
+            tracing::warn!(%target, "RTBH: target in a protected prefix; skipping (never mitigate own service)");
+            self.protected_skipped = self.protected_skipped.saturating_add(1);
+            return Vec::new();
+        }
         if !self
             .config
             .eligible_prefixes
@@ -631,6 +658,31 @@ mod tests {
         // counts against the cap
         assert_eq!(c.manual_add(ip("203.0.113.6"), 0).len(), 1);
         assert!(c.manual_add(ip("203.0.113.7"), 0).is_empty(), "at cap");
+    }
+
+    #[test]
+    fn protected_target_is_skipped_even_when_eligible() {
+        // 203.0.113.53 is inside the eligible /24 but is carved out as a
+        // protected VIP: it must never be blackholed.
+        let mut c = RtbhController::new(RtbhConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.on_event(&DetectionEvent::Opened(det("203.0.113.53")), 1_000);
+        assert!(actions.is_empty(), "protected VIP must not be blackholed");
+        assert!(c.active_blackholes().is_empty());
+        assert_eq!(c.protected_skipped(), 1);
+    }
+
+    #[test]
+    fn unprotected_eligible_target_still_mitigates() {
+        let mut c = RtbhController::new(RtbhConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 1_000);
+        assert!(matches!(actions.as_slice(), [RtbhAction::Announce(_)]));
+        assert_eq!(c.protected_skipped(), 0);
     }
 
     #[test]

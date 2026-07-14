@@ -25,6 +25,26 @@ pub struct ShadowMetrics {
     pub xdp_rate_limit: AtomicU64,
 }
 
+/// Per-plane counters backing the `blackwall_mitigations_protected_skipped_total`
+/// metric (C1 anycast self-protection: RTBH/FlowSpec/XDP each skip a target
+/// that falls inside a configured `protected_prefixes` entry, own VIP,
+/// before ever reaching eligibility). Unlike [`ShadowMetrics`], this fires in
+/// BOTH shadow and live sessions — the guard runs inside each pure
+/// controller itself, so it applies regardless of mode. Built unconditionally
+/// (harmless all-zero counters when RTBH/FlowSpec/XDP aren't configured);
+/// each manager task copies its controller's `protected_skipped()` counter in
+/// here on every tick, mirroring how `CollectorMetrics::set_min_sample_suppressed`
+/// is kept in sync from the flow detector.
+#[derive(Default)]
+pub struct ProtectedSkippedMetrics {
+    /// RTBH targets skipped because they were in a protected prefix.
+    pub rtbh: AtomicU64,
+    /// FlowSpec targets skipped because they were in a protected prefix.
+    pub flowspec: AtomicU64,
+    /// XDP detections skipped because the victim was in a protected prefix.
+    pub xdp: AtomicU64,
+}
+
 /// Records shadow actions to the audit log + metrics + INFO log.
 ///
 /// Wired in place of a real `BgpExecutor`/journal pair (via

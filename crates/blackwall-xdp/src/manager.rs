@@ -248,6 +248,15 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         self.controller.active_entries()
     }
 
+    /// Number of detections skipped by the controller's protected-prefix
+    /// guard (own anycast VIPs never mitigated). Surfaced for `/metrics`;
+    /// see `blackwall_rtbh::manager::RtbhManager::protected_skipped` for the
+    /// analogous RTBH accessor.
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.controller.protected_skipped()
+    }
+
     /// Queue a failed mirror write for self-heal, coalescing by identity
     /// (source or network).
     ///
@@ -397,7 +406,7 @@ mod tests {
 
     fn mgr(fail_exec: bool, fail_journal: bool) -> XdpManager<FakeExecutor, FakeJournal> {
         XdpManager::new(
-            XdpController::new(own(), 100, 1000),
+            XdpController::new(own(), 100, 1000, Vec::new()),
             FakeExecutor {
                 fail: fail_exec,
                 ..Default::default()
@@ -411,7 +420,7 @@ mod tests {
 
     fn mgr_transient_journal_failures(n: usize) -> XdpManager<FakeExecutor, FakeJournal> {
         XdpManager::new(
-            XdpController::new(own(), 100, 1000),
+            XdpController::new(own(), 100, 1000, Vec::new()),
             FakeExecutor::default(),
             FakeJournal {
                 fail_calls_remaining: Mutex::new(n),
@@ -522,7 +531,7 @@ mod tests {
     #[tokio::test]
     async fn apply_add_defers_at_capacity() {
         let mut m = XdpManager::new(
-            XdpController::new(own(), 1, 1000),
+            XdpController::new(own(), 1, 1000, Vec::new()),
             FakeExecutor::default(),
             FakeJournal::default(),
         );

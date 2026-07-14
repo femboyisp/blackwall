@@ -256,6 +256,15 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         self.controller.active_rules()
     }
 
+    /// Number of targets skipped by the controller's protected-prefix guard
+    /// (own anycast VIPs never mitigated). Surfaced for `/metrics`; see
+    /// [`crate::manager::RtbhManager::protected_skipped`] for the analogous
+    /// RTBH accessor.
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.controller.protected_skipped()
+    }
+
     fn is_active(&self, key: FlowKey) -> bool {
         self.controller
             .active_rules()

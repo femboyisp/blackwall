@@ -36,6 +36,10 @@ pub(crate) struct MetricsSources {
     /// Shadow-mode "would mitigate" counters (RTBH/FlowSpec/XDP); `None`
     /// outside the flow daemon (no RTBH/FlowSpec/XDP managers to shadow).
     pub shadow: Option<Arc<crate::shadow::ShadowMetrics>>,
+    /// Per-plane anycast self-protection skip counters (C1); `None` outside
+    /// the flow daemon (no RTBH/FlowSpec/XDP managers to guard). Unlike
+    /// `shadow`, populated in both shadow AND live sessions.
+    pub protected_skipped: Option<Arc<crate::shadow::ProtectedSkippedMetrics>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -428,6 +432,38 @@ fn shadow_block(sources: &MetricsSources) -> Option<String> {
     Some(out)
 }
 
+/// Render `blackwall_mitigations_protected_skipped_total{plane}` from the
+/// shared per-plane counters, or `None` when they aren't wired up (outside
+/// the flow daemon). Labels are a fixed, known-at-compile-time set, but still
+/// hand-written since [`Metric`] only carries unlabelled series — mirrors
+/// [`shadow_block`].
+fn protected_skipped_block(sources: &MetricsSources) -> Option<String> {
+    use std::sync::atomic::Ordering;
+
+    let counters = sources.protected_skipped.as_ref()?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_mitigations_protected_skipped_total Targets skipped because they fell inside a configured protected prefix (own VIP), by plane"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_mitigations_protected_skipped_total counter"
+    );
+    for (plane, counter) in [
+        ("rtbh", &counters.rtbh),
+        ("flowspec", &counters.flowspec),
+        ("xdp", &counters.xdp),
+    ] {
+        let _ = writeln!(
+            out,
+            "blackwall_mitigations_protected_skipped_total{{plane=\"{plane}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        );
+    }
+    Some(out)
+}
+
 /// Serve `/metrics` forever. Each connection is handled on its own task so a
 /// slow client cannot block scrapes; a bind failure disables the endpoint (and
 /// is logged) without taking down the daemon.
@@ -480,6 +516,12 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
                 body.push('\n');
             }
             body.push_str(&shadow);
+        }
+        if let Some(protected) = protected_skipped_block(sources) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&protected);
         }
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

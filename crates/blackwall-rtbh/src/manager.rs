@@ -251,6 +251,16 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         self.controller.active_blackholes()
     }
 
+    /// Number of targets skipped by the controller's protected-prefix guard
+    /// (own anycast VIPs never mitigated). Surfaced for `/metrics`; the
+    /// owning task periodically copies this into a shared counter read by
+    /// the metrics endpoint, mirroring how `min_sample_suppressed` reaches
+    /// `/metrics` from the flow detector.
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.controller.protected_skipped()
+    }
+
     fn is_active(&self, target: IpAddr) -> bool {
         self.controller
             .active_blackholes()

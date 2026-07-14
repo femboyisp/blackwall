@@ -797,6 +797,7 @@ async fn rtbh_manager_task<B, J>(
     mut manager: blackwall_rtbh::RtbhManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
+    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
     J: blackwall_rtbh::manager::BlackholeJournal + Send + 'static,
@@ -817,6 +818,11 @@ async fn rtbh_manager_task<B, J>(
                 // Mandatory: without this, a `Cleared` arriving before hold-down
                 // elapses is deferred and never completed.
                 manager.tick(mono_now(), wall_now()).await;
+
+                protected_metrics.rtbh.store(
+                    manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 match request_store.pending_requests().await {
                     Ok(reqs) => {
@@ -911,6 +917,7 @@ async fn flowspec_manager_task<B, J>(
     mut manager: blackwall_rtbh::FlowSpecManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::FlowMitigationEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
+    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
     J: blackwall_rtbh::flowspec_manager::FlowSpecJournal + Send + 'static,
@@ -939,6 +946,11 @@ async fn flowspec_manager_task<B, J>(
             _ = ticker.tick() => {
                 // Mandatory: completes deferred clears / TTL expiry.
                 manager.tick(mono_now(), wall_now()).await;
+
+                protected_metrics.flowspec.store(
+                    manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 match request_store.pending_flowspec_requests().await {
                     Ok(reqs) => {
@@ -1097,6 +1109,7 @@ async fn xdp_manager_task<J>(
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
     auto_enabled: bool,
+    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
 ) where
     J: blackwall_xdp::XdpJournal + 'static,
 {
@@ -1119,6 +1132,11 @@ async fn xdp_manager_task<J>(
             _ = ticker.tick() => {
                 // Drains any journal mirror-writes queued by a transient DB blip.
                 manager.tick().await;
+
+                protected_metrics.xdp.store(
+                    manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 match request_store.xdp_pending_requests().await {
                     Ok(reqs) => {
@@ -1412,6 +1430,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the metrics endpoint. Built unconditionally — harmless all-zero
             // counters when shadow mode is off.
             let shadow_metrics = std::sync::Arc::new(shadow::ShadowMetrics::default());
+            // Shared anycast self-protection (C1) skip counters: each manager
+            // task below copies its controller's `protected_skipped()` value
+            // in here on every tick, in BOTH shadow and live sessions (unlike
+            // `shadow_metrics`, this guard is not shadow-specific). Built
+            // unconditionally — harmless all-zero counters when RTBH/FlowSpec/
+            // XDP aren't configured.
+            let protected_skipped_metrics =
+                std::sync::Arc::new(shadow::ProtectedSkippedMetrics::default());
 
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
             {
@@ -1442,7 +1468,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         // No rehydrate: the shadow mirror is intentionally
                         // empty — nothing was ever really announced, so there
                         // is nothing to replay.
-                        tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+                        tokio::spawn(rtbh_manager_task(
+                            manager,
+                            rx,
+                            store.clone(),
+                            protected_skipped_metrics.clone(),
+                        ));
                         None
                     } else {
                         let peer = blackwall_bgp::PeerConfig {
@@ -1485,7 +1516,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 .collect();
                         manager.rehydrate(rehydrate_rows, mono_now()).await;
 
-                        tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+                        tokio::spawn(rtbh_manager_task(
+                            manager,
+                            rx,
+                            store.clone(),
+                            protected_skipped_metrics.clone(),
+                        ));
                         Some(bgp)
                     };
 
@@ -1532,6 +1568,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_manager,
                                         fs_rx,
                                         store.clone(),
+                                        protected_skipped_metrics.clone(),
                                     ));
                                 }
                                 Some(bgp) => {
@@ -1572,6 +1609,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_manager,
                                         fs_rx,
                                         store.clone(),
+                                        protected_skipped_metrics.clone(),
                                     ));
                                 }
                             }
@@ -1726,6 +1764,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             policy.prefixes.clone(),
                             XDP_MAX_ENTRIES,
                             default_pps,
+                            policy.protected_prefixes.clone(),
                         );
                         let (xdp_tx, xdp_rx) =
                             mpsc::channel::<blackwall_flow::DetectionEvent>(4096);
@@ -1759,6 +1798,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 xdp_rx,
                                 store.clone(),
                                 auto_enabled,
+                                protected_skipped_metrics.clone(),
                             ))
                         } else {
                             let executor = shadow::XdpExec::Live(dataplane.clone());
@@ -1783,6 +1823,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 xdp_rx,
                                 store.clone(),
                                 auto_enabled,
+                                protected_skipped_metrics.clone(),
                             ))
                         };
                         xdp_shutdown = Some((handle, dataplane));
@@ -1809,6 +1850,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     afxdp_udp_responses: afxdp_udp_metric.clone(),
                     agent_stats: Some(agent_snapshot.clone()),
                     shadow: Some(shadow_metrics.clone()),
+                    protected_skipped: Some(protected_skipped_metrics.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -2062,6 +2104,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     afxdp_udp_responses: None,
                     agent_stats: None,
                     shadow: None,
+                    protected_skipped: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }

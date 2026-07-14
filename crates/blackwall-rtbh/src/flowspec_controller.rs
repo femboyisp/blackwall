@@ -72,6 +72,9 @@ pub enum FlowSpecAction {
 pub struct FlowSpecController {
     config: FlowSpecConfig,
     active: HashMap<FlowKey, ActiveEntry>,
+    /// Count of targets skipped by the protected-prefix guard (see
+    /// [`Self::protected_skipped`]).
+    protected_skipped: u64,
 }
 
 impl FlowSpecController {
@@ -81,6 +84,7 @@ impl FlowSpecController {
         Self {
             config,
             active: HashMap::new(),
+            protected_skipped: 0,
         }
     }
 
@@ -289,6 +293,16 @@ impl FlowSpecController {
             .any(|p| p.contains(&target))
     }
 
+    /// Number of targets skipped because they fell inside a configured
+    /// [`FlowSpecConfig::protected_prefixes`] entry (own anycast VIP or
+    /// similar always-safe destination) — the anycast self-protection guard
+    /// in [`Self::insert_rule`]. Surfaced for `/metrics`
+    /// (`blackwall_mitigations_protected_skipped_total{plane="flowspec"}`).
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.protected_skipped
+    }
+
     fn insert_rule(
         &mut self,
         target: IpAddr,
@@ -296,6 +310,20 @@ impl FlowSpecController {
         announced_at: u64,
         origin: BlackholeOrigin,
     ) -> Vec<FlowSpecAction> {
+        // Anycast self-protection (C1): a protected prefix (own VIP) must
+        // never have a FlowSpec rule installed against it, even when it also
+        // falls inside an eligible prefix — checked BEFORE eligibility, and
+        // decisive.
+        if self
+            .config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+        {
+            tracing::warn!(%target, "FlowSpec: target in a protected prefix; skipping (never mitigate own service)");
+            self.protected_skipped = self.protected_skipped.saturating_add(1);
+            return Vec::new();
+        }
         if !self.is_eligible(target) {
             tracing::warn!(%target, "FlowSpec: target outside eligible prefixes; ignoring");
             return Vec::new();
@@ -615,5 +643,31 @@ mod tests {
         let c = FlowSpecController::new(cfg());
         assert!(c.is_eligible(ip("203.0.113.7")));
         assert!(!c.is_eligible(ip("198.51.100.7")));
+    }
+
+    #[test]
+    fn protected_target_is_skipped_even_when_eligible() {
+        // 203.0.113.53 is inside the eligible /24 but is carved out as a
+        // protected VIP: it must never get a FlowSpec rule installed.
+        let mut c = FlowSpecController::new(FlowSpecConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.install(ip("203.0.113.53"), &[(17, 53, 1000.0)], 1_000);
+        assert!(actions.is_empty(), "protected VIP must not get a rule");
+        assert!(c.active_rules().is_empty());
+        assert_eq!(c.protected_skipped(), 1);
+    }
+
+    #[test]
+    fn unprotected_eligible_target_still_mitigates() {
+        let mut c = FlowSpecController::new(FlowSpecConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.install(ip("203.0.113.7"), &[(17, 53, 1000.0)], 1_000);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions.as_slice(), [FlowSpecAction::Announce(_)]));
+        assert_eq!(c.protected_skipped(), 0);
     }
 }
