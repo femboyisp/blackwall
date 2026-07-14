@@ -12,7 +12,7 @@ mod sflow;
 mod sink;
 
 pub use agents::AgentRegistry;
-pub use collector_net::run_collector;
+pub use collector_net::{monotonic_now_ms, run_collector};
 pub use detector::{
     AgentStat, AttackKind, Detection, DetectionEvent, Detector, DetectorConfig, Severity,
     ThresholdDetector,

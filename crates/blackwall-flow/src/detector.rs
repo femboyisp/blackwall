@@ -136,7 +136,10 @@ pub trait Detector {
 pub struct AgentStat {
     /// POP name for this agent, as configured in the registry.
     pub pop: String,
-    /// Timestamp (ms since epoch) this agent was last observed.
+    /// Monotonic timestamp (ms since process start, from
+    /// [`crate::monotonic_now_ms`]) this agent was last observed. Compare it
+    /// against `monotonic_now_ms()` — NOT wall-clock epoch — to get a staleness
+    /// age; mixing the two clocks yields a ~epoch-sized nonsense value.
     pub last_seen_ms: u64,
     /// Count of samples from this agent whose reported sampling rate was
     /// clamped because it deviated far from the agent's expected rate.
