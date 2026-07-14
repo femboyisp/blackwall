@@ -284,6 +284,58 @@ impl XdpController {
         self.total_active() >= self.max_entries
     }
 
+    /// Whether `net` is currently blocked (manually or automatically).
+    ///
+    /// Lets a caller (e.g. the manager) check freshness *before* calling
+    /// [`Self::manual_block`], to decide whether a subsequent executor
+    /// failure should [`Self::rollback`] a brand-new insert or leave an
+    /// already-active entry untouched.
+    #[must_use]
+    pub fn is_blocked(&self, net: IpNet) -> bool {
+        self.blocked_nets.contains_key(&net)
+    }
+
+    /// Whether `src` is currently rate-limited (manually or automatically).
+    ///
+    /// See [`Self::is_blocked`] for why this is exposed.
+    #[must_use]
+    pub fn is_rate_limited(&self, src: IpAddr) -> bool {
+        self.rate_limited.contains_key(&src)
+    }
+
+    /// Undo a just-inserted active entry after its executor apply failed
+    /// (C2: commit-after-confirm).
+    ///
+    /// Removes the entry `action` describes from the active set and emits
+    /// nothing — the map write never took, so there is nothing to unwind on
+    /// the data-plane side. Only meaningful for [`XdpAction::RateLimit`] and
+    /// [`XdpAction::Block`] (the two "insert" variants); called on an
+    /// [`XdpAction::Unblock`] or [`XdpAction::ClearRate`] it is a no-op,
+    /// since those represent a removal that already happened in the
+    /// controller's bookkeeping regardless of the executor outcome.
+    ///
+    /// Callers must only invoke this for an `action` known to be a brand-new
+    /// insert (see [`Self::is_blocked`]/[`Self::is_rate_limited`]) — calling
+    /// it after a re-assertion or a param upgrade of an already-active entry
+    /// would incorrectly drop state that predates this call. Mirrors
+    /// `blackwall_rtbh::controller::RtbhController::rollback`.
+    pub fn rollback(&mut self, action: &XdpAction) {
+        match *action {
+            XdpAction::RateLimit { src, victim, .. } => {
+                self.rate_limited.remove(&src);
+                if let Some(victim) = victim {
+                    if let Some(sources) = self.by_target.get_mut(&victim) {
+                        sources.remove(&src);
+                    }
+                }
+            }
+            XdpAction::Block { net } => {
+                self.blocked_nets.remove(&net);
+            }
+            XdpAction::Unblock { .. } | XdpAction::ClearRate { .. } => {}
+        }
+    }
+
     /// Number of detections skipped because the victim fell inside a
     /// configured protected prefix (own anycast VIP or similar always-safe
     /// destination) — the anycast self-protection guard in

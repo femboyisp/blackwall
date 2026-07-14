@@ -112,14 +112,18 @@ enum MirrorKey {
 ///
 /// Owns the pure [`XdpController`] plus the I/O boundary: it executes the
 /// controller's decisions on an [`XdpExecutor`] and mirrors state via an
-/// [`XdpJournal`]. An executor failure is logged and the action is not
-/// journaled — the controller entry is kept in memory while the map write
-/// itself is never retried automatically (a known limitation, mirroring
-/// `RtbhManager`'s BGP-failure behavior). A journal failure after a
-/// successful executor operation is logged, never causes a live entry to be
-/// removed, and is queued as a `MirrorOp` for a bounded self-heal retry on
-/// the next [`XdpManager::tick`] — the executor outcome is never re-issued,
-/// only the mirror write.
+/// [`XdpJournal`]. An executor failure is logged, the action is not
+/// journaled, and — for a brand-new insert (a fresh `RateLimit`/`Block`,
+/// never a re-assertion or param upgrade of an already-active entry) — the
+/// controller's freshly-added active entry is rolled back via
+/// [`XdpController::rollback`] (C2: commit-after-confirm), mirroring
+/// `RtbhManager`'s BGP-failure rollback. This is not a retry mechanism: the
+/// map write itself is never retried automatically, but a future detection
+/// for the same source is no longer deduped against a phantom active entry.
+/// A journal failure after a successful executor operation is logged, never
+/// causes a live entry to be removed, and is queued as a `MirrorOp` for a
+/// bounded self-heal retry on the next [`XdpManager::tick`] — the executor
+/// outcome is never re-issued, only the mirror write.
 pub struct XdpManager<E: XdpExecutor, J: XdpJournal> {
     controller: XdpController,
     executor: E,
@@ -128,6 +132,10 @@ pub struct XdpManager<E: XdpExecutor, J: XdpJournal> {
     /// succeeded; retried (never re-issued to the executor) by
     /// [`XdpManager::retry_pending_mirror`] on the next tick.
     pending_mirror: Vec<MirrorOp>,
+    /// Count of executor applies that failed, each counted here (see
+    /// [`Self::apply_failures`]); a fresh insert among them is also rolled
+    /// back (see [`XdpController::rollback`]).
+    apply_failures: u64,
 }
 
 impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
@@ -138,6 +146,7 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
             executor,
             journal,
             pending_mirror: Vec::new(),
+            apply_failures: 0,
         }
     }
 
@@ -146,7 +155,12 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     pub async fn on_detection(&mut self, ev: &blackwall_flow::DetectionEvent, wall_now: u64) {
         let actions = self.controller.on_detection(ev);
         for action in actions {
-            self.execute_and_journal(action, XdpOrigin::Auto, wall_now)
+            // `XdpController::on_detection` only ever emits a `RateLimit`
+            // for a source it just freshly inserted (an already-active
+            // source is deduplicated before an action is produced — see
+            // `XdpController::handle_detection`), so every action reaching
+            // here is always a fresh insert.
+            self.execute_and_journal(action, XdpOrigin::Auto, wall_now, true)
                 .await;
         }
     }
@@ -157,9 +171,10 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     /// [`ApplyOutcome::Rejected`] if `net` overlaps an own prefix, or
     /// [`ApplyOutcome::Deferred`] if the manager is at capacity.
     pub async fn apply_add(&mut self, net: IpNet, wall_now: u64) -> ApplyOutcome {
+        let fresh = !self.controller.is_blocked(net);
         match self.controller.manual_block(net) {
             Ok(action) => {
-                self.execute_and_journal(action, XdpOrigin::Manual, wall_now)
+                self.execute_and_journal(action, XdpOrigin::Manual, wall_now, fresh)
                     .await;
                 ApplyOutcome::Applied
             }
@@ -173,7 +188,10 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     pub async fn apply_remove(&mut self, net: IpNet, wall_now: u64) -> ApplyOutcome {
         match self.controller.manual_unblock(net) {
             Ok(action) => {
-                self.execute_and_journal(action, XdpOrigin::Manual, wall_now)
+                // `Unblock` is a removal, not an insert — nothing for a
+                // failed apply to roll back (`XdpController::rollback` is a
+                // no-op for this variant regardless).
+                self.execute_and_journal(action, XdpOrigin::Manual, wall_now, false)
                     .await;
                 ApplyOutcome::Applied
             }
@@ -186,7 +204,9 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     pub async fn apply_clear_rate(&mut self, src: IpAddr, wall_now: u64) -> ApplyOutcome {
         match self.controller.manual_clear_rate(src) {
             Ok(action) => {
-                self.execute_and_journal(action, XdpOrigin::Manual, wall_now)
+                // `ClearRate` is a removal, not an insert — see the
+                // `apply_remove` comment above.
+                self.execute_and_journal(action, XdpOrigin::Manual, wall_now, false)
                     .await;
                 ApplyOutcome::Applied
             }
@@ -205,9 +225,10 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         burst: u64,
         wall_now: u64,
     ) -> ApplyOutcome {
+        let fresh = !self.controller.is_rate_limited(src);
         match self.controller.manual_rate_limit(src, pps, burst) {
             Ok(action) => {
-                self.execute_and_journal(action, XdpOrigin::Manual, wall_now)
+                self.execute_and_journal(action, XdpOrigin::Manual, wall_now, fresh)
                     .await;
                 ApplyOutcome::Applied
             }
@@ -257,6 +278,17 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         self.controller.protected_skipped()
     }
 
+    /// Count of executor (eBPF-map) applies that failed (C2). A failure for
+    /// a brand-new insert also rolls back the controller's freshly-added
+    /// active entry (see [`XdpController::rollback`]) so the control plane
+    /// never believes an unconfirmed map write is active. Surfaced for
+    /// `/metrics` as `blackwall_xdp_apply_failures_total`, mirroring
+    /// `blackwall_rtbh::manager::RtbhManager::apply_failures`.
+    #[must_use]
+    pub fn apply_failures(&self) -> u64 {
+        self.apply_failures
+    }
+
     /// Queue a failed mirror write for self-heal, coalescing by identity
     /// (source or network).
     ///
@@ -272,9 +304,34 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     }
 
     /// Execute one controller action on the executor and mirror it into the journal.
-    async fn execute_and_journal(&mut self, action: XdpAction, origin: XdpOrigin, wall_now: u64) {
+    ///
+    /// `fresh` marks whether `action` is a brand-new insert (a first-time
+    /// `RateLimit`/`Block`) rather than a re-assertion or param upgrade of an
+    /// already-active entry, or a removal (`Unblock`/`ClearRate`). On an
+    /// executor failure, a fresh insert's freshly-added active entry is
+    /// rolled back (C2: commit-after-confirm) so the control plane never
+    /// believes an unconfirmed map write is active; a non-fresh action has no
+    /// just-inserted entry to undo, so nothing is rolled back. Either way the
+    /// failure is counted in `apply_failures`.
+    async fn execute_and_journal(
+        &mut self,
+        action: XdpAction,
+        origin: XdpOrigin,
+        wall_now: u64,
+        fresh: bool,
+    ) {
         if let Err(e) = self.executor.apply(action).await {
-            tracing::warn!(error = %e, ?action, "XDP: executor apply failed; not journaling");
+            self.apply_failures = self.apply_failures.saturating_add(1);
+            if fresh {
+                tracing::warn!(
+                    error = %e,
+                    ?action,
+                    "XDP: executor apply failed; rolling back active entry, not journaling"
+                );
+                self.controller.rollback(&action);
+            } else {
+                tracing::warn!(error = %e, ?action, "XDP: executor apply failed; not journaling");
+            }
             return;
         }
         if let Err(e) = self.journal.record(&action, origin, wall_now).await {
@@ -487,6 +544,46 @@ mod tests {
             m.journal().recorded.lock().unwrap().is_empty(),
             "an executor failure must not be journaled"
         );
+    }
+
+    #[tokio::test]
+    async fn executor_failure_does_not_leave_a_phantom_active_entry() {
+        // The executor (map write) fails: the kernel never installed the
+        // rate limit, so the control plane must NOT believe it did (C2) —
+        // the freshly-inserted active entry must be rolled back, not left as
+        // a phantom "active" mitigation that dedupes future detections.
+        let mut m = mgr(true, false); // executor fails
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.7", vec!["198.51.100.9"])),
+            1000,
+        )
+        .await;
+        assert!(
+            m.active().is_empty(),
+            "a failed executor apply must not leave a phantom active entry"
+        );
+        assert_eq!(m.apply_failures(), 1);
+
+        // A subsequent identical detection re-attempts (not deduped against
+        // a phantom active entry).
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.7", vec!["198.51.100.9"])),
+            2000,
+        )
+        .await;
+        assert_eq!(m.apply_failures(), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_apply_activates_with_no_apply_failures() {
+        let mut m = mgr(false, false);
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.7", vec!["198.51.100.9"])),
+            1000,
+        )
+        .await;
+        assert_eq!(m.active().len(), 1);
+        assert_eq!(m.apply_failures(), 0);
     }
 
     #[tokio::test]

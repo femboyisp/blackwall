@@ -50,6 +50,11 @@ pub(crate) struct MetricsSources {
     /// `flowspec` block is configured. Copied from the manager once per
     /// tick, mirroring `rtbh_apply_failures`.
     pub flowspec_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// XDP executor (eBPF-map) applies that failed and were rolled back (C2,
+    /// `blackwall_xdp::manager::XdpManager::apply_failures`); `None` when no
+    /// `xdp` block is configured. Copied from the manager once per tick,
+    /// mirroring `rtbh_apply_failures`.
+    pub xdp_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -144,6 +149,14 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             help: "FlowSpec announces that failed at the BGP executor and were rolled back (C2)",
             kind: MetricKind::Counter,
             value: u64_to_f64(flowspec_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(xdp_apply_failures) = &sources.xdp_apply_failures {
+        m.push(Metric {
+            name: "blackwall_xdp_apply_failures_total",
+            help: "XDP executor (eBPF-map) applies that failed and were rolled back (C2)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(xdp_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
 

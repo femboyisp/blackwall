@@ -1120,6 +1120,7 @@ async fn xdp_manager_task<J>(
     request_store: std::sync::Arc<blackwall_state::Store>,
     auto_enabled: bool,
     protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
+    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
 ) where
     J: blackwall_xdp::XdpJournal + 'static,
 {
@@ -1145,6 +1146,10 @@ async fn xdp_manager_task<J>(
 
                 protected_metrics.xdp.store(
                     manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                apply_failure_metrics.store(
+                    manager.apply_failures(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -1461,6 +1466,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Built unconditionally — harmless all-zero counter when no
             // `flowspec` block is configured.
             let flowspec_apply_failure_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // XDP executor (eBPF-map) applies that failed and were rolled
+            // back (C2): copied from `XdpManager::apply_failures` on every
+            // tick, mirroring `rtbh_apply_failure_metrics` above. Built
+            // unconditionally — harmless all-zero counter when no `xdp`
+            // block is configured.
+            let xdp_apply_failure_metrics =
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
@@ -1827,6 +1839,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 store.clone(),
                                 auto_enabled,
                                 protected_skipped_metrics.clone(),
+                                xdp_apply_failure_metrics.clone(),
                             ))
                         } else {
                             let executor = shadow::XdpExec::Live(dataplane.clone());
@@ -1852,6 +1865,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 store.clone(),
                                 auto_enabled,
                                 protected_skipped_metrics.clone(),
+                                xdp_apply_failure_metrics.clone(),
                             ))
                         };
                         xdp_shutdown = Some((handle, dataplane));
@@ -1881,6 +1895,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     protected_skipped: Some(protected_skipped_metrics.clone()),
                     rtbh_apply_failures: Some(rtbh_apply_failure_metrics.clone()),
                     flowspec_apply_failures: Some(flowspec_apply_failure_metrics.clone()),
+                    xdp_apply_failures: Some(xdp_apply_failure_metrics.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -2137,6 +2152,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     protected_skipped: None,
                     rtbh_apply_failures: None,
                     flowspec_apply_failures: None,
+                    xdp_apply_failures: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
