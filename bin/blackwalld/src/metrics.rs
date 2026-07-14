@@ -504,6 +504,37 @@ fn protected_skipped_block(sources: &MetricsSources) -> Option<String> {
     Some(out)
 }
 
+/// Render `blackwall_bgp_unnegotiated_announce_skipped_total{safi}` (C3) from
+/// the live `BgpHandle`, or `None` when no `rtbh`/`flowspec` block is
+/// configured (no BGP session to report — mirrors `sources.bgp` used by
+/// [`gather`]'s session-state/reconnect metrics). Labels are a fixed,
+/// known-at-compile-time set, but still hand-written since [`Metric`] only
+/// carries unlabelled series — mirrors [`shadow_block`]/[`protected_skipped_block`].
+fn unnegotiated_announce_skipped_block(sources: &MetricsSources) -> Option<String> {
+    let bgp = sources.bgp.as_ref()?;
+    let counts = bgp.unnegotiated_skip_counts();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_bgp_unnegotiated_announce_skipped_total FlowSpec/IPv6 announces skipped because the peer never negotiated that SAFI in its OPEN (C3)"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_bgp_unnegotiated_announce_skipped_total counter"
+    );
+    for (safi, count) in [
+        ("flowspec_v4", counts.flowspec_v4),
+        ("flowspec_v6", counts.flowspec_v6),
+        ("ipv6_unicast", counts.ipv6_unicast),
+    ] {
+        let _ = writeln!(
+            out,
+            "blackwall_bgp_unnegotiated_announce_skipped_total{{safi=\"{safi}\"}} {count}"
+        );
+    }
+    Some(out)
+}
+
 /// Serve `/metrics` forever. Each connection is handled on its own task so a
 /// slow client cannot block scrapes; a bind failure disables the endpoint (and
 /// is logged) without taking down the daemon.
@@ -562,6 +593,12 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
                 body.push('\n');
             }
             body.push_str(&protected);
+        }
+        if let Some(unnegotiated) = unnegotiated_announce_skipped_block(sources) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&unnegotiated);
         }
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

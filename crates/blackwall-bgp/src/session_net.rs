@@ -100,6 +100,133 @@ pub enum PeerConfigError {
 #[error("BGP session task is not running; command dropped")]
 pub struct BgpSendError;
 
+// ── C3: capability-gated announces ──────────────────────────────────────────
+
+/// Which negotiated AFI/SAFI an announce needs, per RFC 4760 MP-BGP
+/// capabilities (RFC 8955/8956 §133 for FlowSpec).
+///
+/// [`announce_allowed`] gates a pending announce against the peer's
+/// [`OpenMsg`] before it is written to the wire — sending an UPDATE for a
+/// SAFI the peer never advertised in its own OPEN causes some
+/// implementations (and our own bird-config default) to NOTIFICATION-reset
+/// the session, dropping every other active mitigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceSafi {
+    /// AFI 1 / SAFI 1 — unconditionally allowed; see [`announce_allowed`].
+    Ipv4Unicast,
+    /// AFI 2 / SAFI 1.
+    Ipv6Unicast,
+    /// AFI 1 / SAFI 133.
+    FlowSpecV4,
+    /// AFI 2 / SAFI 133.
+    FlowSpecV6,
+}
+
+impl AnnounceSafi {
+    /// The SAFI an announce for `prefix` needs (IPv4 vs IPv6 unicast).
+    fn for_route(prefix: &IpNet) -> Self {
+        match prefix {
+            IpNet::V4(_) => AnnounceSafi::Ipv4Unicast,
+            IpNet::V6(_) => AnnounceSafi::Ipv6Unicast,
+        }
+    }
+
+    /// The SAFI a FlowSpec announce for `dst` needs (v4 vs v6 FlowSpec).
+    fn for_flowspec(dst: &IpNet) -> Self {
+        match dst {
+            IpNet::V4(_) => AnnounceSafi::FlowSpecV4,
+            IpNet::V6(_) => AnnounceSafi::FlowSpecV6,
+        }
+    }
+
+    /// The `safi` label used for `tracing::warn!` and the
+    /// `blackwall_bgp_unnegotiated_announce_skipped_total` metric.
+    fn label(self) -> &'static str {
+        match self {
+            AnnounceSafi::Ipv4Unicast => "ipv4_unicast",
+            AnnounceSafi::Ipv6Unicast => "ipv6_unicast",
+            AnnounceSafi::FlowSpecV4 => "flowspec_v4",
+            AnnounceSafi::FlowSpecV6 => "flowspec_v6",
+        }
+    }
+}
+
+/// Pure gate: does `peer`'s negotiated capability set (decoded from its OPEN)
+/// allow an announce needing `safi`?
+///
+/// IPv4 unicast is unconditionally allowed — every peer we support negotiates
+/// it, and it is not the SAFI the C3 bug concerns. IPv6 unicast and both
+/// FlowSpec AFIs gate on the corresponding field decoded from the peer's
+/// [`OpenMsg`] at handshake (`decode_open`), so an under-negotiating peer is
+/// skipped instead of NOTIFICATION-reset.
+fn announce_allowed(peer: &OpenMsg, safi: AnnounceSafi) -> bool {
+    match safi {
+        AnnounceSafi::Ipv4Unicast => true,
+        AnnounceSafi::Ipv6Unicast => peer.ipv6_unicast,
+        AnnounceSafi::FlowSpecV4 => peer.flowspec_v4,
+        AnnounceSafi::FlowSpecV6 => peer.flowspec_v6,
+    }
+}
+
+/// Read-only session context for [`established_loop`]: static peer config
+/// plus the C3 capability-gating inputs (the peer's negotiated SAFIs and the
+/// shared skip counters). Grouped into a single parameter so
+/// `established_loop` stays under clippy's `too_many_arguments` limit.
+struct EstablishedCtx<'a> {
+    cfg: &'a PeerConfig,
+    peer_open: &'a OpenMsg,
+    unnegotiated_skipped: &'a UnnegotiatedSkipCounters,
+}
+
+/// A snapshot of unnegotiated-SAFI announce-skip counts (C3), for the
+/// `/metrics` endpoint (`blackwall_bgp_unnegotiated_announce_skipped_total{safi}`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnnegotiatedSkipCounts {
+    /// FlowSpec v4 (AFI 1 / SAFI 133) announces skipped because the peer
+    /// never negotiated that SAFI.
+    pub flowspec_v4: u64,
+    /// FlowSpec v6 (AFI 2 / SAFI 133) announces skipped.
+    pub flowspec_v6: u64,
+    /// IPv6 unicast (AFI 2 / SAFI 1) announces skipped.
+    pub ipv6_unicast: u64,
+}
+
+/// Live counters backing [`UnnegotiatedSkipCounts`]; shared between the
+/// session task (writer) and [`BgpHandle`] (reader, for `/metrics`).
+///
+/// `pub(crate)` (rather than private) because [`run`] — itself `pub` for
+/// [`spawn`] to call across the module boundary — takes an `Arc` of this type
+/// as a parameter, and Rust requires a `pub` item's signature to only
+/// reference types at least as visible as the item itself.
+#[derive(Debug, Default)]
+pub(crate) struct UnnegotiatedSkipCounters {
+    flowspec_v4: AtomicU64,
+    flowspec_v6: AtomicU64,
+    ipv6_unicast: AtomicU64,
+}
+
+impl UnnegotiatedSkipCounters {
+    /// Record one skipped announce for `safi`. `Ipv4Unicast` is never gated
+    /// (see [`announce_allowed`]) and is intentionally not counted.
+    fn record(&self, safi: AnnounceSafi) {
+        let counter = match safi {
+            AnnounceSafi::FlowSpecV4 => &self.flowspec_v4,
+            AnnounceSafi::FlowSpecV6 => &self.flowspec_v6,
+            AnnounceSafi::Ipv6Unicast => &self.ipv6_unicast,
+            AnnounceSafi::Ipv4Unicast => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> UnnegotiatedSkipCounts {
+        UnnegotiatedSkipCounts {
+            flowspec_v4: self.flowspec_v4.load(Ordering::Relaxed),
+            flowspec_v6: self.flowspec_v6.load(Ordering::Relaxed),
+            ipv6_unicast: self.ipv6_unicast.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl PeerConfig {
     /// Validate the configuration for an iBGP-injection session.
     ///
@@ -161,6 +288,7 @@ pub struct BgpHandle {
     tx: mpsc::Sender<SessionCommand>,
     state: watch::Receiver<SessionState>,
     reconnects: Arc<AtomicU64>,
+    unnegotiated_skipped: Arc<UnnegotiatedSkipCounters>,
 }
 
 impl BgpHandle {
@@ -181,6 +309,14 @@ impl BgpHandle {
     #[must_use]
     pub fn reconnects(&self) -> u64 {
         self.reconnects.load(Ordering::Relaxed)
+    }
+
+    /// FlowSpec/IPv6 announces skipped because the peer never negotiated the
+    /// required SAFI in its OPEN (C3) — see [`announce_allowed`]. For the
+    /// `/metrics` endpoint's `blackwall_bgp_unnegotiated_announce_skipped_total{safi}`.
+    #[must_use]
+    pub fn unnegotiated_skip_counts(&self) -> UnnegotiatedSkipCounts {
+        self.unnegotiated_skipped.snapshot()
     }
 
     /// Announce a route to the BGP peer.
@@ -270,12 +406,14 @@ pub fn spawn(cfg: PeerConfig) -> Result<(BgpHandle, tokio::task::JoinHandle<()>)
     let (tx, rx) = mpsc::channel(256);
     let (state_tx, state_rx) = watch::channel(SessionState::Idle);
     let reconnects = Arc::new(AtomicU64::new(0));
+    let unnegotiated_skipped = Arc::new(UnnegotiatedSkipCounters::default());
     let handle = BgpHandle {
         tx,
         state: state_rx,
         reconnects: Arc::clone(&reconnects),
+        unnegotiated_skipped: Arc::clone(&unnegotiated_skipped),
     };
-    let join = tokio::spawn(run(cfg, rx, state_tx, reconnects));
+    let join = tokio::spawn(run(cfg, rx, state_tx, reconnects, unnegotiated_skipped));
     Ok((handle, join))
 }
 
@@ -291,6 +429,7 @@ pub async fn run(
     mut commands: mpsc::Receiver<SessionCommand>,
     state: watch::Sender<SessionState>,
     reconnects: Arc<AtomicU64>,
+    unnegotiated_skipped: Arc<UnnegotiatedSkipCounters>,
 ) {
     let mut active: HashMap<IpNet, Route> = HashMap::new();
     let mut active_flowspec: HashMap<Vec<u8>, FlowSpecRule> = HashMap::new();
@@ -307,6 +446,7 @@ pub async fn run(
             &mut active_flowspec,
             &state,
             &mut consecutive_failures,
+            &unnegotiated_skipped,
         )
         .await;
         match outcome {
@@ -390,6 +530,7 @@ async fn session_once(
     active_flowspec: &mut HashMap<Vec<u8>, FlowSpecRule>,
     state: &watch::Sender<SessionState>,
     consecutive_failures: &mut u32,
+    unnegotiated_skipped: &UnnegotiatedSkipCounters,
 ) -> SessionOutcome {
     // ── 1. TCP connect ──────────────────────────────────────────────────────
     let mut stream = match connect_peer(
@@ -573,33 +714,68 @@ async fn session_once(
     let _ = state.send(SessionState::Established);
 
     // ── 5. Re-announce the full active set ──────────────────────────────────
+    // C3: gate on the peer's negotiated SAFIs — `active`/`active_flowspec` may
+    // hold routes/rules queued while disconnected (or negotiated with a
+    // *different* prior session), so this reconnect path is just as capable
+    // of sending a session-resetting UPDATE as the live command arms below.
+    let mut skipped_routes = 0usize;
     for route in active.values() {
+        let safi = AnnounceSafi::for_route(&route.prefix);
+        if !announce_allowed(&peer_open, safi) {
+            unnegotiated_skipped.record(safi);
+            skipped_routes += 1;
+            warn!(
+                peer = %cfg.peer_addr, prefix = %route.prefix, safi = safi.label(),
+                "skipping re-announce: peer did not negotiate this SAFI"
+            );
+            continue;
+        }
         let pkt = build_announce(route);
         if let Err(e) = stream.write_all(&pkt).await {
             return SessionOutcome::Reconnect(format!("re-announce write failed: {e}"));
         }
     }
-    if !active.is_empty() {
-        debug!(peer = %cfg.peer_addr, count = active.len(), "re-announced active routes");
+    if active.len() > skipped_routes {
+        debug!(
+            peer = %cfg.peer_addr,
+            count = active.len() - skipped_routes,
+            "re-announced active routes"
+        );
     }
 
+    let mut skipped_flowspec = 0usize;
     for rule in active_flowspec.values() {
+        let safi = AnnounceSafi::for_flowspec(&rule.dst);
+        if !announce_allowed(&peer_open, safi) {
+            unnegotiated_skipped.record(safi);
+            skipped_flowspec += 1;
+            warn!(
+                peer = %cfg.peer_addr, dst = %rule.dst, safi = safi.label(),
+                "skipping FlowSpec re-announce: peer did not negotiate this SAFI"
+            );
+            continue;
+        }
         let pkt = build_flowspec_announce(rule);
         if let Err(e) = stream.write_all(&pkt).await {
             return SessionOutcome::Reconnect(format!("FlowSpec re-announce write failed: {e}"));
         }
     }
-    if !active_flowspec.is_empty() {
+    if active_flowspec.len() > skipped_flowspec {
         debug!(
             peer = %cfg.peer_addr,
-            count = active_flowspec.len(),
+            count = active_flowspec.len() - skipped_flowspec,
             "re-announced active FlowSpec rules"
         );
     }
 
     // ── 6. Established event loop ───────────────────────────────────────────
-    established_loop(
+    let ctx = EstablishedCtx {
         cfg,
+        peer_open: &peer_open,
+        unnegotiated_skipped,
+    };
+    established_loop(
+        &ctx,
         commands,
         active,
         active_flowspec,
@@ -701,7 +877,7 @@ async fn await_peer_confirmation(
 /// commands.  Returns when the session needs to reconnect or the command
 /// channel closes.
 async fn established_loop(
-    cfg: &PeerConfig,
+    ctx: &EstablishedCtx<'_>,
     commands: &mut mpsc::Receiver<SessionCommand>,
     active: &mut HashMap<IpNet, Route>,
     active_flowspec: &mut HashMap<Vec<u8>, FlowSpecRule>,
@@ -709,6 +885,9 @@ async fn established_loop(
     buf: &mut Vec<u8>,
     hold_secs: u16,
 ) -> SessionOutcome {
+    let cfg = ctx.cfg;
+    let peer_open = ctx.peer_open;
+    let unnegotiated_skipped = ctx.unnegotiated_skipped;
     // Fix 3: when hold_secs == 0 (RFC 4271: no keepalive/hold timers), park the
     // keepalive arm on `pending()` so we never send unsolicited KEEPALIVEs.
     // When hold_secs > 0, keepalive every hold/3 (min 1 s).  RFC 4271 §6.7.
@@ -849,14 +1028,28 @@ async fn established_loop(
                     }
                     Some(SessionCommand::Announce(route)) => {
                         let prefix = route.prefix;
-                        let pkt = build_announce(&route);
-                        active.insert(prefix, route);
-                        if let Err(e) = stream.write_all(&pkt).await {
-                            return SessionOutcome::Reconnect(
-                                format!("announce write failed: {e}")
+                        // C3: gate IPv6-unicast announces on the peer's negotiated
+                        // SAFI (IPv4 unicast is unconditionally allowed). `active`
+                        // still tracks the route so a later reconnect (to a peer
+                        // that *does* negotiate it) re-announces it.
+                        let safi = AnnounceSafi::for_route(&prefix);
+                        if !announce_allowed(peer_open, safi) {
+                            unnegotiated_skipped.record(safi);
+                            active.insert(prefix, route);
+                            warn!(
+                                peer = %cfg.peer_addr, %prefix, safi = safi.label(),
+                                "skipping announce: peer did not negotiate this SAFI"
                             );
+                        } else {
+                            let pkt = build_announce(&route);
+                            active.insert(prefix, route);
+                            if let Err(e) = stream.write_all(&pkt).await {
+                                return SessionOutcome::Reconnect(
+                                    format!("announce write failed: {e}")
+                                );
+                            }
+                            debug!(peer = %cfg.peer_addr, %prefix, "announced");
                         }
-                        debug!(peer = %cfg.peer_addr, %prefix, "announced");
                     }
                     Some(SessionCommand::Withdraw(prefix)) => {
                         active.remove(&prefix);
@@ -870,14 +1063,28 @@ async fn established_loop(
                     }
                     Some(SessionCommand::AnnounceFlowSpec(rule)) => {
                         let key = crate::flowspec::encode_flowspec_nlri(&rule);
-                        let pkt = build_flowspec_announce(&rule);
-                        active_flowspec.insert(key, rule);
-                        if let Err(e) = stream.write_all(&pkt).await {
-                            return SessionOutcome::Reconnect(
-                                format!("FlowSpec announce write failed: {e}")
+                        // C3: gate on the peer's negotiated FlowSpec SAFI (133) for
+                        // this rule's address family. `active_flowspec` still tracks
+                        // the rule so a later reconnect can re-announce it.
+                        let safi = AnnounceSafi::for_flowspec(&rule.dst);
+                        if !announce_allowed(peer_open, safi) {
+                            unnegotiated_skipped.record(safi);
+                            let dst = rule.dst;
+                            active_flowspec.insert(key, rule);
+                            warn!(
+                                peer = %cfg.peer_addr, %dst, safi = safi.label(),
+                                "skipping FlowSpec announce: peer did not negotiate this SAFI"
                             );
+                        } else {
+                            let pkt = build_flowspec_announce(&rule);
+                            active_flowspec.insert(key, rule);
+                            if let Err(e) = stream.write_all(&pkt).await {
+                                return SessionOutcome::Reconnect(
+                                    format!("FlowSpec announce write failed: {e}")
+                                );
+                            }
+                            debug!(peer = %cfg.peer_addr, "FlowSpec rule announced");
                         }
-                        debug!(peer = %cfg.peer_addr, "FlowSpec rule announced");
                     }
                     Some(SessionCommand::WithdrawFlowSpec(rule)) => {
                         let key = crate::flowspec::encode_flowspec_nlri(&rule);
@@ -1234,6 +1441,97 @@ mod tests {
         assert_eq!(
             local.ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    // ── C3: capability-gated announces ──────────────────────────────────────
+
+    /// A minimal `OpenMsg` with every AFI/SAFI disabled, for tests to
+    /// selectively enable one field at a time.
+    fn peer_stub() -> OpenMsg {
+        OpenMsg {
+            asn: 65001,
+            hold_time: 90,
+            router_id: 0x0A00_0001,
+            ipv4_unicast: true,
+            ipv6_unicast: false,
+            flowspec_v4: false,
+            flowspec_v6: false,
+        }
+    }
+
+    #[test]
+    fn ipv4_unicast_is_always_allowed() {
+        // Even a peer that negotiated nothing else must still get IPv4 unicast.
+        assert!(announce_allowed(&peer_stub(), AnnounceSafi::Ipv4Unicast));
+    }
+
+    #[test]
+    fn flowspec_announce_skipped_when_peer_did_not_negotiate_safi_133() {
+        let peer = peer_stub();
+        assert!(!announce_allowed(&peer, AnnounceSafi::FlowSpecV4));
+        let peer2 = OpenMsg {
+            flowspec_v4: true,
+            ..peer
+        };
+        assert!(announce_allowed(&peer2, AnnounceSafi::FlowSpecV4));
+    }
+
+    #[test]
+    fn flowspec_v6_gates_independently_of_flowspec_v4() {
+        let mut peer = peer_stub();
+        peer.flowspec_v4 = true;
+        // v4 negotiated, v6 not — a v6 FlowSpec announce must still be gated.
+        assert!(!announce_allowed(&peer, AnnounceSafi::FlowSpecV6));
+        peer.flowspec_v6 = true;
+        assert!(announce_allowed(&peer, AnnounceSafi::FlowSpecV6));
+    }
+
+    #[test]
+    fn ipv6_unicast_gates_on_peer_capability() {
+        let peer = peer_stub();
+        assert!(!announce_allowed(&peer, AnnounceSafi::Ipv6Unicast));
+        let peer2 = OpenMsg {
+            ipv6_unicast: true,
+            ..peer
+        };
+        assert!(announce_allowed(&peer2, AnnounceSafi::Ipv6Unicast));
+    }
+
+    #[test]
+    fn announce_safi_for_route_dispatches_on_address_family() {
+        let v4: IpNet = "10.0.0.1/32".parse().unwrap();
+        let v6: IpNet = "2001:db8::1/128".parse().unwrap();
+        assert_eq!(AnnounceSafi::for_route(&v4), AnnounceSafi::Ipv4Unicast);
+        assert_eq!(AnnounceSafi::for_route(&v6), AnnounceSafi::Ipv6Unicast);
+    }
+
+    #[test]
+    fn announce_safi_for_flowspec_dispatches_on_address_family() {
+        let v4: IpNet = "10.0.0.0/24".parse().unwrap();
+        let v6: IpNet = "2001:db8::/32".parse().unwrap();
+        assert_eq!(AnnounceSafi::for_flowspec(&v4), AnnounceSafi::FlowSpecV4);
+        assert_eq!(AnnounceSafi::for_flowspec(&v6), AnnounceSafi::FlowSpecV6);
+    }
+
+    #[test]
+    fn unnegotiated_skip_counters_record_and_snapshot_per_safi() {
+        let counters = UnnegotiatedSkipCounters::default();
+        counters.record(AnnounceSafi::FlowSpecV4);
+        counters.record(AnnounceSafi::FlowSpecV4);
+        counters.record(AnnounceSafi::FlowSpecV6);
+        counters.record(AnnounceSafi::Ipv6Unicast);
+        // Ipv4Unicast is never gated in practice; recording it is a no-op.
+        counters.record(AnnounceSafi::Ipv4Unicast);
+
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap,
+            UnnegotiatedSkipCounts {
+                flowspec_v4: 2,
+                flowspec_v6: 1,
+                ipv6_unicast: 1,
+            }
         );
     }
 }
