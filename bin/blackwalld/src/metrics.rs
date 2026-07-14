@@ -40,6 +40,11 @@ pub(crate) struct MetricsSources {
     /// the flow daemon (no RTBH/FlowSpec/XDP managers to guard). Unlike
     /// `shadow`, populated in both shadow AND live sessions.
     pub protected_skipped: Option<Arc<crate::shadow::ProtectedSkippedMetrics>>,
+    /// RTBH announces that failed at the BGP executor and were rolled back
+    /// (C2, `RtbhManager::apply_failures`); `None` when no `rtbh` block is
+    /// configured. Copied from the manager once per tick, mirroring how
+    /// `protected_skipped` reaches this endpoint.
+    pub rtbh_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -117,6 +122,15 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             help: "AF_XDP UDP responder replies sent (reflection-safe, B3.2)",
             kind: MetricKind::Counter,
             value: u64_to_f64(afxdp_udp.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+
+    if let Some(rtbh_apply_failures) = &sources.rtbh_apply_failures {
+        m.push(Metric {
+            name: "blackwall_rtbh_apply_failures_total",
+            help: "RTBH announces that failed at the BGP executor and were rolled back (C2)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(rtbh_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
 

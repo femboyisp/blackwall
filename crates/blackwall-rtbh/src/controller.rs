@@ -336,6 +336,25 @@ impl RtbhController {
         vec![RtbhAction::Announce(route)]
     }
 
+    /// Undo a just-inserted active entry after its BGP announce failed (C2:
+    /// commit-after-confirm).
+    ///
+    /// Removes `target` from the active set and emits nothing — the router
+    /// never took the route, so there is nothing to withdraw. Must only be
+    /// called immediately after an [`RtbhAction::Announce`] was returned for
+    /// `target` (by [`Self::on_event`], [`Self::manual_add`], or
+    /// [`Self::resume`]): [`Self::insert_blackhole`] emits `Announce` only
+    /// when it performs a brand-new insert — a re-assertion, an
+    /// Auto-to-Manual upgrade, an at-cap target, or an ineligible/protected
+    /// target all return an empty vector instead and never reach this call.
+    /// So at the point of a failed announce, `active[target]` is guaranteed
+    /// to still be exactly the entry this call is undoing — never a
+    /// pre-existing `Manual` blackhole or one touched by anything else in
+    /// between.
+    pub fn rollback(&mut self, target: IpAddr) {
+        self.active.remove(&target);
+    }
+
     fn host_route(&self, target: IpAddr) -> Option<Route> {
         let next_hop = match target {
             IpAddr::V4(_) => self.config.next_hop_v4.map(IpAddr::V4),

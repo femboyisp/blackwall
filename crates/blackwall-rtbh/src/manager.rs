@@ -77,14 +77,18 @@ pub enum ApplyOutcome {
 ///
 /// Owns the pure [`RtbhController`] plus the I/O boundary: it executes the
 /// controller's decisions on a [`BgpExecutor`] and mirrors auto/manual state
-/// via a [`BlackholeJournal`]. A BGP failure is logged and the action is not
-/// journaled — but note this is a known limitation, not a retry mechanism:
-/// on a failed first announce the controller entry is kept in memory while
-/// the route itself is never re-announced automatically. A journal failure
-/// after a successful BGP operation is logged, never causes a live
-/// blackhole to be withdrawn, and is queued as a `MirrorOp` for a bounded
-/// self-heal retry on the next [`RtbhManager::tick`] — the BGP outcome is
-/// never re-issued, only the mirror write.
+/// via a [`BlackholeJournal`]. A BGP announce failure is logged, the action
+/// is not journaled, and the controller's freshly-inserted active entry is
+/// rolled back via [`RtbhController::rollback`] (C2: commit-after-confirm) —
+/// the control plane never believes an unconfirmed announce succeeded, so a
+/// future detection for the same target is not deduped against a phantom
+/// entry. There is no retry queue for this: while the underlying attack
+/// persists, the detector naturally re-emits the detection on its next tick
+/// and the manager re-attempts through the same path. This differs from a
+/// *journal* failure after a successful BGP operation, which is logged,
+/// never causes a live blackhole to be withdrawn, and is queued as a
+/// `MirrorOp` for a bounded self-heal retry on the next [`RtbhManager::tick`]
+/// — the BGP outcome is never re-issued, only the mirror write.
 pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     controller: RtbhController,
     bgp: B,
@@ -93,6 +97,9 @@ pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     /// succeeded; retried (never re-issued to BGP) by
     /// `RtbhManager::retry_pending_mirror` on the next tick.
     pending_mirror: Vec<MirrorOp>,
+    /// Count of announces that failed at the BGP executor, each rolled back
+    /// (see [`Self::apply_failures`]).
+    apply_failures: u64,
 }
 
 /// A journal mirror write that failed and is queued for a self-heal retry.
@@ -128,6 +135,7 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
             bgp,
             journal,
             pending_mirror: Vec::new(),
+            apply_failures: 0,
         }
     }
 
@@ -270,6 +278,17 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         self.controller.protected_skipped()
     }
 
+    /// Count of announces that failed at the [`BgpExecutor`] (C2). Each
+    /// failure rolls back the controller's freshly-inserted active entry
+    /// (see [`RtbhController::rollback`]) so the control plane never
+    /// believes an unconfirmed announce is active. Surfaced for `/metrics`
+    /// as `blackwall_rtbh_apply_failures_total`, mirroring how
+    /// [`Self::protected_skipped`] reaches the endpoint.
+    #[must_use]
+    pub fn apply_failures(&self) -> u64 {
+        self.apply_failures
+    }
+
     fn is_active(&self, target: IpAddr) -> bool {
         self.controller
             .active_blackholes()
@@ -326,7 +345,9 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         wall_now: u64,
     ) {
         if let Err(e) = self.bgp.announce(route).await {
-            tracing::warn!(%target, error = %e, "RTBH: BGP announce failed; not journaling");
+            tracing::warn!(%target, error = %e, "RTBH: BGP announce failed; rolling back active entry, not journaling");
+            self.controller.rollback(target);
+            self.apply_failures = self.apply_failures.saturating_add(1);
             return;
         }
         if let Err(e) = self.journal.record_announce(target, origin, wall_now).await {
@@ -624,6 +645,37 @@ mod tests {
             m.journal().announced.lock().unwrap().is_empty(),
             "a BGP failure must not be journaled"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_announce_does_not_leave_a_phantom_active_entry() {
+        // BGP fails: the router never took the route, so the control plane
+        // must NOT believe it did (C2) — the freshly-inserted active entry
+        // must be rolled back, not left as a phantom "active" mitigation.
+        let mut m = mgr(true, false); // BGP fails
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 1_000, 1_000)
+            .await;
+        assert!(
+            !m.is_active(ip("203.0.113.7")),
+            "a failed announce must not leave a phantom active entry"
+        );
+        assert_eq!(m.apply_failures(), 1);
+
+        // A subsequent identical detection re-attempts (not deduped against
+        // a phantom active entry) — no retry queue, just the natural
+        // re-detection on the next tick.
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 2_000, 2_000)
+            .await;
+        assert_eq!(m.apply_failures(), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_announce_activates_and_journals_no_apply_failures() {
+        let mut m = mgr(false, false);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 1_000, 1_000)
+            .await;
+        assert!(m.is_active(ip("203.0.113.7")));
+        assert_eq!(m.apply_failures(), 0);
     }
 
     #[tokio::test]
