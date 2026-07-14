@@ -55,6 +55,12 @@ pub(crate) struct MetricsSources {
     /// `xdp` block is configured. Copied from the manager once per tick,
     /// mirroring `rtbh_apply_failures`.
     pub xdp_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Per-plane cross-plane new-mitigation rate cap (C6) skip counters
+    /// (`RtbhManager`/`FlowSpecManager::ratecapped`); `None` outside the flow
+    /// daemon (no managers to cap). Populated (all-zero) even when no `rtbh`
+    /// block is configured or `max-new-per-min` is unset (unlimited), mirroring
+    /// `protected_skipped`.
+    pub ratecapped: Option<Arc<crate::shadow::RatecappedMetrics>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -504,6 +510,30 @@ fn protected_skipped_block(sources: &MetricsSources) -> Option<String> {
     Some(out)
 }
 
+/// Render `blackwall_mitigations_ratecapped_total{plane}` (C6 cross-plane
+/// new-mitigation rate cap) from the shared per-plane counters, or `None`
+/// when they aren't wired up (outside the flow daemon) — mirrors
+/// [`protected_skipped_block`].
+fn ratecapped_block(sources: &MetricsSources) -> Option<String> {
+    use std::sync::atomic::Ordering;
+
+    let counters = sources.ratecapped.as_ref()?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_mitigations_ratecapped_total New-mitigation announces skipped because the shared cross-plane rate cap (C6, max-new-per-min) was at capacity, by plane"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_mitigations_ratecapped_total counter");
+    for (plane, counter) in [("rtbh", &counters.rtbh), ("flowspec", &counters.flowspec)] {
+        let _ = writeln!(
+            out,
+            "blackwall_mitigations_ratecapped_total{{plane=\"{plane}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        );
+    }
+    Some(out)
+}
+
 /// Render `blackwall_bgp_unnegotiated_announce_skipped_total{safi}` (C3, C3
 /// follow-up) from the live `BgpHandle`, or `None` when no `rtbh`/`flowspec`
 /// block is configured (no BGP session to report — mirrors `sources.bgp`
@@ -593,6 +623,12 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
                 body.push('\n');
             }
             body.push_str(&protected);
+        }
+        if let Some(ratecapped) = ratecapped_block(sources) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&ratecapped);
         }
         if let Some(unnegotiated) = unnegotiated_announce_skipped_block(sources) {
             if !body.is_empty() {

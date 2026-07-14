@@ -15,10 +15,12 @@
 use crate::controller::BlackholeOrigin;
 use crate::flowspec_controller::{key_of, FlowKey, FlowSpecAction, FlowSpecController};
 use crate::manager::{ApplyOutcome, BgpExecutor, JournalError};
+use crate::rate_limit::ArmingRateLimiter;
 use async_trait::async_trait;
 use blackwall_bgp::FlowSpecRule;
 use blackwall_flow::FlowRule;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
 /// Mirrors FlowSpec rule state into persistent storage.
 ///
@@ -95,6 +97,18 @@ pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     /// Count of announces that failed at the BGP executor, each rolled back
     /// (see [`Self::apply_failures`]).
     apply_failures: u64,
+    /// Cross-plane cap (C6) on the arrival rate of NEW mitigations, shared
+    /// with the sibling `RtbhManager` via the same `Arc<Mutex<_>>` so ONE
+    /// limiter governs the combined RTBH+FlowSpec announce rate. `None` (the
+    /// default from [`Self::new`]) is unlimited — `main.rs` only attaches
+    /// `Some` via [`Self::with_rate_limiter`] on the live path (never under
+    /// shadow, where nothing is really announced).
+    rate_limiter: Option<Arc<Mutex<ArmingRateLimiter>>>,
+    /// Count of announces skipped because [`Self::rate_limiter`] was at
+    /// capacity (C6) — a SKIP (never attempted), distinct from
+    /// [`Self::apply_failures`] (attempted and failed at BGP). See
+    /// [`Self::ratecapped`].
+    ratecapped: u64,
 }
 
 impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
@@ -106,7 +120,22 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             journal,
             pending_mirror: Vec::new(),
             apply_failures: 0,
+            rate_limiter: None,
+            ratecapped: 0,
         }
+    }
+
+    /// Attach a shared cross-plane rate cap (C6) on new mitigations.
+    ///
+    /// Non-breaking: absent (the default from [`Self::new`]) is unlimited.
+    /// `main.rs` wires `Some` only on the live path (`!policy.shadow`) — the
+    /// shadow-mode construction never calls this, so shadow sessions are
+    /// always unlimited (rate-capping a mitigation that is never really
+    /// announced would only corrupt the would-mitigate signal).
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Arc<Mutex<ArmingRateLimiter>>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
     }
 
     /// Install the flow-scoped rules selected for `target` (from a
@@ -132,7 +161,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             .collect();
         let actions = self.controller.install(target, &tuples, mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -143,7 +172,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     pub async fn apply_clear(&mut self, target: IpAddr, mono_now: u64, wall_now: u64) {
         let actions = self.controller.clear_target(target, mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -172,7 +201,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         self.retry_pending_mirror().await;
         let actions = self.controller.tick(mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -194,7 +223,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         let target = rule.dst.addr();
         let actions = self.controller.manual_add(rule.clone(), mono_now);
         if let Some(FlowSpecAction::Announce(r)) = actions.into_iter().next() {
-            self.execute_and_journal_announce(r, BlackholeOrigin::Manual, wall_now)
+            self.execute_and_journal_announce(r, BlackholeOrigin::Manual, mono_now, wall_now)
                 .await;
             return ApplyOutcome::Applied;
         }
@@ -231,10 +260,16 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     }
 
     /// Manually withdraw a rule (bypasses hold-down).
-    pub async fn apply_remove(&mut self, rule: FlowSpecRule, wall_now: u64) {
+    ///
+    /// `mono_now` is accepted for symmetry with the other entry points that
+    /// funnel through [`Self::execute_and_journal`] (it is unused here: a
+    /// manual removal only ever produces a `Withdraw`, never an `Announce`,
+    /// so the shared rate limiter — which only gates `Announce` — is never
+    /// consulted on this path).
+    pub async fn apply_remove(&mut self, rule: FlowSpecRule, mono_now: u64, wall_now: u64) {
         let actions = self.controller.manual_remove(rule);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -295,6 +330,17 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         self.apply_failures
     }
 
+    /// Count of announces skipped because the shared cross-plane
+    /// [`ArmingRateLimiter`] (C6) was at capacity. Each skip rolls back the
+    /// controller's freshly-inserted active entry (never left as a phantom
+    /// active rule) and is distinct from [`Self::apply_failures`] — a
+    /// rate-cap skip was never attempted at all. Surfaced for `/metrics` as
+    /// `blackwall_mitigations_ratecapped_total{plane="flowspec"}`.
+    #[must_use]
+    pub fn ratecapped(&self) -> u64 {
+        self.ratecapped
+    }
+
     fn is_active(&self, key: FlowKey) -> bool {
         self.controller
             .active_rules()
@@ -315,10 +361,10 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     }
 
     /// Execute one controller action on BGP and mirror it into the journal.
-    async fn execute_and_journal(&mut self, action: FlowSpecAction, wall_now: u64) {
+    async fn execute_and_journal(&mut self, action: FlowSpecAction, mono_now: u64, wall_now: u64) {
         match action {
             FlowSpecAction::Announce(rule) => {
-                self.execute_and_journal_announce(rule, BlackholeOrigin::Auto, wall_now)
+                self.execute_and_journal_announce(rule, BlackholeOrigin::Auto, mono_now, wall_now)
                     .await;
             }
             FlowSpecAction::Withdraw(rule) => {
@@ -338,13 +384,35 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         }
     }
 
+    /// Execute one NEW-mitigation `Announce` on BGP and mirror it into the
+    /// journal.
+    ///
+    /// First consults the shared [`ArmingRateLimiter`] (C6), if attached: a
+    /// rejection rolls back the controller's freshly-inserted active entry
+    /// (same "commit-after-confirm" discipline as a BGP failure, see the
+    /// module docs) and counts against [`Self::ratecapped`] — never
+    /// [`Self::apply_failures`], since the announce was never attempted, not
+    /// attempted-and-failed. Only reached for `Announce` actions.
     async fn execute_and_journal_announce(
         &mut self,
         rule: FlowSpecRule,
         origin: BlackholeOrigin,
+        mono_now: u64,
         wall_now: u64,
     ) {
         let key = key_of(&rule);
+        if let Some(limiter) = &self.rate_limiter {
+            let allowed = limiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_acquire(mono_now);
+            if !allowed {
+                tracing::warn!(?key, "FlowSpec: cross-plane new-mitigation rate cap exceeded (C6); skipping announce, not activating");
+                self.controller.rollback(key);
+                self.ratecapped = self.ratecapped.saturating_add(1);
+                return;
+            }
+        }
         if let Err(e) = self.bgp.announce_flowspec(rule.clone()).await {
             tracing::warn!(?key, error = %e, "FlowSpec: BGP announce failed; rolling back active entry, not journaling");
             self.controller.rollback(key);
@@ -739,6 +807,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_capped_announce_is_skipped_not_activated_and_not_an_apply_failure() {
+        // C6: mirrors `manager::tests::rate_capped_announce_is_skipped_...`
+        // for the FlowSpec side of the SAME shared limiter type.
+        let mut m =
+            mgr(false, false).with_rate_limiter(Arc::new(Mutex::new(ArmingRateLimiter::new(1))));
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key1 = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key1), "first announce is admitted");
+
+        m.apply_open(
+            ip("203.0.113.8"),
+            &[flow_rule("203.0.113.8", 17, 53, 0.0)],
+            1_500,
+            1_500,
+        )
+        .await;
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key2),
+            "rate-capped announce must not leave a phantom active entry"
+        );
+        assert_eq!(
+            m.bgp().announced.lock().unwrap().len(),
+            1,
+            "the rate-capped announce must never reach BGP"
+        );
+        assert_eq!(m.ratecapped(), 1);
+        assert_eq!(
+            m.apply_failures(),
+            0,
+            "a rate-cap skip is not an apply_failure (never attempted)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_rate_limiter_attached_is_unlimited() {
+        // Non-breaking: a manager with no limiter attached (the default from
+        // `new`) behaves exactly as before this feature existed.
+        let mut m = mgr(false, false);
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[
+                flow_rule("203.0.113.7", 17, 53, 0.0),
+                flow_rule("203.0.113.7", 6, 80, 0.0),
+            ],
+            0,
+            0,
+        )
+        .await;
+        assert_eq!(
+            m.bgp().announced.lock().unwrap().len(),
+            2,
+            "still bounded by max_rules=2 in cfg(), not by any rate cap"
+        );
+        assert_eq!(m.ratecapped(), 0);
+    }
+
+    #[tokio::test]
     async fn tick_drains_pending_mirror_once_journal_recovers() {
         let mut m = mgr_transient_journal_failures(1);
         m.apply_open(
@@ -789,7 +921,7 @@ mod tests {
             m.journal().announced.lock().unwrap()[0].1,
             BlackholeOrigin::Manual
         );
-        m.apply_remove(r, 1000).await;
+        m.apply_remove(r, 1000, 1000).await;
         assert!(m.active().is_empty());
         assert_eq!(m.journal().withdrawn.lock().unwrap().len(), 1);
     }
@@ -914,7 +1046,7 @@ mod tests {
             1000,
         )
         .await;
-        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000)
+        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000, 2000)
             .await;
         m.apply_open(
             ip("203.0.113.7"),
@@ -942,7 +1074,7 @@ mod tests {
         .await;
         assert_eq!(m.pending_mirror_len(), 1);
 
-        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000)
+        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000, 2000)
             .await;
         assert_eq!(
             m.pending_mirror_len(),

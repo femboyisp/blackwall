@@ -227,6 +227,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             | "md5"
                             | "gtsm-hops"
                             | "local-addr"
+                            | "max-new-per-min"
                     ) {
                         return Err(ConfigError::BadValue {
                             line: line.number,
@@ -326,6 +327,16 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     }
                     None => None,
                 };
+                // C6: cross-plane rate cap on new mitigations. Absent =>
+                // `None` => unlimited (today's behavior, non-breaking).
+                // `0` is accepted (rejects every new announce) rather than
+                // treated as "unset" — an operator may deliberately want to
+                // freeze new arming while still allowing existing
+                // blackholes/rules and withdraws to proceed.
+                let max_new_per_min: Option<u32> = match kv.get("max-new-per-min") {
+                    Some(v) => Some(v.parse().map_err(|_| bad("rtbh max-new-per-min", v))?),
+                    None => None,
+                };
                 rtbh = Some(RtbhPolicy {
                     local_asn,
                     peer_asn,
@@ -345,6 +356,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         .get("local-addr")
                         .map(|v| v.parse().map_err(|_| bad("local-addr", v)))
                         .transpose()?,
+                    max_new_per_min,
                 });
             }
             "flowspec" => {
@@ -1637,6 +1649,34 @@ tenant t {
             "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s\n",
         ).unwrap();
         assert_eq!(p.rtbh.unwrap().local_addr, None);
+    }
+
+    #[test]
+    fn rtbh_max_new_per_min_defaults_none_unlimited() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s\n",
+        ).unwrap();
+        assert_eq!(
+            p.rtbh.unwrap().max_new_per_min,
+            None,
+            "absent max-new-per-min must be unlimited (non-breaking)"
+        );
+    }
+
+    #[test]
+    fn rtbh_parses_max_new_per_min() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s max-new-per-min=30\n",
+        ).unwrap();
+        assert_eq!(p.rtbh.unwrap().max_new_per_min, Some(30));
+    }
+
+    #[test]
+    fn rtbh_rejects_bad_max_new_per_min() {
+        let err = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s max-new-per-min=notanumber\n",
+        );
+        assert!(err.is_err());
     }
 
     #[test]

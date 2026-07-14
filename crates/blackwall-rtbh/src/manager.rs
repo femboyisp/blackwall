@@ -6,11 +6,13 @@
 //! traits so `blackwall-rtbh` stays free of any DB dependency.
 
 use crate::controller::{BlackholeOrigin, RtbhAction, RtbhController};
+use crate::rate_limit::ArmingRateLimiter;
 use async_trait::async_trait;
 use blackwall_bgp::Route;
 use blackwall_flow::DetectionEvent;
 use ipnet::IpNet;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
 /// Executes BGP announce/withdraw commands.
 ///
@@ -100,6 +102,18 @@ pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     /// Count of announces that failed at the BGP executor, each rolled back
     /// (see [`Self::apply_failures`]).
     apply_failures: u64,
+    /// Cross-plane cap (C6) on the arrival rate of NEW mitigations, shared
+    /// with the sibling `FlowSpecManager` via the same `Arc<Mutex<_>>` so ONE
+    /// limiter governs the combined RTBH+FlowSpec announce rate. `None` (the
+    /// default from [`Self::new`]) is unlimited — [`main`](../../bin/blackwalld)
+    /// only attaches `Some` via [`Self::with_rate_limiter`] on the live path
+    /// (never under shadow, where nothing is really announced).
+    rate_limiter: Option<Arc<Mutex<ArmingRateLimiter>>>,
+    /// Count of announces skipped because [`Self::rate_limiter`] was at
+    /// capacity (C6) — a SKIP (never attempted), distinct from
+    /// [`Self::apply_failures`] (attempted and failed at BGP). See
+    /// [`Self::ratecapped`].
+    ratecapped: u64,
 }
 
 /// A journal mirror write that failed and is queued for a self-heal retry.
@@ -136,7 +150,22 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
             journal,
             pending_mirror: Vec::new(),
             apply_failures: 0,
+            rate_limiter: None,
+            ratecapped: 0,
         }
+    }
+
+    /// Attach a shared cross-plane rate cap (C6) on new mitigations.
+    ///
+    /// Non-breaking: absent (the default from [`Self::new`]) is unlimited.
+    /// `main.rs` wires `Some` only on the live path (`!policy.shadow`) — the
+    /// shadow-mode construction never calls this, so shadow sessions are
+    /// always unlimited (rate-capping a mitigation that is never really
+    /// announced would only corrupt the would-mitigate signal).
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Arc<Mutex<ArmingRateLimiter>>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
     }
 
     /// Feed one detection event through the controller and execute + journal
@@ -151,7 +180,7 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     pub async fn apply_event(&mut self, event: &DetectionEvent, mono_now: u64, wall_now: u64) {
         let actions = self.controller.on_event(event, mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -166,7 +195,7 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         self.retry_pending_mirror().await;
         let actions = self.controller.tick(mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -185,8 +214,14 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     ) -> ApplyOutcome {
         let actions = self.controller.manual_add(target, mono_now);
         if let Some(RtbhAction::Announce(route)) = actions.into_iter().next() {
-            self.execute_and_journal_announce(target, route, BlackholeOrigin::Manual, wall_now)
-                .await;
+            self.execute_and_journal_announce(
+                target,
+                route,
+                BlackholeOrigin::Manual,
+                mono_now,
+                wall_now,
+            )
+            .await;
             return ApplyOutcome::Applied;
         }
         // Empty result: either already active (upgrade), at cap, or rejected.
@@ -226,10 +261,16 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     }
 
     /// Manually withdraw a target (bypasses hold-down).
-    pub async fn apply_remove(&mut self, target: IpAddr, wall_now: u64) {
+    ///
+    /// `mono_now` is accepted for symmetry with the other entry points that
+    /// funnel through [`Self::execute_and_journal`] (it is unused here: a
+    /// manual removal only ever produces a `Withdraw`, never an `Announce`,
+    /// so the shared rate limiter — which only gates `Announce` — is never
+    /// consulted on this path).
+    pub async fn apply_remove(&mut self, target: IpAddr, mono_now: u64, wall_now: u64) {
         let actions = self.controller.manual_remove(target);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -289,6 +330,17 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         self.apply_failures
     }
 
+    /// Count of announces skipped because the shared cross-plane
+    /// [`ArmingRateLimiter`] (C6) was at capacity. Each skip rolls back the
+    /// controller's freshly-inserted active entry (never left as a phantom
+    /// active mitigation) and is distinct from [`Self::apply_failures`] — a
+    /// rate-cap skip was never attempted at all. Surfaced for `/metrics` as
+    /// `blackwall_mitigations_ratecapped_total{plane="rtbh"}`.
+    #[must_use]
+    pub fn ratecapped(&self) -> u64 {
+        self.ratecapped
+    }
+
     fn is_active(&self, target: IpAddr) -> bool {
         self.controller
             .active_blackholes()
@@ -309,13 +361,14 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     }
 
     /// Execute one controller action on BGP and mirror it into the journal.
-    async fn execute_and_journal(&mut self, action: RtbhAction, wall_now: u64) {
+    async fn execute_and_journal(&mut self, action: RtbhAction, mono_now: u64, wall_now: u64) {
         match action {
             RtbhAction::Announce(route) => {
                 self.execute_and_journal_announce(
                     ip_of(&route.prefix),
                     route,
                     BlackholeOrigin::Auto,
+                    mono_now,
                     wall_now,
                 )
                 .await;
@@ -337,13 +390,37 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         }
     }
 
+    /// Execute one NEW-mitigation `Announce` on BGP and mirror it into the
+    /// journal.
+    ///
+    /// First consults the shared [`ArmingRateLimiter`] (C6), if attached: a
+    /// rejection rolls back the controller's freshly-inserted active entry
+    /// (same "commit-after-confirm" discipline as a BGP failure, see the
+    /// module docs) and counts against [`Self::ratecapped`] — never
+    /// [`Self::apply_failures`], since the announce was never attempted, not
+    /// attempted-and-failed. Only reached for `Announce` actions (never a
+    /// `Withdraw` or a controller re-assertion/refresh, which don't produce
+    /// `Announce` at all).
     async fn execute_and_journal_announce(
         &mut self,
         target: IpAddr,
         route: Route,
         origin: BlackholeOrigin,
+        mono_now: u64,
         wall_now: u64,
     ) {
+        if let Some(limiter) = &self.rate_limiter {
+            let allowed = limiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_acquire(mono_now);
+            if !allowed {
+                tracing::warn!(%target, "RTBH: cross-plane new-mitigation rate cap exceeded (C6); skipping announce, not activating");
+                self.controller.rollback(target);
+                self.ratecapped = self.ratecapped.saturating_add(1);
+                return;
+            }
+        }
         if let Err(e) = self.bgp.announce(route).await {
             tracing::warn!(%target, error = %e, "RTBH: BGP announce failed; rolling back active entry, not journaling");
             self.controller.rollback(target);
@@ -679,6 +756,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_capped_announce_is_skipped_not_activated_and_not_an_apply_failure() {
+        // C6: a shared limiter admitting only 1 announce per minute. The
+        // second Opened in the same window must be SKIPPED (never reach
+        // BGP), rolled back so it is not left as a phantom active entry, and
+        // counted as `ratecapped` — NOT `apply_failures` (it was never
+        // attempted, unlike a BGP failure).
+        let mut m =
+            mgr(false, false).with_rate_limiter(Arc::new(Mutex::new(ArmingRateLimiter::new(1))));
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 1_000, 1_000)
+            .await;
+        assert!(m.is_active(ip("203.0.113.7")), "first announce is admitted");
+
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.8")), 1_500, 1_500)
+            .await;
+        assert!(
+            !m.is_active(ip("203.0.113.8")),
+            "rate-capped announce must not leave a phantom active entry"
+        );
+        assert!(
+            m.bgp().announced.lock().unwrap().len() == 1,
+            "the rate-capped announce must never reach BGP"
+        );
+        assert_eq!(m.ratecapped(), 1);
+        assert_eq!(
+            m.apply_failures(),
+            0,
+            "a rate-cap skip is not an apply_failure (never attempted)"
+        );
+
+        // Once the window rolls, the target is admitted normally.
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.8")), 61_500, 61_500)
+            .await;
+        assert!(m.is_active(ip("203.0.113.8")));
+        assert_eq!(m.ratecapped(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_rate_limiter_attached_is_unlimited() {
+        // Non-breaking: a manager with no limiter attached (the default from
+        // `new`) behaves exactly as before this feature existed.
+        let mut m = mgr(false, false);
+        for i in 0..10u8 {
+            let target = format!("203.0.113.{}", i + 1);
+            m.apply_add(target.parse().unwrap(), u64::from(i), u64::from(i))
+                .await;
+        }
+        assert_eq!(
+            m.bgp().announced.lock().unwrap().len(),
+            2,
+            "still bounded by max_blackholes=2 in cfg(), not by any rate cap"
+        );
+        assert_eq!(m.ratecapped(), 0);
+    }
+
+    #[tokio::test]
     async fn apply_add_rejects_ineligible_and_defers_at_cap() {
         let mut m = mgr(false, false);
         assert!(matches!(
@@ -751,7 +883,7 @@ mod tests {
     async fn apply_remove_withdraws_and_journals() {
         let mut m = mgr(false, false);
         m.apply_add(ip("203.0.113.7"), 0, 0).await;
-        m.apply_remove(ip("203.0.113.7"), 1000).await;
+        m.apply_remove(ip("203.0.113.7"), 1000, 1000).await;
         assert!(m.active().is_empty());
         assert_eq!(m.journal().withdrawn.lock().unwrap().len(), 1);
     }
@@ -864,7 +996,7 @@ mod tests {
             .await;
         assert_eq!(m.pending_mirror_len(), 1);
 
-        m.apply_remove(ip("203.0.113.7"), 2000).await;
+        m.apply_remove(ip("203.0.113.7"), 2000, 2000).await;
         assert_eq!(
             m.pending_mirror_len(),
             1,
@@ -887,7 +1019,7 @@ mod tests {
         let mut m = mgr(false, true); // BGP ok, journal always fails
         m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 1000)
             .await;
-        m.apply_remove(ip("203.0.113.7"), 2000).await;
+        m.apply_remove(ip("203.0.113.7"), 2000, 2000).await;
         m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 3000, 3000)
             .await;
         assert_eq!(

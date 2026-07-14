@@ -799,6 +799,7 @@ async fn rtbh_manager_task<B, J>(
     request_store: std::sync::Arc<blackwall_state::Store>,
     protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
     apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
+    ratecapped_metrics: Arc<shadow::RatecappedMetrics>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
     J: blackwall_rtbh::manager::BlackholeJournal + Send + 'static,
@@ -826,6 +827,10 @@ async fn rtbh_manager_task<B, J>(
                 );
                 apply_failure_metrics.store(
                     manager.apply_failures(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ratecapped_metrics.rtbh.store(
+                    manager.ratecapped(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -882,7 +887,9 @@ async fn apply_request<B, J>(
             }
         },
         "remove" => {
-            manager.apply_remove(req.target, wall_now()).await;
+            manager
+                .apply_remove(req.target, mono_now(), wall_now())
+                .await;
             // Cancel any other still-pending add for the same target: the
             // operator's remove is the newer intent, so a pending add must
             // not later announce this target once capacity frees.
@@ -924,6 +931,7 @@ async fn flowspec_manager_task<B, J>(
     request_store: std::sync::Arc<blackwall_state::Store>,
     protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
     apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
+    ratecapped_metrics: Arc<shadow::RatecappedMetrics>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
     J: blackwall_rtbh::flowspec_manager::FlowSpecJournal + Send + 'static,
@@ -959,6 +967,10 @@ async fn flowspec_manager_task<B, J>(
                 );
                 apply_failure_metrics.store(
                     manager.apply_failures(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ratecapped_metrics.flowspec.store(
+                    manager.ratecapped(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -1021,7 +1033,7 @@ async fn apply_flowspec_request<B, J>(
             }
         },
         "remove" => {
-            manager.apply_remove(rule, wall_now()).await;
+            manager.apply_remove(rule, mono_now(), wall_now()).await;
             // The operator's remove is the newer intent: cancel any earlier
             // still-pending add for the same flow key.
             if let Err(err) = request_store
@@ -1474,6 +1486,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // block is configured.
             let xdp_apply_failure_metrics =
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // C6 cross-plane new-mitigation rate cap skip counters: copied
+            // from `RtbhManager`/`FlowSpecManager::ratecapped` on every tick,
+            // mirroring `protected_skipped_metrics` above. Built
+            // unconditionally — harmless all-zero counters when no `rtbh`
+            // block is configured or `max-new-per-min` is unset.
+            let ratecapped_metrics = std::sync::Arc::new(shadow::RatecappedMetrics::default());
 
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
             {
@@ -1486,6 +1504,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
                     let channel_cap = rtbh.max_blackholes.max(1024);
                     let (tx, rx) = mpsc::channel::<blackwall_flow::DetectionEvent>(channel_cap);
+
+                    // C6 cross-plane rate cap on new mitigations: ONE limiter
+                    // built from the rtbh block's `max-new-per-min` knob,
+                    // shared between RTBH and FlowSpec below (FlowSpec reuses
+                    // this block). Only wired on the live path (`!policy.shadow`)
+                    // — under shadow nothing is really announced, so
+                    // rate-capping would only corrupt the would-mitigate
+                    // signal; `None` here (either shadow, or the knob absent)
+                    // means neither manager ever gets `.with_rate_limiter`
+                    // called, so both stay unlimited (non-breaking default).
+                    let rate_limiter: Option<
+                        std::sync::Arc<std::sync::Mutex<blackwall_rtbh::ArmingRateLimiter>>,
+                    > = if policy.shadow {
+                        None
+                    } else {
+                        rtbh.max_new_per_min.map(|n| {
+                            std::sync::Arc::new(std::sync::Mutex::new(
+                                blackwall_rtbh::ArmingRateLimiter::new(n),
+                            ))
+                        })
+                    };
 
                     // The live BGP handle, threaded to the FlowSpec
                     // construction below so its live branch reuses this same
@@ -1510,6 +1549,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             store.clone(),
                             protected_skipped_metrics.clone(),
                             rtbh_apply_failure_metrics.clone(),
+                            ratecapped_metrics.clone(),
                         ));
                         None
                     } else {
@@ -1535,6 +1575,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let journal: blackwall_state::Store = (*store).clone();
                         let mut manager =
                             blackwall_rtbh::RtbhManager::new(controller, bgp.clone(), journal);
+                        if let Some(limiter) = &rate_limiter {
+                            manager = manager.with_rate_limiter(limiter.clone());
+                        }
 
                         // Rehydrate the controller from the announced mirror
                         // before this session starts accepting new
@@ -1559,6 +1602,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             store.clone(),
                             protected_skipped_metrics.clone(),
                             rtbh_apply_failure_metrics.clone(),
+                            ratecapped_metrics.clone(),
                         ));
                         Some(bgp)
                     };
@@ -1608,6 +1652,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         store.clone(),
                                         protected_skipped_metrics.clone(),
                                         flowspec_apply_failure_metrics.clone(),
+                                        ratecapped_metrics.clone(),
                                     ));
                                 }
                                 Some(bgp) => {
@@ -1617,6 +1662,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         bgp,
                                         fs_journal,
                                     );
+                                    // FlowSpec reuses the rtbh block's
+                                    // `max-new-per-min` knob: the SAME shared
+                                    // limiter as the RTBH manager above, so
+                                    // ONE cap governs the combined
+                                    // cross-plane announce rate (C6).
+                                    if let Some(limiter) = &rate_limiter {
+                                        fs_manager = fs_manager.with_rate_limiter(limiter.clone());
+                                    }
 
                                     // Rehydrate FlowSpec rules from the announced mirror.
                                     let fs_mirror = store.list_active_flowspec().await?;
@@ -1650,6 +1703,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         store.clone(),
                                         protected_skipped_metrics.clone(),
                                         flowspec_apply_failure_metrics.clone(),
+                                        ratecapped_metrics.clone(),
                                     ));
                                 }
                             }
@@ -1893,6 +1947,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     agent_stats: Some(agent_snapshot.clone()),
                     shadow: Some(shadow_metrics.clone()),
                     protected_skipped: Some(protected_skipped_metrics.clone()),
+                    ratecapped: Some(ratecapped_metrics.clone()),
                     rtbh_apply_failures: Some(rtbh_apply_failure_metrics.clone()),
                     flowspec_apply_failures: Some(flowspec_apply_failure_metrics.clone()),
                     xdp_apply_failures: Some(xdp_apply_failure_metrics.clone()),
@@ -2150,6 +2205,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     agent_stats: None,
                     shadow: None,
                     protected_skipped: None,
+                    ratecapped: None,
                     rtbh_apply_failures: None,
                     flowspec_apply_failures: None,
                     xdp_apply_failures: None,
