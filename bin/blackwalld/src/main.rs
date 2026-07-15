@@ -831,20 +831,34 @@ async fn bgp_supervisor(mut states: tokio::sync::watch::Receiver<blackwall_bgp::
     }
 }
 
+/// The `/metrics` gauges/counters one `*_manager_task` copies its manager's
+/// per-tick snapshot into, bundled into a single argument so
+/// `rtbh_manager_task`/`flowspec_manager_task`/`xdp_manager_task` each take
+/// one metrics parameter instead of threading the same handful of `Arc`s
+/// individually (prep refactor for #194 C1 — pure plumbing, no behavior
+/// change).
+#[derive(Clone)]
+struct PlaneMetrics {
+    /// Anycast self-protection (C1) skip counter, shared across all three
+    /// planes — this task writes only its own field (see
+    /// [`shadow::ProtectedSkippedMetrics`]'s per-plane fields).
+    protected: Arc<shadow::ProtectedSkippedMetrics>,
+    /// This plane's dedicated apply-failure counter (C2).
+    apply_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared cross-plane rate-cap (C6) skip counters; `None` for XDP, which
+    /// has no shared rate limiter to report against.
+    ratecapped: Option<Arc<shadow::RatecappedMetrics>>,
+    /// This plane's dedicated reapply-pending gauge (issue #194 C1).
+    reapply_pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Runs until `rx` is closed (i.e. for the process's lifetime, since the
 /// paired `ChannelSink`'s sender is held by the running collector).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one Arc per /metrics gauge/counter this task feeds (mirrors the sibling flowspec/xdp reconcile tasks); bundling into a struct would only relocate the coupling, not reduce it"
-)]
 async fn rtbh_manager_task<B, J>(
     mut manager: blackwall_rtbh::RtbhManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
-    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
-    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
-    ratecapped_metrics: Arc<shadow::RatecappedMetrics>,
-    reapply_pending_metrics: Arc<std::sync::atomic::AtomicUsize>,
+    metrics: PlaneMetrics,
     mut disarm_rx: tokio::sync::broadcast::Receiver<()>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
@@ -889,19 +903,20 @@ async fn rtbh_manager_task<B, J>(
                 // elapses is deferred and never completed.
                 manager.tick(mono_now(), wall_now()).await;
 
-                protected_metrics.rtbh.store(
+                metrics.protected.rtbh.store(
                     manager.protected_skipped(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                apply_failure_metrics.store(
+                metrics.apply_failures.store(
                     manager.apply_failures(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                ratecapped_metrics.rtbh.store(
-                    manager.ratecapped(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                reapply_pending_metrics.store(
+                if let Some(ratecapped) = &metrics.ratecapped {
+                    ratecapped
+                        .rtbh
+                        .store(manager.ratecapped(), std::sync::atomic::Ordering::Relaxed);
+                }
+                metrics.reapply_pending.store(
                     manager.reapply_pending(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
@@ -1001,9 +1016,7 @@ async fn flowspec_manager_task<B, J>(
     mut manager: blackwall_rtbh::FlowSpecManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::FlowMitigationEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
-    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
-    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
-    ratecapped_metrics: Arc<shadow::RatecappedMetrics>,
+    metrics: PlaneMetrics,
     mut disarm_rx: tokio::sync::broadcast::Receiver<()>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
@@ -1049,16 +1062,22 @@ async fn flowspec_manager_task<B, J>(
                 // Mandatory: completes deferred clears / TTL expiry.
                 manager.tick(mono_now(), wall_now()).await;
 
-                protected_metrics.flowspec.store(
+                metrics.protected.flowspec.store(
                     manager.protected_skipped(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                apply_failure_metrics.store(
+                metrics.apply_failures.store(
                     manager.apply_failures(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                ratecapped_metrics.flowspec.store(
-                    manager.ratecapped(),
+                if let Some(ratecapped) = &metrics.ratecapped {
+                    ratecapped.flowspec.store(
+                        manager.ratecapped(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                metrics.reapply_pending.store(
+                    manager.reapply_pending(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -1219,8 +1238,7 @@ async fn xdp_manager_task<J>(
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
     auto_enabled: bool,
-    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
-    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
+    metrics: PlaneMetrics,
     mut disarm_rx: tokio::sync::broadcast::Receiver<()>,
 ) where
     J: blackwall_xdp::XdpJournal + 'static,
@@ -1260,12 +1278,16 @@ async fn xdp_manager_task<J>(
                 // Drains any journal mirror-writes queued by a transient DB blip.
                 manager.tick().await;
 
-                protected_metrics.xdp.store(
+                metrics.protected.xdp.store(
                     manager.protected_skipped(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                apply_failure_metrics.store(
+                metrics.apply_failures.store(
                     manager.apply_failures(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                metrics.reapply_pending.store(
+                    manager.reapply_pending(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -1603,6 +1625,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // harmless all-zero gauge when no `rtbh` block is configured.
             let rtbh_reapply_pending_metrics =
                 std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // `rehydrate` re-announces queued for a self-heal retry after a
+            // failed BGP announce on restart (issue #194): copied from
+            // `FlowSpecManager::reapply_pending` on every tick, mirroring
+            // `rtbh_reapply_pending_metrics` above. Built unconditionally —
+            // harmless all-zero gauge when no `flowspec` block is configured.
+            let flowspec_reapply_pending_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // `reapply_active` re-applies queued for a self-heal retry after
+            // a failed executor apply on restart (issue #194): copied from
+            // `blackwall_xdp::manager::XdpManager::reapply_pending` on every
+            // tick, mirroring `rtbh_reapply_pending_metrics` above. Built
+            // unconditionally — harmless all-zero gauge when no `xdp` block
+            // is configured.
+            let xdp_reapply_pending_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Bundled per-plane `/metrics` argument for the three
+            // `*_manager_task`s (prep refactor for #194 C1 — see
+            // `PlaneMetrics`'s doc comment). XDP has no shared rate limiter,
+            // so its `ratecapped` is `None`.
+            let rtbh_plane_metrics = PlaneMetrics {
+                protected: protected_skipped_metrics.clone(),
+                apply_failures: rtbh_apply_failure_metrics.clone(),
+                ratecapped: Some(ratecapped_metrics.clone()),
+                reapply_pending: rtbh_reapply_pending_metrics.clone(),
+            };
+            let flowspec_plane_metrics = PlaneMetrics {
+                protected: protected_skipped_metrics.clone(),
+                apply_failures: flowspec_apply_failure_metrics.clone(),
+                ratecapped: Some(ratecapped_metrics.clone()),
+                reapply_pending: flowspec_reapply_pending_metrics.clone(),
+            };
+            let xdp_plane_metrics = PlaneMetrics {
+                protected: protected_skipped_metrics.clone(),
+                apply_failures: xdp_apply_failure_metrics.clone(),
+                ratecapped: None,
+                reapply_pending: xdp_reapply_pending_metrics.clone(),
+            };
             // In-daemon disarm kill switch (C5): `blackwall_armed` starts at
             // 1 (live) or 0 (shadow) and is flipped to 0 exactly once, on a
             // SIGUSR1 disarm — there is no path back to 1 short of a
@@ -1669,10 +1728,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             manager,
                             rx,
                             store.clone(),
-                            protected_skipped_metrics.clone(),
-                            rtbh_apply_failure_metrics.clone(),
-                            ratecapped_metrics.clone(),
-                            rtbh_reapply_pending_metrics.clone(),
+                            rtbh_plane_metrics.clone(),
                             disarm_tx.subscribe(),
                         ));
                         None
@@ -1724,10 +1780,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             manager,
                             rx,
                             store.clone(),
-                            protected_skipped_metrics.clone(),
-                            rtbh_apply_failure_metrics.clone(),
-                            ratecapped_metrics.clone(),
-                            rtbh_reapply_pending_metrics.clone(),
+                            rtbh_plane_metrics.clone(),
                             disarm_tx.subscribe(),
                         ));
                         Some(bgp)
@@ -1776,9 +1829,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_manager,
                                         fs_rx,
                                         store.clone(),
-                                        protected_skipped_metrics.clone(),
-                                        flowspec_apply_failure_metrics.clone(),
-                                        ratecapped_metrics.clone(),
+                                        flowspec_plane_metrics.clone(),
                                         disarm_tx.subscribe(),
                                     ));
                                 }
@@ -1828,9 +1879,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_manager,
                                         fs_rx,
                                         store.clone(),
-                                        protected_skipped_metrics.clone(),
-                                        flowspec_apply_failure_metrics.clone(),
-                                        ratecapped_metrics.clone(),
+                                        flowspec_plane_metrics.clone(),
                                         disarm_tx.subscribe(),
                                     ));
                                 }
@@ -2020,8 +2069,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 xdp_rx,
                                 store.clone(),
                                 auto_enabled,
-                                protected_skipped_metrics.clone(),
-                                xdp_apply_failure_metrics.clone(),
+                                xdp_plane_metrics.clone(),
                                 disarm_tx.subscribe(),
                             ))
                         } else {
@@ -2047,8 +2095,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 xdp_rx,
                                 store.clone(),
                                 auto_enabled,
-                                protected_skipped_metrics.clone(),
-                                xdp_apply_failure_metrics.clone(),
+                                xdp_plane_metrics.clone(),
                                 disarm_tx.subscribe(),
                             ))
                         };
@@ -2087,6 +2134,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     flowspec_apply_failures: Some(flowspec_apply_failure_metrics.clone()),
                     xdp_apply_failures: Some(xdp_apply_failure_metrics.clone()),
                     rtbh_reapply_pending: Some(rtbh_reapply_pending_metrics.clone()),
+                    flowspec_reapply_pending: Some(flowspec_reapply_pending_metrics.clone()),
+                    xdp_reapply_pending: Some(xdp_reapply_pending_metrics.clone()),
                     armed: Some(blackwall_armed.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
@@ -2347,6 +2396,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     flowspec_apply_failures: None,
                     xdp_apply_failures: None,
                     rtbh_reapply_pending: None,
+                    flowspec_reapply_pending: None,
+                    xdp_reapply_pending: None,
                     armed: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));

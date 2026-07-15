@@ -61,6 +61,18 @@ pub(crate) struct MetricsSources {
     /// configured. Copied from the manager once per tick, mirroring how
     /// `rtbh_apply_failures` reaches this endpoint.
     pub rtbh_reapply_pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// `rehydrate` re-announces currently queued for a self-heal retry after
+    /// a failed BGP announce on restart (issue #194,
+    /// `FlowSpecManager::reapply_pending`); `None` when no `flowspec` block
+    /// is configured. Copied from the manager once per tick, mirroring
+    /// `rtbh_reapply_pending`.
+    pub flowspec_reapply_pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// `reapply_active` re-applies currently queued for a self-heal retry
+    /// after a failed executor apply on restart (issue #194,
+    /// `blackwall_xdp::manager::XdpManager::reapply_pending`); `None` when no
+    /// `xdp` block is configured. Copied from the manager once per tick,
+    /// mirroring `rtbh_reapply_pending`.
+    pub xdp_reapply_pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Per-plane cross-plane new-mitigation rate cap (C6) skip counters
     /// (`RtbhManager`/`FlowSpecManager::ratecapped`); `None` outside the flow
     /// daemon (no managers to cap). Populated (all-zero) even when no `rtbh`
@@ -183,6 +195,24 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             help: "RTBH rehydrate re-announces queued for a self-heal retry after a failed BGP announce on restart (#194)",
             kind: MetricKind::Gauge,
             value: count_to_f64(rtbh_reapply_pending.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(flowspec_reapply_pending) = &sources.flowspec_reapply_pending {
+        m.push(Metric {
+            name: "blackwall_flowspec_reapply_pending",
+            help: "FlowSpec rehydrate re-announces queued for a self-heal retry after a failed BGP announce on restart (#194)",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(
+                flowspec_reapply_pending.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        });
+    }
+    if let Some(xdp_reapply_pending) = &sources.xdp_reapply_pending {
+        m.push(Metric {
+            name: "blackwall_xdp_reapply_pending",
+            help: "XDP reapply_active re-applies queued for a self-heal retry after a failed executor apply on restart (#194)",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(xdp_reapply_pending.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
     if let Some(armed) = &sources.armed {
