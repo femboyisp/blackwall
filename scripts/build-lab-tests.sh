@@ -33,6 +33,14 @@ pairs=(
 if grep -rqs flowspec_auto_interop crates/blackwall-rtbh/tests/ 2>/dev/null; then
   pairs+=("blackwall-rtbh flowspec_auto_interop")
 fi
+# M1 armed-mode gate drivers (protected skip/rate re-announce C1+C4, and
+# SIGUSR1 disarm C5) ship in blackwall-rtbh too; same before/after guard.
+if grep -rqs armed_protect_reannounce_interop crates/blackwall-rtbh/tests/ 2>/dev/null; then
+  pairs+=("blackwall-rtbh armed_protect_reannounce_interop")
+fi
+if grep -rqs armed_disarm_interop crates/blackwall-rtbh/tests/ 2>/dev/null; then
+  pairs+=("blackwall-rtbh armed_disarm_interop")
+fi
 
 mkdir -p target/debug/lab-tests
 for pair in "${pairs[@]}"; do
