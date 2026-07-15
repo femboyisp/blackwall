@@ -15,7 +15,12 @@
 //! This crate has no I/O of its own; that is a design invariant, not an
 //! implementation detail — keep it that way.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
+
+mod fetch;
+pub use fetch::{build_client, check_once, fetch_validity, FetchError};
 
 /// The RPKI validity state of a single announced prefix, as classified from
 /// a Routinator `/api/v1/validity` response.
@@ -113,6 +118,111 @@ pub fn validity_url(base: &str, asn: u32, ms: &ipnet::IpNet) -> String {
     format!("{base}/api/v1/validity/AS{asn}/{ms}")
 }
 
+/// The aggregate result of one [`fetch::check_once`] pass over a set of
+/// RTBH-eligible prefixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpkiReport {
+    /// Whether the validator itself was reachable during this pass. See
+    /// [`aggregate_report`] for exactly how this is derived from the
+    /// per-prefix fetch outcomes.
+    pub validator_up: bool,
+    /// The classified state of each checked prefix (already reduced to its
+    /// host more-specific — see [`host_more_specific`]). Only prefixes whose
+    /// fetch+classify succeeded are present; a prefix whose check failed is
+    /// omitted (its state is unknown, not assumed valid or invalid).
+    pub per_prefix: Vec<(ipnet::IpNet, RpkiState)>,
+}
+
+/// Aggregate the raw fetch+classify outcome of each checked prefix into an
+/// [`RpkiReport`].
+///
+/// This is deliberately the *pure* half of [`fetch::check_once`] — the I/O
+/// (the actual HTTP fetch) lives in the coverage-excluded `fetch` module;
+/// this function only reasons about the `Result`s that I/O already produced,
+/// so it is unit-tested directly.
+///
+/// **Validator-reachability rule** (documented here, not just in code, since
+/// it's a judgment call): `validator_up` is `true` only if the check found at
+/// least one prefix to test AND the *first* prefix's fetch succeeded at the
+/// transport/parse level. A validator that answers the first request is
+/// assumed reachable for the rest of the pass — this avoids flapping
+/// `validator_up` on a single flaky prefix lookup while still catching the
+/// common "validator down" case (every fetch fails, so the first one does
+/// too). An empty prefix set has nothing to disprove reachability, so it
+/// reports `validator_up: true` (nothing to fail open on). A per-prefix
+/// fetch error (regardless of position) always means that prefix's state is
+/// unknown, so it's dropped from `per_prefix` rather than guessed at.
+pub fn aggregate_report<E>(results: Vec<(ipnet::IpNet, Result<RpkiState, E>)>) -> RpkiReport {
+    let validator_up = results.first().is_none_or(|(_, r)| r.is_ok());
+    let per_prefix = results
+        .into_iter()
+        .filter_map(|(net, r)| r.ok().map(|state| (net, state)))
+        .collect();
+    RpkiReport {
+        validator_up,
+        per_prefix,
+    }
+}
+
+/// Tracks previously-observed RPKI validator reachability and per-prefix
+/// validity state so the periodic checker (in `blackwalld`) can WARN only on
+/// a state **transition**, never on a steady-state repeat — a standing RPKI
+/// gap (e.g. a ROA with a short `maxLength`) must not spam the log every
+/// `rpki-check-interval` forever.
+///
+/// This is the pure, unit-tested dedup core; the periodic tokio task that
+/// drives it lives in `blackwalld` (coverage-excluded I/O glue).
+#[derive(Debug, Clone)]
+pub struct RpkiWarnState {
+    validator_up: bool,
+    prefixes: HashMap<ipnet::IpNet, RpkiState>,
+}
+
+impl Default for RpkiWarnState {
+    /// Starts assuming the validator is reachable (`true`) and with no prior
+    /// per-prefix observations — so the very first down/invalid observation
+    /// after startup is treated as a transition and warns, rather than being
+    /// silently absorbed as "no change from an unknown baseline".
+    fn default() -> Self {
+        Self {
+            validator_up: true,
+            prefixes: HashMap::new(),
+        }
+    }
+}
+
+impl RpkiWarnState {
+    /// Record the validator's reachability observed on this check pass.
+    ///
+    /// Returns `true` only on an up→down transition — "you should WARN
+    /// now". A down→down repeat and an up→up repeat both return `false` (no
+    /// change worth logging again); a down→up recovery also returns `false`,
+    /// but the transition is still recorded — the caller should log that
+    /// case as an INFO, not a WARN.
+    pub fn observe_validator_up(&mut self, up: bool) -> bool {
+        let should_warn = self.validator_up && !up;
+        self.validator_up = up;
+        should_warn
+    }
+
+    /// Record the validity state observed for `net` on this check pass.
+    ///
+    /// Returns `true` — "you should WARN now" — when `state` is
+    /// [`RpkiState::Invalid`] or [`RpkiState::NotFound`] (a state that would
+    /// cause a validating upstream to drop the blackhole announcement) **and**
+    /// it is either the first observation of `net` or different from the
+    /// previously observed state for `net`. A repeat of the same bad state
+    /// returns `false` (already warned, don't spam). A transition to
+    /// [`RpkiState::Valid`] — a recovery — always returns `false`: it is
+    /// still recorded (so a later regression is detected as a fresh
+    /// transition), but recovering is good news, not a WARN; the caller
+    /// should log it as an INFO instead.
+    pub fn observe_prefix(&mut self, net: ipnet::IpNet, state: RpkiState) -> bool {
+        let prev = self.prefixes.insert(net, state);
+        state != RpkiState::Valid && prev != Some(state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +305,85 @@ mod tests {
             validity_url("http://h:8323", 214806, &pfx("2a12:9b00:b00b::/128")),
             "http://h:8323/api/v1/validity/AS214806/2a12:9b00:b00b::/128"
         );
+    }
+
+    #[test]
+    fn warns_only_on_state_transition() {
+        let mut st = RpkiWarnState::default();
+        // first observation of an invalid prefix → warn
+        assert!(st.observe_prefix(pfx("94.156.238.0/24"), RpkiState::Invalid)); // returns true = "should warn"
+                                                                                // same state next interval → no warn
+        assert!(!st.observe_prefix(pfx("94.156.238.0/24"), RpkiState::Invalid));
+        // recovers to valid → (info, not warn) → observe returns false-for-warn but records the change
+        assert!(!st.observe_prefix(pfx("94.156.238.0/24"), RpkiState::Valid));
+        // validator down→up→down transitions warn once each
+        assert!(st.observe_validator_up(false)); // up(default)→down = warn
+        assert!(!st.observe_validator_up(false)); // still down = no warn
+        assert!(!st.observe_validator_up(true)); // recovery = info, not warn
+        assert!(st.observe_validator_up(false)); // down again = warn
+    }
+
+    #[test]
+    fn observe_prefix_warns_on_worse_or_different_bad_state_not_on_repeat() {
+        let mut st = RpkiWarnState::default();
+        let net = pfx("94.156.238.0/32");
+        // first bad observation warns
+        assert!(st.observe_prefix(net, RpkiState::NotFound));
+        // same bad state repeated → no warn
+        assert!(!st.observe_prefix(net, RpkiState::NotFound));
+        // a *different* bad state → warn (still bad, but changed)
+        assert!(st.observe_prefix(net, RpkiState::Invalid));
+        // first observation of a prefix that is immediately valid → no warn
+        let other = pfx("203.0.113.0/32");
+        assert!(!st.observe_prefix(other, RpkiState::Valid));
+        // repeated valid → still no warn
+        assert!(!st.observe_prefix(other, RpkiState::Valid));
+    }
+
+    #[test]
+    fn observe_prefix_tracks_each_prefix_independently() {
+        let mut st = RpkiWarnState::default();
+        let a = pfx("94.156.238.0/32");
+        let b = pfx("203.0.113.5/32");
+        assert!(st.observe_prefix(a, RpkiState::Invalid));
+        // a different, previously-unseen prefix warns on its own first observation
+        assert!(st.observe_prefix(b, RpkiState::NotFound));
+        // repeating `a`'s state doesn't warn, `b` is untouched by it
+        assert!(!st.observe_prefix(a, RpkiState::Invalid));
+    }
+
+    #[test]
+    fn aggregate_report_validator_up_when_first_fetch_succeeds() {
+        let net = pfx("94.156.238.0/32");
+        let results: Vec<(ipnet::IpNet, Result<RpkiState, ()>)> = vec![
+            (net, Ok(RpkiState::Invalid)),
+            (pfx("203.0.113.0/32"), Err(())),
+        ];
+        let report = aggregate_report(results);
+        assert!(report.validator_up);
+        // the failed second prefix is omitted, not guessed at
+        assert_eq!(report.per_prefix, vec![(net, RpkiState::Invalid)]);
+    }
+
+    #[test]
+    fn aggregate_report_validator_down_when_first_fetch_fails() {
+        let results: Vec<(ipnet::IpNet, Result<RpkiState, ()>)> = vec![
+            (pfx("94.156.238.0/32"), Err(())),
+            (pfx("203.0.113.0/32"), Ok(RpkiState::Valid)),
+        ];
+        let report = aggregate_report(results);
+        assert!(!report.validator_up);
+        assert_eq!(
+            report.per_prefix,
+            vec![(pfx("203.0.113.0/32"), RpkiState::Valid)]
+        );
+    }
+
+    #[test]
+    fn aggregate_report_empty_prefix_set_is_validator_up() {
+        let report: RpkiReport =
+            aggregate_report(Vec::<(ipnet::IpNet, Result<RpkiState, ()>)>::new());
+        assert!(report.validator_up);
+        assert!(report.per_prefix.is_empty());
     }
 }

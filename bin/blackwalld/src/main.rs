@@ -682,6 +682,148 @@ fn flowspec_config_from(
     }
 }
 
+/// Spawn the periodic RPKI validity cross-check task (#5 C2) when
+/// `policy.rpki_validator` is set.
+///
+/// Requires an `rtbh` block for `local_asn` (the ASN the check queries the
+/// validator with, matching the ASN RTBH announcements actually originate
+/// from) — if `rpki_validator` is configured but no `rtbh` block is
+/// present, logs one warning and does not spawn (there is nothing sensible
+/// to query with). Non-breaking: when `rpki_validator` is unset, this is a
+/// no-op, so no config gains a new background task it didn't ask for.
+///
+/// Never on the mitigation hot path: this task only fails open (logs a
+/// WARN/INFO and updates a metric) — it never touches RTBH/FlowSpec/XDP
+/// state itself.
+fn spawn_rpki_check_task(
+    policy: &blackwall_core::Policy,
+    validator_up: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    uncovered_prefixes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let Some(base) = policy.rpki_validator.clone() else {
+        return;
+    };
+    let Some(rtbh) = policy.rtbh.as_ref() else {
+        tracing::warn!(
+            "rpki-validator is configured but no rtbh block is present; \
+             skipping the periodic RPKI validity cross-check (no local ASN \
+             to query the validator with)"
+        );
+        return;
+    };
+    let asn = rtbh.local_asn;
+    let interval = policy.rpki_check_interval;
+
+    // eligible_prefixes ∪ protected_prefixes: everything an RTBH blackhole
+    // more-specific could ever be announced for. De-duplicated so a prefix
+    // listed in both `prefixes` and `protect` isn't checked twice.
+    let mut seen = std::collections::HashSet::new();
+    let prefixes: Vec<ipnet::IpNet> = policy
+        .prefixes
+        .iter()
+        .chain(policy.protected_prefixes.iter())
+        .copied()
+        .filter(|net| seen.insert(*net))
+        .collect();
+
+    tracing::info!(
+        base = %base,
+        asn,
+        prefixes = prefixes.len(),
+        interval_secs = interval.as_secs(),
+        "starting periodic RPKI validity cross-check (#5 C2)"
+    );
+    tokio::spawn(rpki_check_task(
+        base,
+        asn,
+        prefixes,
+        interval,
+        validator_up,
+        uncovered_prefixes,
+    ));
+}
+
+/// The periodic RPKI validity cross-check loop (#5 C2): runs
+/// [`blackwall_rpki::check_once`] immediately at startup and then every
+/// `interval`, logging a WARN on a fresh validator-down or newly-invalid
+/// prefix transition (an INFO on recovery), and updating the
+/// `blackwall_rpki_validator_up` / `blackwall_rpki_uncovered_prefixes`
+/// gauges. Runs forever — intended to be `tokio::spawn`ed and left detached,
+/// like the other supervisory tasks in this daemon.
+///
+/// Fails open by construction: every fetch failure is a WARN/metric, never a
+/// panic and never a mitigation action — see `blackwall_rpki::fetch_validity`'s
+/// docs for the "never a silent pass" contract this task relies on.
+async fn rpki_check_task(
+    base: String,
+    asn: u32,
+    prefixes: Vec<ipnet::IpNet>,
+    interval: std::time::Duration,
+    validator_up: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    uncovered_prefixes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let client = blackwall_rpki::build_client();
+    let mut warn_state = blackwall_rpki::RpkiWarnState::default();
+    // Mirrors `warn_state`'s internal validator-reachability bit, kept
+    // separately here purely so this glue can tell "no change" apart from
+    // "down→up recovery" for INFO-vs-nothing logging — `RpkiWarnState`
+    // itself only exposes the WARN-worthy (up→down) transition.
+    let mut previously_up = true;
+    // Mirrors `warn_state`'s internal per-prefix map for the same reason:
+    // telling "no change" apart from "recovered to valid" for INFO logging.
+    let mut previous_states: std::collections::HashMap<ipnet::IpNet, blackwall_rpki::RpkiState> =
+        std::collections::HashMap::new();
+
+    loop {
+        let report = blackwall_rpki::check_once(&client, &base, asn, &prefixes).await;
+
+        if warn_state.observe_validator_up(report.validator_up) {
+            tracing::warn!(
+                base = %base,
+                "RPKI validator unreachable; RTBH blackhole RPKI cross-check is \
+                 failing open (not enforced) until it recovers"
+            );
+        } else if !previously_up && report.validator_up {
+            tracing::info!(base = %base, "RPKI validator reachable again");
+        }
+        previously_up = report.validator_up;
+
+        let mut uncovered_count = 0usize;
+        for &(net, state) in &report.per_prefix {
+            if matches!(
+                state,
+                blackwall_rpki::RpkiState::Invalid | blackwall_rpki::RpkiState::NotFound
+            ) {
+                uncovered_count += 1;
+            }
+            let should_warn = warn_state.observe_prefix(net, state);
+            let prev = previous_states.insert(net, state);
+            if should_warn {
+                tracing::warn!(
+                    prefix = %net,
+                    asn,
+                    state = ?state,
+                    "RTBH blackhole more-specific is RPKI-invalid/uncovered; a \
+                     validating upstream will silently drop this announcement"
+                );
+            } else if matches!(
+                prev,
+                Some(blackwall_rpki::RpkiState::Invalid | blackwall_rpki::RpkiState::NotFound)
+            ) && state == blackwall_rpki::RpkiState::Valid
+            {
+                tracing::info!(prefix = %net, "RTBH blackhole more-specific recovered RPKI validity");
+            }
+        }
+
+        validator_up.store(u8::from(report.validator_up), Ordering::Relaxed);
+        uncovered_prefixes.store(uncovered_count, Ordering::Relaxed);
+
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Construct a host route (`/32` for IPv4, `/128` for IPv6) for `target`.
 ///
 /// Local mirror of `blackwall_rtbh`'s crate-private `host_prefix`, used to
@@ -1674,6 +1816,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 std::sync::Arc::new(std::sync::atomic::AtomicU8::new(u8::from(!policy.shadow)));
             let (disarm_tx, _disarm_rx) = tokio::sync::broadcast::channel::<()>(8);
 
+            // Periodic RPKI validity cross-check (#5 C2): a no-op unless
+            // `rpki-validator=` is configured. Built unconditionally
+            // (harmless — starts at "reachable"/"nothing uncovered") so
+            // `/metrics` can report them regardless, mirroring
+            // `rtbh_apply_failure_metrics` and friends above.
+            let rpki_validator_up = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
+            let rpki_uncovered_prefixes =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            spawn_rpki_check_task(
+                &policy,
+                rpki_validator_up.clone(),
+                rpki_uncovered_prefixes.clone(),
+            );
+
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
             {
                 None => std::sync::Arc::new(blackwall_state::PgMitigationSink::new(store.clone())),
@@ -2137,6 +2293,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     flowspec_reapply_pending: Some(flowspec_reapply_pending_metrics.clone()),
                     xdp_reapply_pending: Some(xdp_reapply_pending_metrics.clone()),
                     armed: Some(blackwall_armed.clone()),
+                    rpki_validator_up: Some(rpki_validator_up.clone()),
+                    rpki_uncovered_prefixes: Some(rpki_uncovered_prefixes.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -2223,6 +2381,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let policy = blackwall_config::parse_file(&config)?;
             ensure_interface_exists(&policy.interface)?;
             ensure_flowtable_devices_exist(&policy)?;
+
+            // Periodic RPKI validity cross-check (#5 C2): a no-op unless
+            // `rpki-validator=` is configured. The deception engine (`run`)
+            // does not itself manage RTBH/FlowSpec/XDP, but this monitoring
+            // task is independent of that and belongs wherever the policy is
+            // parsed — see `spawn_rpki_check_task`'s docs.
+            let rpki_validator_up = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
+            let rpki_uncovered_prefixes =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            spawn_rpki_check_task(
+                &policy,
+                rpki_validator_up.clone(),
+                rpki_uncovered_prefixes.clone(),
+            );
 
             // Connect and migrate the store early so discovery can persist its results.
             let store = blackwall_state::Store::connect(&database_url).await?;
@@ -2399,6 +2571,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     flowspec_reapply_pending: None,
                     xdp_reapply_pending: None,
                     armed: None,
+                    rpki_validator_up: Some(rpki_validator_up.clone()),
+                    rpki_uncovered_prefixes: Some(rpki_uncovered_prefixes.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }

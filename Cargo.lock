@@ -378,6 +378,7 @@ name = "blackwall-rpki"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
