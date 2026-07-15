@@ -730,6 +730,11 @@ mod tests {
         announced: Arc<Mutex<Vec<FlowSpecRule>>>,
         withdrawn: Arc<Mutex<Vec<FlowSpecRule>>>,
         fail: Arc<Mutex<bool>>,
+        /// Independent withdraw-only failure toggle, for exercising disarm's
+        /// best-effort tolerance of a withdraw `Err` without also blocking
+        /// the announce that must precede it (unlike `fail`, which fails
+        /// both). Mirrors `crate::manager::RtbhManager`'s test fake.
+        fail_withdraw: Arc<Mutex<bool>>,
     }
     impl FakeBgp {
         /// Build a fake whose `announce_flowspec`/`withdraw_flowspec` fail
@@ -737,6 +742,13 @@ mod tests {
         fn with_fail(fail: bool) -> Self {
             let f = Self::default();
             f.set_fail(fail);
+            f
+        }
+        /// Build a fake whose `withdraw_flowspec` alone fails from the start
+        /// (`announce_flowspec` still succeeds).
+        fn with_fail_withdraw(fail_withdraw: bool) -> Self {
+            let f = Self::default();
+            *f.fail_withdraw.lock().unwrap() = fail_withdraw;
             f
         }
         /// Flip the announce/withdraw failure toggle at runtime — lets a
@@ -776,7 +788,7 @@ mod tests {
             &self,
             rule: FlowSpecRule,
         ) -> Result<(), crate::manager::BgpError> {
-            if *self.fail.lock().unwrap() {
+            if *self.fail.lock().unwrap() || *self.fail_withdraw.lock().unwrap() {
                 return Err(crate::manager::BgpError);
             }
             self.withdrawn.lock().unwrap().push(rule);
@@ -1345,6 +1357,61 @@ mod tests {
         assert_eq!(m.apply_failures(), 0);
         assert_eq!(m.ratecapped(), 0);
         assert_eq!(m.disarmed_skips(), 1);
+    }
+
+    #[tokio::test]
+    async fn disarm_tolerates_a_withdraw_error() {
+        // Best-effort: a withdraw_flowspec Err during disarm must not abort
+        // the sweep (a second active rule is still withdrawn) or stop the
+        // manager from switching to record-only. Mirrors
+        // `crate::manager::RtbhManager`'s `disarm_tolerates_a_withdraw_error`.
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(cfg()),
+            FakeBgp::with_fail_withdraw(true),
+            FakeJournal::default(),
+        );
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            0,
+            0,
+        )
+        .await;
+        m.apply_open(
+            ip("203.0.113.8"),
+            &[flow_rule("203.0.113.8", 17, 53, 0.0)],
+            0,
+            0,
+        )
+        .await;
+        let key1 = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(m.is_active(key1));
+        assert!(m.is_active(key2));
+
+        m.disarm(1_000).await;
+
+        assert!(
+            m.bgp().withdrawn.lock().unwrap().is_empty(),
+            "every withdraw errored, so none was recorded by the fake"
+        );
+        assert!(!m.is_active(key1));
+        assert!(
+            !m.is_active(key2),
+            "disarm clears the active set even when every withdraw errors (best-effort)"
+        );
+
+        // Record-only holds even though disarm itself never got a
+        // confirmed withdraw.
+        m.apply_open(
+            ip("203.0.113.9"),
+            &[flow_rule("203.0.113.9", 17, 53, 0.0)],
+            2_000,
+            2_000,
+        )
+        .await;
+        let key3 = key_of(&rule("203.0.113.9/32", 17, 53, 0.0));
+        assert!(!m.is_active(key3));
     }
 
     #[tokio::test]

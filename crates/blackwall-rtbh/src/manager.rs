@@ -1342,6 +1342,76 @@ mod tests {
         assert!(!m.is_active(ip("203.0.113.9")));
     }
 
+    /// Counts `tracing` events whose formatted message contains `DISARMED`.
+    ///
+    /// Test-only counting [`Layer`] standing in for `tracing-test` (not a
+    /// workspace dependency — see the `blackwall-rtbh/Cargo.toml` dev-dep
+    /// comment): guards the #193 final-review fix that `disarm()` logs its
+    /// banner exactly once. Before that fix, `bin/blackwalld/src/main.rs`
+    /// ALSO logged a pre-call `DISARMED` warn in each manager task's
+    /// `select!` arm, ahead of `disarm()` actually running — a second,
+    /// premature copy of the same banner. This test only exercises
+    /// `RtbhManager::disarm` directly (the manager-side log), so it can't see
+    /// that main.rs duplicate; it exists to pin the manager side at exactly
+    /// 1 so a future regression there is caught too.
+    #[derive(Clone, Default)]
+    struct DisarmedCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DisarmedCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct MessageContains<'a> {
+                needle: &'a str,
+                found: bool,
+            }
+            impl tracing::field::Visit for MessageContains<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" && format!("{value:?}").contains(self.needle) {
+                        self.found = true;
+                    }
+                }
+            }
+            let mut visitor = MessageContains {
+                needle: "DISARMED",
+                found: false,
+            };
+            event.record(&mut visitor);
+            if visitor.found {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disarm_logs_disarmed_exactly_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let counter = DisarmedCounter::default();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut m = mgr(false, false);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 0)
+            .await;
+
+        // A repeated disarm is a no-op (idempotent) and must not re-log.
+        m.disarm(1_000).await;
+        m.disarm(2_000).await;
+
+        assert_eq!(
+            counter.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "DISARMED must be logged exactly once by the manager, even across a repeated disarm() call"
+        );
+    }
+
     #[tokio::test]
     async fn apply_add_while_disarmed_is_rejected_not_applied() {
         // C5 + final-review fix: a manual add while disarmed must be

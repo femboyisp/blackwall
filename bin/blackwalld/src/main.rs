@@ -1044,7 +1044,6 @@ async fn rtbh_manager_task<B, J>(
                 // is treated the same as `Ok`.
                 match disarmed {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        tracing::warn!("RTBH: DISARMED — mitigations withdrawn, now recording only");
                         manager.disarm(mono_now()).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -1204,7 +1203,6 @@ async fn flowspec_manager_task<B, J>(
                 // `Lagged` delivery still counts as "disarm was requested".
                 match disarmed {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        tracing::warn!("FlowSpec: DISARMED — mitigations withdrawn, now recording only");
                         manager.disarm(mono_now()).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -1420,7 +1418,6 @@ async fn xdp_manager_task<J>(
                 // `Lagged` delivery still counts as "disarm was requested".
                 match disarmed {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        tracing::warn!("XDP: DISARMED — mitigations withdrawn, now recording only");
                         manager.disarm(mono_now()).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {

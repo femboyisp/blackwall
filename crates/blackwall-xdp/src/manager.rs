@@ -1013,6 +1013,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disarm_tolerates_a_withdraw_error() {
+        // Best-effort: an executor Err on disarm's withdraw (ClearRate) apply
+        // must not abort the sweep (a second active entry is still swept) or
+        // stop the manager from switching to record-only. Mirrors
+        // `blackwall_rtbh::manager::RtbhManager`'s
+        // `disarm_tolerates_a_withdraw_error`.
+        let mut m = XdpManager::new(
+            XdpController::new(own(), 100, 1000, Vec::new()),
+            FakeExecutor {
+                // Calls 1-2 (the two fresh rate-limit installs) succeed;
+                // call 3 onward (disarm's ClearRate withdraws) fail.
+                fail_from_call: Some(3),
+                ..Default::default()
+            },
+            FakeJournal::default(),
+        );
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.7", vec!["198.51.100.9"])),
+            0,
+        )
+        .await;
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.8", vec!["198.51.100.10"])),
+            0,
+        )
+        .await;
+        assert_eq!(m.active().len(), 2);
+
+        m.disarm(1_000).await;
+
+        assert!(
+            !m.executor()
+                .applied
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| matches!(a, XdpAction::ClearRate { .. })),
+            "every withdraw errored, so no ClearRate was recorded by the fake"
+        );
+        assert!(
+            m.active().is_empty(),
+            "disarm clears the active set even when every withdraw errors (best-effort)"
+        );
+
+        // Record-only holds even though disarm itself never got a
+        // confirmed withdraw.
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.9", vec!["198.51.100.11"])),
+            2_000,
+        )
+        .await;
+        assert!(m.active().is_empty());
+    }
+
+    #[tokio::test]
     async fn apply_add_while_disarmed_is_rejected_not_applied() {
         // C5 + final-review fix: a manual add while disarmed must be
         // classified Rejected (retrying is pointless — there is no re-arm
