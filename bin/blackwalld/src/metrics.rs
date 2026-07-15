@@ -366,6 +366,7 @@ fn xdp_block(sources: &MetricsSources) -> Option<String> {
         dropped_blocklist_packets: u64_to_f64(s.dropped_blocklist.packets),
         dropped_ratelimit_packets: u64_to_f64(s.dropped_ratelimit.packets),
         syn_cookies_sent_packets: u64_to_f64(s.syn_cookies_sent.packets),
+        syn_cookies_txcapped_packets: u64_to_f64(s.syn_cookies_txcapped.packets),
         blocked_entries: u64_to_f64(s.blocked_entries),
         ratelimit_entries: u64_to_f64(s.ratelimit_entries),
     }))

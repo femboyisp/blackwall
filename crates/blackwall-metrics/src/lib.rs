@@ -100,6 +100,10 @@ pub struct XdpMetrics {
     /// Packets answered in-kernel with a SipHash-cookie SYN-ACK via `XDP_TX`
     /// (`REASON_SYNCOOKIE`, B2.3c).
     pub syn_cookies_sent_packets: f64,
+    /// SYNs that cleared every SYN-cookie gate but were denied a SYN-ACK
+    /// because the global `TX_BUDGET` mint-rate cap was exhausted
+    /// (`REASON_SYNCOOKIE_TXCAPPED`, sub-project X3).
+    pub syn_cookies_txcapped_packets: f64,
     /// Number of active blocklist entries (`BLOCK_V4` + `BLOCK_V6`).
     pub blocked_entries: f64,
     /// Number of active rate-limit entries (`RATE`).
@@ -152,6 +156,21 @@ pub fn render_xdp_metrics(m: &XdpMetrics) -> String {
         out,
         "blackwall_xdp_syn_cookies_sent_total {}",
         format_value(m.syn_cookies_sent_packets)
+    );
+    let _ = writeln!(
+        out,
+        "\n# HELP blackwall_xdp_syn_cookies_txcapped_total SYNs that cleared every \
+         SYN-cookie gate but were denied a SYN-ACK because the global XDP_TX mint-rate cap \
+         was exhausted"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_xdp_syn_cookies_txcapped_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "blackwall_xdp_syn_cookies_txcapped_total {}",
+        format_value(m.syn_cookies_txcapped_packets)
     );
     let _ = writeln!(
         out,
@@ -285,6 +304,7 @@ blackwall_bgp_reconnects_total 0
             dropped_blocklist_packets: 42.0,
             dropped_ratelimit_packets: 7.0,
             syn_cookies_sent_packets: 9.0,
+            syn_cookies_txcapped_packets: 2.0,
             blocked_entries: 3.0,
             ratelimit_entries: 5.0,
         };
@@ -301,6 +321,10 @@ blackwall_xdp_packets_passed_total 1000
 # HELP blackwall_xdp_syn_cookies_sent_total SYN-ACKs answered in-kernel with a SipHash SYN cookie
 # TYPE blackwall_xdp_syn_cookies_sent_total counter
 blackwall_xdp_syn_cookies_sent_total 9
+
+# HELP blackwall_xdp_syn_cookies_txcapped_total SYNs that cleared every SYN-cookie gate but were denied a SYN-ACK because the global XDP_TX mint-rate cap was exhausted
+# TYPE blackwall_xdp_syn_cookies_txcapped_total counter
+blackwall_xdp_syn_cookies_txcapped_total 2
 
 # HELP blackwall_xdp_blocked_entries Active XDP source-blocklist entries
 # TYPE blackwall_xdp_blocked_entries gauge
@@ -327,6 +351,7 @@ blackwall_xdp_ratelimit_entries 5
             dropped_blocklist_packets: 0.0,
             dropped_ratelimit_packets: 0.0,
             syn_cookies_sent_packets: 0.0,
+            syn_cookies_txcapped_packets: 0.0,
             blocked_entries: 0.0,
             ratelimit_entries: 0.0,
         });

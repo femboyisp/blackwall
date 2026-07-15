@@ -14,6 +14,15 @@ pub enum XdpMode {
     Generic,
 }
 
+/// Conservative default for [`XdpConfig::syn_cookie_tx_cap`] (packets per
+/// second), used when the `syn-cookie-tx-cap=` directive key is absent.
+///
+/// **Never `0`** (`0` means "unlimited" to the in-kernel `TX_BUDGET` bucket —
+/// see `blackwall_xdp_common::TxBucket`'s doc comment): an operator who
+/// enables `cookie-ports` without also specifying this knob must still get a
+/// bounded SYN-ACK reflector rather than an unbounded gain-1 amplifier.
+pub const DEFAULT_SYN_COOKIE_TX_CAP_PPS: u32 = 1000;
+
 /// Configuration for the on-box XDP fast path (`xdp` directive); `None` on
 /// [`crate::Policy`] means XDP is disabled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,4 +61,15 @@ pub struct XdpConfig {
     /// still truncates the banner to at most the request's payload length, so
     /// this can never amplify.
     pub afxdp_udp_banner: Option<Vec<u8>>,
+    /// Global cap (packets per second) on the in-kernel SYN-cookie `XDP_TX`
+    /// mint rate (`syn-cookie-tx-cap=` directive, sub-project X3), written into
+    /// the eBPF `TX_BUDGET` bucket via
+    /// `blackwall_xdp::XdpDataplane::set_syn_cookie_tx_cap`. Bounds the
+    /// *aggregate* SYN-ACK reflection rate regardless of how many distinct
+    /// (possibly spoofed) source addresses a flood spreads across — the
+    /// per-source `RATE` limiter alone never engages against a flood that never
+    /// reuses a source. Defaults to [`DEFAULT_SYN_COOKIE_TX_CAP_PPS`]
+    /// (never `0`/unlimited) so enabling `cookie-ports` without this knob still
+    /// yields a bounded reflector.
+    pub syn_cookie_tx_cap: u32,
 }

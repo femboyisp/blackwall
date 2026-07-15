@@ -2115,6 +2115,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if !xdp_cfg.cookie_ports.is_empty() {
                             match store.cookie_secret().await {
                                 Ok(secret) => {
+                                    // Task 3 (X3): whenever the cookie path is
+                                    // armed, ALSO seed the global `TX_BUDGET`
+                                    // mint-rate cap — never leave it at its
+                                    // zero-initialised (unlimited) default while
+                                    // cookie-ports is live, so an operator who
+                                    // enables cookie-ports without also setting
+                                    // `syn-cookie-tx-cap` still gets a bounded
+                                    // reflector (config defaults the cap to
+                                    // `DEFAULT_SYN_COOKIE_TX_CAP_PPS`).
                                     let activated = dataplane
                                         .set_cookie_key(secret)
                                         .and_then(|()| {
@@ -2122,11 +2131,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         })
                                         .and_then(|()| {
                                             dataplane.set_protected_ports(&xdp_cfg.cookie_ports)
+                                        })
+                                        .and_then(|()| {
+                                            dataplane
+                                                .set_syn_cookie_tx_cap(xdp_cfg.syn_cookie_tx_cap)
                                         });
                                     match activated {
                                         Ok(()) => tracing::info!(
                                             ports = xdp_cfg.cookie_ports.len(),
                                             prefixes = policy.prefixes.len(),
+                                            tx_cap_pps = xdp_cfg.syn_cookie_tx_cap,
                                             "XDP: SYN-cookie fast path activated"
                                         ),
                                         Err(err) => tracing::warn!(
