@@ -20,6 +20,7 @@ blackwall-metrics = { path = "../../crates/blackwall-metrics" }
 blackwall-speedtest = { path = "../../crates/blackwall-speedtest" }
 blackwall-bgp = { path = "../../crates/blackwall-bgp" }
 blackwall-rtbh = { path = "../../crates/blackwall-rtbh" }
+blackwall-rpki = { path = "../../crates/blackwall-rpki" }
 blackwall-xdp = { path = "../../crates/blackwall-xdp" }
 async-trait = { workspace = true }
 axum = { workspace = true }

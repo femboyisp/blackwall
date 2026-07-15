@@ -141,6 +141,8 @@ mod tests {
             stateless_tcp_ports: Vec::new(),
             protected_prefixes: Vec::new(),
             shadow: false,
+            rpki_validator: None,
+            rpki_check_interval: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -308,6 +310,8 @@ mod tests {
             stateless_tcp_ports: Vec::new(),
             protected_prefixes: Vec::new(),
             shadow: false,
+            rpki_validator: None,
+            rpki_check_interval: std::time::Duration::from_secs(3600),
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());
