@@ -1264,3 +1264,149 @@ fn rate_limited_source_is_admitted_up_to_burst_then_dropped() {
         );
     });
 }
+
+// --- X3: global per-CPU SYN-cookie XDP_TX mint-rate cap ---
+//
+// The per-source `RATE` limiter (X1) never engages against a spoofed SYN
+// flood: each spoofed source address gets its own fresh, never-reused bucket,
+// so the in-kernel cookie fast path would mint (and `XDP_TX`-bounce) a
+// SYN-ACK for every single spoofed SYN with no ceiling. `TX_BUDGET` bounds the
+// *aggregate* mint rate regardless of how many distinct source addresses are
+// involved.
+
+/// `#[repr(transparent)]` newtype so the foreign
+/// [`blackwall_xdp_common::TxBucket`] POD can carry an [`aya::Pod`] impl (the
+/// orphan rule forbids implementing it directly) — mirrors `RateBucketPod`.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct TxBucketPod(blackwall_xdp_common::TxBucket);
+
+// SAFETY: `TxBucket` is a `#[repr(C)]` `Copy + 'static` plain-old-data struct
+// of three `u64` fields; `#[repr(transparent)]` makes `TxBucketPod` share its
+// exact layout, so it is byte-for-byte valid as a per-CPU BPF map value.
+unsafe impl aya::Pod for TxBucketPod {}
+
+/// Install a global `TX_BUDGET` cap of `cap` tokens on *every* CPU's slot,
+/// with `rate_pps = 1` (nonzero, so `tx_budget_ok` treats the cap as
+/// configured rather than "not configured => never throttle") and
+/// `last_ns = u64::MAX` so `now.saturating_sub(last_ns)` is always `0` — no
+/// refill can occur during the test no matter how much wall-clock time
+/// elapses between `BPF_PROG_TEST_RUN` calls. Mirrors `install_rate_bucket`'s
+/// no-refill trick, adapted because X3's cap-enable signal is `rate_pps != 0`
+/// itself (unlike `RATE`, where `rate_pps = 0` is used to freeze refill while
+/// the bucket is still "configured" by virtue of the entry existing at all).
+fn install_tx_budget(bpf: &mut Ebpf, cap: u64) {
+    use aya::maps::{PerCpuArray, PerCpuValues};
+    use aya::util::nr_cpus;
+
+    let mut map: PerCpuArray<_, TxBucketPod> =
+        PerCpuArray::try_from(bpf.map_mut("TX_BUDGET").expect("TX_BUDGET map present"))
+            .expect("TX_BUDGET is a PerCpuArray");
+    let bucket = blackwall_xdp_common::TxBucket {
+        tokens: cap,
+        last_ns: u64::MAX,
+        rate_pps: 1,
+    };
+    let cpus = nr_cpus().expect("nr_cpus");
+    let values =
+        PerCpuValues::try_from(vec![TxBucketPod(bucket); cpus]).expect("build per-CPU values");
+    map.set(0, values, 0).expect("insert tx budget");
+}
+
+/// X3: with the cookie path fully enabled (protected prefix + port, a valid
+/// cookie key) and `TX_BUDGET` seeded to a cap of `CAP` tokens with no refill
+/// for the test's duration (see `install_tx_budget`), exactly the first `CAP`
+/// of `TOTAL > CAP` SYNs to the protected destination must be answered via
+/// `XDP_TX`; every SYN after that must fall through to its normal non-cookie
+/// verdict (`XDP_PASS`, since nothing else in this test gates it) instead of
+/// minting, and `REASON_SYNCOOKIE_TXCAPPED` must count exactly the denied
+/// SYNs. Pinned to one CPU (X1's pattern) so every `BPF_PROG_TEST_RUN` call
+/// hits the same per-CPU `TX_BUDGET` slot — otherwise the scheduler could
+/// migrate the calling thread between calls and each SYN would hit a
+/// different, independently-full per-CPU budget rather than draining one.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn global_tx_budget_caps_mints_then_stats_the_rest() {
+    const CAP: u64 = 3;
+    const TOTAL: u64 = 5;
+
+    pin_to_cpu0(|| {
+        let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+        install_tx_budget(&mut bpf, CAP);
+        let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+        let mut minted = 0u64;
+        let mut capped = 0u64;
+        for i in 0..TOTAL {
+            let port_offset = u16::try_from(i).expect("small test index fits u16");
+            let seq_offset = u32::try_from(i).expect("small test index fits u32");
+            let syn = eth_ipv4_tcp_syn(
+                [203, 0, 113, 7],
+                [10, 0, 0, 1],
+                50_000 + port_offset,
+                PROTECT_TCP_PORT,
+                0x1000_0000 + seq_offset,
+                1460,
+            );
+            let action = run_xdp(prog_fd, &syn);
+            if i < CAP {
+                assert_eq!(
+                    action, XDP_TX,
+                    "SYN {i} within the global budget must mint via XDP_TX"
+                );
+                minted += 1;
+            } else {
+                assert_eq!(
+                    action, XDP_PASS,
+                    "SYN {i} beyond the global budget must fall through to XDP_PASS"
+                );
+                capped += 1;
+            }
+        }
+        assert_eq!(minted, CAP, "exactly CAP SYNs must have minted");
+        assert_eq!(
+            capped,
+            TOTAL - CAP,
+            "the remaining SYNs must all be budget-capped"
+        );
+        assert_eq!(
+            stat_packets(&mut bpf, blackwall_xdp_common::REASON_SYNCOOKIE_TXCAPPED),
+            TOTAL - CAP,
+            "REASON_SYNCOOKIE_TXCAPPED must count exactly the denied SYNs"
+        );
+    });
+}
+
+/// X3 default-off regression guard: with `TX_BUDGET` left entirely unseeded
+/// (the map's zero-initialised default — `rate_pps == 0`), the cap must be
+/// treated as "not configured" and never throttle, so a single SYN mints
+/// exactly as it did before X3. This is the same scenario the pre-X3
+/// `syn_to_protected_prefix_and_port_is_answered_via_xdp_tx` test exercises;
+/// this test makes the "unseeded TX_BUDGET must not regress the existing
+/// syncookie behavior" requirement explicit and independently checked.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn unseeded_tx_budget_never_throttles() {
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    // Deliberately do NOT install TX_BUDGET.
+    let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+    let syn = eth_ipv4_tcp_syn(
+        [203, 0, 113, 7],
+        [10, 0, 0, 1],
+        54_321,
+        PROTECT_TCP_PORT,
+        0x1122_3344,
+        1460,
+    );
+    let action = run_xdp(prog_fd, &syn);
+    assert_eq!(
+        action, XDP_TX,
+        "an unseeded TX_BUDGET must never throttle -- a SYN must still mint"
+    );
+    assert_eq!(
+        stat_packets(&mut bpf, blackwall_xdp_common::REASON_SYNCOOKIE_TXCAPPED),
+        0,
+        "an unseeded TX_BUDGET must never count a SYN as capped"
+    );
+}

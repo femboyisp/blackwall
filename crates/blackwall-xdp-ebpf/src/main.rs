@@ -83,8 +83,9 @@ use aya_ebpf::maps::{HashMap, LpmTrie, LruPerCpuHashMap, PerCpuArray, RingBuf, X
 use aya_ebpf::programs::XdpContext;
 use blackwall_cookie::make_cookie_raw;
 use blackwall_xdp_common::{
-    CaptureFrame, CaptureRecord, CookieKeyValue, RateBucket, Stat, CAP_SNAP_LEN, REASON_BLOCKLIST,
-    REASON_COUNT, REASON_PASS, REASON_RATELIMIT, REASON_REDIRECT, REASON_SYNCOOKIE,
+    CaptureFrame, CaptureRecord, CookieKeyValue, RateBucket, Stat, TxBucket, CAP_SNAP_LEN,
+    REASON_BLOCKLIST, REASON_COUNT, REASON_PASS, REASON_RATELIMIT, REASON_REDIRECT,
+    REASON_SYNCOOKIE, REASON_SYNCOOKIE_TXCAPPED,
 };
 use core::mem;
 use network_types::eth::{EthHdr, EtherType};
@@ -108,6 +109,14 @@ static RATE: LruPerCpuHashMap<[u8; 16], RateBucket> =
     LruPerCpuHashMap::with_max_entries(1_048_576, 0);
 #[map]
 static STATS: PerCpuArray<Stat> = PerCpuArray::with_max_entries(REASON_COUNT, 0);
+/// Single-slot (index `0`) global per-CPU SYN-cookie `XDP_TX` mint-rate token
+/// bucket (sub-project X3 — see [`TxBucket`]'s doc comment for the full
+/// rationale and the per-CPU aggregate-ceiling tradeoff). Zero-initialised
+/// (`rate_pps == 0`) until userspace writes a nonzero rate, which
+/// [`tx_budget_ok`] treats as "cap not configured" so the fast path's pre-X3
+/// behavior is unchanged by default.
+#[map]
+static TX_BUDGET: PerCpuArray<TxBucket> = PerCpuArray::with_max_entries(1, 0);
 /// Single-entry map (key `0`) holding the 128-bit SYN-cookie secret, pre-split
 /// into the SipHash `(k0, k1)` pair (see [`CookieKeyValue`]). Populated from
 /// userspace before the program answers any SYN; an absent entry makes the SYN
@@ -278,6 +287,15 @@ const MAX_TCP_SEG: usize = 64;
 /// Nanoseconds per second, dividing [`bpf_ktime_get_ns`] down to the
 /// seconds-since-boot the cookie core slots (`>> COUNTER_SHIFT`) internally.
 const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// Fixed burst cap for the global per-CPU [`TX_BUDGET`] token bucket
+/// (sub-project X3). Unlike [`RateBucket`], [`TxBucket`] carries no per-instance
+/// `burst` field (see its doc comment), so the cap is this compile-time
+/// constant: a round number comfortably above any sane sustained per-CPU
+/// SYN-ACK burst, so a correctly configured `rate_pps` is never truncated by
+/// this ceiling -- it only guards against `tokens` growing without bound
+/// between refills (e.g. after a long idle period).
+const TX_BUDGET_BURST: u64 = 1_000_000;
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
@@ -710,7 +728,19 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     // Cookie time base: real monotonic seconds-since-boot (`CLOCK_MONOTONIC`);
     // `make_cookie_raw` slots it with `>> COUNTER_SHIFT` internally.
     // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
-    let now_secs = unsafe { bpf_ktime_get_ns() } / NS_PER_SEC;
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    let now_secs = now_ns / NS_PER_SEC;
+
+    // X3: the global per-CPU mint budget, checked immediately before minting.
+    // A SYN that cleared every other gate (protected prefix+port, per-source
+    // `over_rate`, a valid cookie key) but exceeds the box's aggregate budget
+    // falls through to its normal non-cookie verdict instead of being answered.
+    if !tx_budget_ok(now_ns) {
+        let frame_len = (ctx.data_end() - ctx.data()) as u64;
+        count(REASON_SYNCOOKIE_TXCAPPED, frame_len);
+        return Err(());
+    }
+
     // Compute the stateless SYN-cookie with the shared no_std core.
     let (cookie_seq, mss) =
         make_cookie_raw(k0, k1, &src, src_port, &dst, dst_port, client_mss, now_secs);
@@ -871,6 +901,19 @@ fn try_synack_v6(ctx: &XdpContext) -> Result<u32, ()> {
     let src_port = load_be16(ctx, OFF_TCP6_SRCPORT)?;
     let client_seq = load_be32(ctx, OFF_TCP6_SEQ)?;
     let ack = client_seq.wrapping_add(1);
+
+    // X3: the global per-CPU mint budget, checked immediately before minting
+    // (mirrors `try_synack_v4`) — a SYN that cleared every other gate
+    // (protected prefix+port, per-source `over_rate`) but exceeds the box's
+    // aggregate budget falls through instead of paying for the SipHash cookie
+    // that `compute_cookie_v6` would otherwise compute.
+    // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    if !tx_budget_ok(now_ns) {
+        let frame_len = (ctx.data_end() - ctx.data()) as u64;
+        count(REASON_SYNCOOKIE_TXCAPPED, frame_len);
+        return Err(());
+    }
 
     // Compute the stateless SYN-cookie **before** any mutation (bails to `Err` —
     // hence `XDP_PASS`, frame untouched — if the cookie key is absent), over the
@@ -1131,6 +1174,56 @@ fn over_rate(src: [u8; 16]) -> bool {
         }
     }
     false
+}
+
+/// Check and consume one token from the global per-CPU SYN-cookie `XDP_TX`
+/// mint budget (sub-project X3). Returns `true` if a SYN-ACK may be minted,
+/// `false` if the caller must bail without minting.
+///
+/// Callers invoke this **after** SYN validation, the [`protected_v4`]/
+/// [`protected_v6`]/[`protected_port`] gating, and the per-source [`over_rate`]
+/// check (checked earlier, in [`try_filter`], before [`try_synack_v4`]/
+/// [`try_synack_v6`] are even called) -- so a non-SYN, unprotected-destination,
+/// or already per-source-limited packet never consumes global budget. The
+/// check sits immediately before the cookie is actually minted.
+///
+/// `rate_pps == 0` (the [`TX_BUDGET`] slot's zero-initialised default) means
+/// the cap has never been configured by userspace and this always returns
+/// `true` -- see [`TxBucket`]'s doc comment. Once `rate_pps` is nonzero, the
+/// refill/decrement mirrors [`over_rate`] exactly: 64-bit-only math
+/// (`wrapping_mul` then `.min(TX_BUDGET_BURST)`; `saturating_mul`/
+/// `overflowing_mul` would emit an unsupported 128-bit `__multi3` on this
+/// target), so wraparound at absurd elapsed values cannot over-credit tokens.
+///
+/// Per-CPU (see [`TX_BUDGET`]'s doc comment): `get_ptr_mut` returns a pointer
+/// to *this* CPU's own slot, so the RMW below is inherently race-free with no
+/// lock needed -- at the cost of an aggregate ceiling of `N_cpus x rate_pps`
+/// across the box, mirroring `over_rate`'s X1 per-CPU tradeoff.
+#[inline(always)]
+fn tx_budget_ok(now: u64) -> bool {
+    let Some(b) = TX_BUDGET.get_ptr_mut(0) else {
+        // No slot at index 0 (unreachable in practice: `with_max_entries(1, 0)`
+        // always has one): fail open, same as the "not configured" case.
+        return true;
+    };
+    // SAFETY: `get_ptr_mut` returned a valid pointer to this CPU's own single
+    // TX_BUDGET slot; it is exclusively ours for the duration of this call (no
+    // other CPU can observe or mutate a per-CPU map's slot for this CPU).
+    unsafe {
+        if (*b).rate_pps == 0 {
+            // Cap not configured: never throttle (pre-X3 behavior).
+            return true;
+        }
+        let elapsed_ns = now.saturating_sub((*b).last_ns);
+        let refill = elapsed_ns.wrapping_mul((*b).rate_pps) / NS_PER_SEC;
+        (*b).tokens = ((*b).tokens.saturating_add(refill)).min(TX_BUDGET_BURST);
+        (*b).last_ns = now;
+        if (*b).tokens == 0 {
+            return false;
+        }
+        (*b).tokens -= 1;
+    }
+    true
 }
 
 #[cfg(not(test))]
