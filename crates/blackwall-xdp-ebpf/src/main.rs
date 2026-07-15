@@ -587,6 +587,10 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
         }
         _ => {}
     }
+    // NOTE: this fallthrough also catches tx-capped SYNs (`try_synack_v4`/
+    // `v6` returning `Err(())` after counting REASON_SYNCOOKIE_TXCAPPED), so
+    // `passed_total` is a superset of the tx-capped count -- the reason
+    // counters intentionally do not sum to the total packet count.
     count(REASON_PASS, frame_len);
     capture(ctx, REASON_PASS, xdp_action::XDP_PASS, frame_len);
     Ok(xdp_action::XDP_PASS)
@@ -742,6 +746,13 @@ fn try_synack_v4(ctx: &XdpContext) -> Result<u32, ()> {
     // falls through to its normal non-cookie verdict instead of being answered.
     if !tx_budget_ok(now_ns) {
         let frame_len = (ctx.data_end() - ctx.data()) as u64;
+        // Intentional double-count: this SYN is tallied under
+        // REASON_SYNCOOKIE_TXCAPPED here (the distinct "budget exceeded"
+        // signal), and then AGAIN under REASON_PASS once `try_filter` falls
+        // through to `XDP_PASS` on this `Err(())`. The XDP verdict (PASS) is
+        // correct either way; `passed_total` is a superset that includes
+        // tx-capped SYNs, so the reason counters do not sum to the packet
+        // total by design.
         count(REASON_SYNCOOKIE_TXCAPPED, frame_len);
         return Err(());
     }
@@ -925,6 +936,10 @@ fn try_synack_v6(ctx: &XdpContext) -> Result<u32, ()> {
     let now_ns = unsafe { bpf_ktime_get_ns() };
     if !tx_budget_ok(now_ns) {
         let frame_len = (ctx.data_end() - ctx.data()) as u64;
+        // Intentional double-count: see the matching comment in
+        // `try_synack_v4` -- this SYN is tallied under
+        // REASON_SYNCOOKIE_TXCAPPED here AND again under REASON_PASS once
+        // `try_filter` falls through to `XDP_PASS` on this `Err(())`.
         count(REASON_SYNCOOKIE_TXCAPPED, frame_len);
         return Err(());
     }

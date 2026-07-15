@@ -2124,17 +2124,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     // `syn-cookie-tx-cap` still gets a bounded
                                     // reflector (config defaults the cap to
                                     // `DEFAULT_SYN_COOKIE_TX_CAP_PPS`).
+                                    // Seed the TX budget BEFORE arming the port
+                                    // gate: these are sequential in-kernel map
+                                    // writes, and a failure landing on the LAST
+                                    // call would otherwise leave PROTECT_PORT
+                                    // armed while TX_BUDGET is still unseeded
+                                    // (rate_pps==0 == UNLIMITED to the eBPF), a
+                                    // momentary unbounded reflector. With the
+                                    // cap seeded first, a failure here means
+                                    // set_protected_ports never runs and the
+                                    // fast path stays inert instead.
                                     let activated = dataplane
                                         .set_cookie_key(secret)
                                         .and_then(|()| {
                                             dataplane.set_protected_prefixes(&policy.prefixes)
                                         })
                                         .and_then(|()| {
-                                            dataplane.set_protected_ports(&xdp_cfg.cookie_ports)
-                                        })
-                                        .and_then(|()| {
                                             dataplane
                                                 .set_syn_cookie_tx_cap(xdp_cfg.syn_cookie_tx_cap)
+                                        })
+                                        .and_then(|()| {
+                                            dataplane.set_protected_ports(&xdp_cfg.cookie_ports)
                                         });
                                     match activated {
                                         Ok(()) => tracing::info!(
