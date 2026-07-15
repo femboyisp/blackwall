@@ -290,6 +290,21 @@ impl FlowSpecController {
             .collect()
     }
 
+    /// Look up the CURRENTLY active rule for `key`, rather than trusting a
+    /// possibly-stale snapshot captured elsewhere and earlier (e.g. by a
+    /// queued [`crate::flowspec_manager::FlowSpecManager`] reapply retry).
+    ///
+    /// `key`'s identity (destination/protocol/port) excludes the action
+    /// (C4), so a re-assert can legitimately change the action in place
+    /// (e.g. `manual_add`'s `changed_action_re_announces`) while the key
+    /// stays the same — a caller that wants "the rule as it stands right
+    /// now" must call this rather than replay a captured `FlowSpecRule`.
+    /// `None` if `key` is no longer active.
+    #[must_use]
+    pub fn active_rule(&self, key: FlowKey) -> Option<FlowSpecRule> {
+        self.active.get(&key).map(|e| e.rule.clone())
+    }
+
     /// Re-assert every active rule for `target` without re-announcing.
     ///
     /// Used for [`blackwall_flow::FlowMitigationEvent::Update`], which reports that

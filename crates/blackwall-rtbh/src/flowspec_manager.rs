@@ -78,16 +78,26 @@ impl MirrorOp {
 /// `ReapplyOp` re-attempts the BGP `announce_flowspec` itself: rehydrate's
 /// failure happens on the BGP side, not the journal side (rehydrate never
 /// journals in the first place).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Holds only the [`FlowKey`], not the rule that was captured when the op
+/// was queued: [`FlowSpecManager::retry_pending_reapply`] re-derives the
+/// CURRENT rule from [`FlowSpecController::active_rule`] at retry time
+/// rather than replaying a snapshot, so a fresh, successful re-assertion of
+/// the same key with a changed action (C4 — e.g. `manual_add`'s
+/// `changed_action_re_announces`) that lands between the failed rehydrate
+/// and the retry is never clobbered by the stale queued content (#194 C1
+/// follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReapplyOp {
-    /// The rule to re-announce.
-    rule: FlowSpecRule,
+    /// The key of the rule to re-announce; the current rule content is
+    /// looked up fresh from the controller at retry time.
+    key: FlowKey,
 }
 
 impl ReapplyOp {
     /// The `FlowKey` this reapply op concerns.
     fn key(&self) -> FlowKey {
-        key_of(&self.rule)
+        self.key
     }
 }
 
@@ -384,7 +394,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             if let Some(FlowSpecAction::Announce(r)) = actions.into_iter().next() {
                 if let Err(e) = self.bgp.announce_flowspec(r.clone()).await {
                     tracing::warn!(%target, error = %e, "FlowSpec: rehydrate re-announce failed; queuing for retry");
-                    self.queue_reapply(ReapplyOp { rule: r });
+                    self.queue_reapply(ReapplyOp { key: key_of(&r) });
                 }
                 continue;
             }
@@ -654,13 +664,20 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     /// Drain-retry queued `rehydrate` re-announces left over from a
     /// transient BGP failure (issue #194).
     ///
-    /// Each queued op is first re-checked against the current active set:
-    /// if the rule is no longer active (e.g. cleared by a manual remove or a
-    /// hold-down expiry between the failed rehydrate and this tick), the op
-    /// is dropped — re-announcing a rule the control plane no longer wants
-    /// live would itself create a phantom. Otherwise the announce is
-    /// re-attempted; ops that still fail are kept (retried again on the next
-    /// call), ops that succeed are dropped.
+    /// Each queued op re-derives the CURRENT rule for its key from
+    /// [`FlowSpecController::active_rule`] rather than replaying the rule
+    /// snapshot captured when the op was queued: if the key is no longer
+    /// active (e.g. cleared by a manual remove or a hold-down expiry between
+    /// the failed rehydrate and this tick), `active_rule` returns `None` and
+    /// the op is dropped — re-announcing a rule the control plane no longer
+    /// wants live would itself create a phantom. If the key is still active
+    /// but a fresh, successful re-assertion changed its action in the
+    /// meantime (C4 — e.g. a detection or operator call tightening the
+    /// rate), re-deriving picks up that CURRENT action instead of replaying
+    /// the stale queued one, which would otherwise silently revert the fresh
+    /// update (#194 C1 follow-up). Otherwise the announce is re-attempted;
+    /// ops that still fail are kept (retried again on the next call), ops
+    /// that succeed are dropped.
     async fn retry_pending_reapply(&mut self) {
         if self.pending_reapply.is_empty() {
             return;
@@ -668,14 +685,14 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         let ops = std::mem::take(&mut self.pending_reapply);
         for op in ops {
             let key = op.key();
-            if !self.is_active(key) {
+            let Some(rule) = self.controller.active_rule(key) else {
                 tracing::info!(
                     ?key,
                     "FlowSpec: dropping queued rehydrate reapply; entry no longer active"
                 );
                 continue;
-            }
-            if let Err(e) = self.bgp.announce_flowspec(op.rule.clone()).await {
+            };
+            if let Err(e) = self.bgp.announce_flowspec(rule).await {
                 tracing::warn!(?key, error = %e, "FlowSpec: rehydrate reapply retry failed; re-queuing");
                 self.pending_reapply.push(op);
             }
@@ -1476,5 +1493,56 @@ mod tests {
         m.tick(4_000, 4_000).await;
         assert_eq!(m.reapply_pending(), 0, "dropped: entry no longer active");
         assert!(!bgp.announced_contains(&r), "not re-announced after clear");
+    }
+
+    #[tokio::test]
+    async fn stale_reapply_does_not_clobber_a_fresh_successful_update() {
+        // #194 C1 follow-up: `retry_pending_reapply` must re-derive the
+        // controller's CURRENT rule for the key at retry time, not replay
+        // the rule snapshot captured when the op was queued. Otherwise a
+        // fresh, successful re-assertion of the SAME key with a CHANGED
+        // action (C4 — a re-assert may legitimately change the action, see
+        // `manual_add_upgrade_with_changed_action_re_announces`) that lands
+        // between the failed rehydrate and the retry gets silently reverted
+        // by the stale queued content — a mitigation-weakening regression.
+        let bgp = FakeBgp::with_fail(true); // rehydrate re-announce fails
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(cfg()),
+            bgp.clone(),
+            FakeJournal::default(),
+        );
+        let old = rule("203.0.113.7/32", 17, 53, 500.0);
+        m.rehydrate(vec![(old.clone(), 1_000, BlackholeOrigin::Auto)], 1_000)
+            .await;
+        let key = key_of(&old);
+        assert!(m.is_active(key), "entry kept (not dropped)");
+        assert_eq!(m.reapply_pending(), 1, "failed rehydrate queued for retry");
+
+        // BGP recovers just in time for a FRESH, successful re-assertion
+        // with a tighter (different) action for the SAME key, landing
+        // before the next tick drains the stale queue.
+        bgp.set_fail(false);
+        let new = rule("203.0.113.7/32", 17, 53, 100.0);
+        let outcome = m.apply_add(new.clone(), 1_500, 1_500).await;
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            bgp.announced_contains(&new),
+            "the fresh, tighter update reached BGP"
+        );
+
+        // The next tick drains the (now-stale) queued reapply. It must
+        // re-derive and re-announce the CURRENT rule (rate 100.0), not
+        // replay the stale queued snapshot (rate 500.0) — which would
+        // silently revert the fresh tightening.
+        m.tick(2_000, 2_000).await;
+        assert_eq!(m.reapply_pending(), 0);
+
+        let announced = m.bgp().announced.lock().unwrap();
+        let last = announced.last().expect("at least one announce recorded");
+        assert_eq!(
+            last.action,
+            FlowAction::TrafficRate(100.0),
+            "the drained retry must re-announce the CURRENT rule, not the stale queued one"
+        );
     }
 }

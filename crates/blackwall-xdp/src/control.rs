@@ -303,6 +303,31 @@ impl XdpController {
         self.rate_limited.contains_key(&src)
     }
 
+    /// Look up the CURRENTLY effective rate-limit action for `src`, rather
+    /// than trusting a possibly-stale snapshot captured elsewhere and
+    /// earlier (e.g. by a queued [`crate::manager::XdpManager`] reapply
+    /// retry). `None` if `src` is no longer rate-limited.
+    #[must_use]
+    pub fn current_rate_limit(&self, src: IpAddr) -> Option<XdpAction> {
+        self.rate_limited.get(&src).map(|e| XdpAction::RateLimit {
+            src,
+            pps: e.pps,
+            burst: e.burst,
+            victim: e.victim,
+        })
+    }
+
+    /// Look up whether `net` is CURRENTLY blocked, rather than trusting a
+    /// possibly-stale snapshot captured elsewhere and earlier. `None` if
+    /// `net` is no longer blocked. See [`Self::current_rate_limit`] for why
+    /// this is exposed.
+    #[must_use]
+    pub fn current_block(&self, net: IpNet) -> Option<XdpAction> {
+        self.blocked_nets
+            .contains_key(&net)
+            .then_some(XdpAction::Block { net })
+    }
+
     /// Undo a just-inserted active entry after its executor apply failed
     /// (C2: commit-after-confirm).
     ///
