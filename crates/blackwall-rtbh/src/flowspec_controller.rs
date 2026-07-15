@@ -24,6 +24,18 @@ struct ActiveEntry {
     last_activity: u64,
     origin: BlackholeOrigin,
     clear_requested_at: Option<u64>,
+    /// The rule this entry held immediately before an in-place update whose
+    /// `Announce` has not yet been confirmed (C4 rollback support). `None`
+    /// for a brand-new entry (nothing to revert to — [`FlowSpecController::rollback`]
+    /// removes it outright on failure). `Some(prior)` for a re-assert or
+    /// manual-upgrade that changed the action in place: the router still
+    /// holds `prior` since the new announce was never confirmed, so a
+    /// failed announce must restore it rather than delete the entry or
+    /// leave the unconfirmed rule stuck in place. Left stale (harmlessly)
+    /// after a successful announce — it is only ever read by `rollback`,
+    /// which is called solely, and immediately, after the very `Announce`
+    /// that last set this field.
+    pending_prior: Option<FlowSpecRule>,
 }
 
 /// FlowSpec policy configuration.
@@ -43,6 +55,10 @@ pub struct FlowSpecConfig {
     /// Maximum lifetime of an auto rule (hygiene backstop against a dropped
     /// or missed clear); `None` disables the TTL.
     pub max_ttl: Option<Duration>,
+    /// Prefixes that must never have FlowSpec rules installed against them
+    /// (own anycast VIPs and similar always-safe destinations), from
+    /// `Policy.protected_prefixes`. Empty (the default) protects nothing extra.
+    pub protected_prefixes: Vec<IpNet>,
 }
 
 /// A decision the [`FlowSpecController`] emits for the sink to execute.
@@ -68,6 +84,9 @@ pub enum FlowSpecAction {
 pub struct FlowSpecController {
     config: FlowSpecConfig,
     active: HashMap<FlowKey, ActiveEntry>,
+    /// Count of targets skipped by the protected-prefix guard (see
+    /// [`Self::protected_skipped`]).
+    protected_skipped: u64,
 }
 
 impl FlowSpecController {
@@ -77,6 +96,7 @@ impl FlowSpecController {
         Self {
             config,
             active: HashMap::new(),
+            protected_skipped: 0,
         }
     }
 
@@ -91,10 +111,14 @@ impl FlowSpecController {
     ///
     /// # Returns
     ///
-    /// An `Announce` action per newly-installed rule. A rule already active is
-    /// re-asserted (its pending clear, if any, is cancelled and its TTL anchor
-    /// refreshed) without emitting a new action. Ineligible targets or a full
-    /// capacity cap are ignored.
+    /// An `Announce` action per newly-installed rule. A rule already active
+    /// (same destination/protocol/port) is re-asserted: its pending clear, if
+    /// any, is cancelled and its TTL anchor refreshed. If the incoming rule's
+    /// action differs from the stored one (e.g. tightening a rate-limit to a
+    /// full drop mid-attack), the stored rule is updated and a fresh
+    /// `Announce` is emitted (C4: `FlowKey` excludes the action, so identity
+    /// alone can't detect this); an unchanged re-assert emits nothing.
+    /// Ineligible targets or a full capacity cap are ignored.
     pub fn install(
         &mut self,
         target: IpAddr,
@@ -163,7 +187,9 @@ impl FlowSpecController {
     ///
     /// If a rule with the same `(dst, protocol, dst_port)` is already active as
     /// `Auto`, this upgrades it to `Manual` (and cancels any pending deferred
-    /// clear) instead of re-announcing.
+    /// clear). If the incoming rule's action also differs from the stored one
+    /// (C4: `FlowKey` excludes the action), the stored rule is updated and a
+    /// fresh `Announce` is emitted instead of the usual silent upgrade.
     ///
     /// # Arguments
     ///
@@ -173,14 +199,24 @@ impl FlowSpecController {
     ///
     /// # Returns
     ///
-    /// An `Announce` action if newly installed, empty vector if upgraded,
-    /// ineligible, or at cap.
+    /// An `Announce` action if newly installed or upgraded with a changed
+    /// action; empty vector if upgraded with no action change, ineligible, or
+    /// at cap.
     pub fn manual_add(&mut self, rule: FlowSpecRule, now: u64) -> Vec<FlowSpecAction> {
         let key = key_of(&rule);
         if let Some(e) = self.active.get_mut(&key) {
             // Already active: upgrade to Manual + cancel any pending clear.
             e.origin = BlackholeOrigin::Manual;
             e.clear_requested_at = None;
+            // Same C4 blind spot as `insert_rule`: an operator re-asserting
+            // with a changed action (e.g. tightening the rate while also
+            // taking manual ownership) must re-announce, not silently keep
+            // the stale rate under the new Manual origin.
+            if e.rule.action != rule.action {
+                e.pending_prior = Some(e.rule.clone());
+                e.rule = rule.clone();
+                return vec![FlowSpecAction::Announce(rule)];
+            }
             return Vec::new();
         }
         let target = rule.dst.addr();
@@ -285,6 +321,32 @@ impl FlowSpecController {
             .any(|p| p.contains(&target))
     }
 
+    /// Whether `target`'s host route falls inside a configured protected
+    /// prefix (own anycast VIP or similar always-safe destination that must
+    /// never be mitigated).
+    ///
+    /// Pure accessor over [`FlowSpecConfig::protected_prefixes`]; mirrors
+    /// [`Self::is_eligible`] so a caller (e.g. the manager) can classify a
+    /// rejected `manual_add` without duplicating the controller's
+    /// self-protection logic.
+    #[must_use]
+    pub fn is_protected(&self, target: IpAddr) -> bool {
+        self.config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+    }
+
+    /// Number of targets skipped because they fell inside a configured
+    /// [`FlowSpecConfig::protected_prefixes`] entry (own anycast VIP or
+    /// similar always-safe destination) — the anycast self-protection guard
+    /// in [`Self::insert_rule`]. Surfaced for `/metrics`
+    /// (`blackwall_mitigations_protected_skipped_total{plane="flowspec"}`).
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.protected_skipped
+    }
+
     fn insert_rule(
         &mut self,
         target: IpAddr,
@@ -292,6 +354,20 @@ impl FlowSpecController {
         announced_at: u64,
         origin: BlackholeOrigin,
     ) -> Vec<FlowSpecAction> {
+        // Anycast self-protection (C1): a protected prefix (own VIP) must
+        // never have a FlowSpec rule installed against it, even when it also
+        // falls inside an eligible prefix — checked BEFORE eligibility, and
+        // decisive.
+        if self
+            .config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+        {
+            tracing::warn!(%target, "FlowSpec: target in a protected prefix; skipping (never mitigate own service)");
+            self.protected_skipped = self.protected_skipped.saturating_add(1);
+            return Vec::new();
+        }
         if !self.is_eligible(target) {
             tracing::warn!(%target, "FlowSpec: target outside eligible prefixes; ignoring");
             return Vec::new();
@@ -303,6 +379,18 @@ impl FlowSpecController {
             // TTL anchor so `tick` does not withdraw a flow under attack again.
             e.clear_requested_at = None;
             e.last_activity = announced_at;
+            // `FlowKey` excludes the traffic-rate action (C4), so a re-assert
+            // with a DIFFERENT action (e.g. tightening a rate-limit to a full
+            // drop mid-attack) must update the stored rule and re-announce —
+            // otherwise the stale rate lingers forever. BGP FlowSpec
+            // semantics: re-announcing the same NLRI with a new action
+            // updates the rule in place, so a single fresh `Announce`
+            // suffices (no explicit withdraw needed).
+            if e.rule.action != rule.action {
+                e.pending_prior = Some(e.rule.clone());
+                e.rule = rule.clone();
+                return vec![FlowSpecAction::Announce(rule)];
+            }
             return Vec::new();
         }
         if self.active.len() >= self.config.max_rules {
@@ -317,9 +405,50 @@ impl FlowSpecController {
                 last_activity: announced_at,
                 origin,
                 clear_requested_at: None,
+                pending_prior: None,
             },
         );
         vec![FlowSpecAction::Announce(rule)]
+    }
+
+    /// Undo an unconfirmed active-entry mutation after its BGP announce
+    /// failed (C2: commit-after-confirm; extended by C4 to updates-in-place).
+    ///
+    /// Emits nothing — the router never took the failed announce, so there
+    /// is nothing to withdraw. Must only be called immediately after a
+    /// [`FlowSpecAction::Announce`] was returned for `key` (by
+    /// [`Self::install`], [`Self::manual_add`], or [`Self::resume`]):
+    /// [`Self::insert_rule`] emits `Announce` only for a brand-new insert or
+    /// a re-assertion whose action changed (likewise
+    /// [`Self::manual_add`]'s upgrade branch) — an unchanged re-assertion, an
+    /// at-cap key, or an ineligible/protected target all return an empty
+    /// vector instead and never reach this call. So at the point of a failed
+    /// announce, `active[key]` is guaranteed to still be exactly the entry
+    /// this call is undoing — never a pre-existing rule or one touched by
+    /// anything else in between.
+    ///
+    /// Two cases, distinguished by [`ActiveEntry::pending_prior`]:
+    /// * Brand-new insert (`pending_prior` is `None`): the entry is removed
+    ///   outright — it never existed as far as the router is concerned.
+    /// * Update-in-place (`pending_prior` is `Some(prior)`, set by
+    ///   [`Self::insert_rule`]/[`Self::manual_add`] just before returning the
+    ///   `Announce` this call is undoing): the entry's rule is restored to
+    ///   `prior` rather than deleted — the router still holds `prior` since
+    ///   the new rule was never confirmed, and the target is still under
+    ///   attack. (The entry's `origin`, if flipped `Auto` -> `Manual` by a
+    ///   manual-add upgrade, is left as `Manual`: the operator's intent to
+    ///   own the rule stands independent of whether the accompanying rate
+    ///   change landed.)
+    ///
+    /// Mirrors [`crate::controller::RtbhController::rollback`].
+    pub fn rollback(&mut self, key: FlowKey) {
+        if let Some(e) = self.active.get_mut(&key) {
+            if let Some(prior) = e.pending_prior.take() {
+                e.rule = prior;
+                return;
+            }
+        }
+        self.active.remove(&key);
     }
 }
 
@@ -344,6 +473,7 @@ mod tests {
             max_rules: 3,
             hold_down: Duration::from_secs(10),
             max_ttl: None,
+            protected_prefixes: Vec::new(),
         }
     }
 
@@ -610,5 +740,126 @@ mod tests {
         let c = FlowSpecController::new(cfg());
         assert!(c.is_eligible(ip("203.0.113.7")));
         assert!(!c.is_eligible(ip("198.51.100.7")));
+    }
+
+    #[test]
+    fn protected_target_is_skipped_even_when_eligible() {
+        // 203.0.113.53 is inside the eligible /24 but is carved out as a
+        // protected VIP: it must never get a FlowSpec rule installed.
+        let mut c = FlowSpecController::new(FlowSpecConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.install(ip("203.0.113.53"), &[(17, 53, 1000.0)], 1_000);
+        assert!(actions.is_empty(), "protected VIP must not get a rule");
+        assert!(c.active_rules().is_empty());
+        assert_eq!(c.protected_skipped(), 1);
+    }
+
+    #[test]
+    fn unprotected_eligible_target_still_mitigates() {
+        let mut c = FlowSpecController::new(FlowSpecConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.install(ip("203.0.113.7"), &[(17, 53, 1000.0)], 1_000);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions.as_slice(), [FlowSpecAction::Announce(_)]));
+        assert_eq!(c.protected_skipped(), 0);
+    }
+
+    #[test]
+    fn tightening_flowspec_rate_mid_attack_re_announces() {
+        let mut c = FlowSpecController::new(cfg());
+        // install rate-limit
+        let a1 = c.install(ip("203.0.113.7"), &[(17, 53, 1000.0)], 1_000);
+        assert!(matches!(a1.as_slice(), [FlowSpecAction::Announce(_)]));
+        // same (dst,proto,port) but tighten to full drop (rate 0.0):
+        let a2 = c.install(ip("203.0.113.7"), &[(17, 53, 0.0)], 2_000);
+        let [FlowSpecAction::Announce(r)] = a2.as_slice() else {
+            panic!("changed action must re-announce, not no-op: {a2:?}");
+        };
+        assert_eq!(r.action, FlowAction::TrafficRate(0.0));
+        // identical re-assert stays a no-op:
+        let a3 = c.install(ip("203.0.113.7"), &[(17, 53, 0.0)], 3_000);
+        assert!(a3.is_empty());
+    }
+
+    #[test]
+    fn manual_add_upgrade_with_changed_action_re_announces() {
+        // A Manual re-assert that also tightens the rate must re-announce,
+        // not silently keep the stale rate under the new Manual origin.
+        let mut c = FlowSpecController::new(cfg());
+        assert_eq!(
+            c.install(ip("203.0.113.7"), &[(17, 53, 1000.0)], 0).len(),
+            1
+        ); // Auto
+        let actions = c.manual_add(rule("203.0.113.7/32", 17, 53, 0.0), 1_000);
+        let [FlowSpecAction::Announce(r)] = actions.as_slice() else {
+            panic!("changed action on manual upgrade must re-announce: {actions:?}");
+        };
+        assert_eq!(r.action, FlowAction::TrafficRate(0.0));
+        let snap = c.active_rules();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].2,
+            BlackholeOrigin::Manual,
+            "still upgraded to Manual"
+        );
+    }
+
+    #[test]
+    fn rollback_after_changed_action_restores_prior_rule_not_delete() {
+        // A re-assert that changes the action optimistically updates the
+        // stored rule before the caller confirms the BGP announce (mirrors
+        // the fresh-insert C2 pattern). If that announce then fails, the
+        // router still holds the OLD rule (it never saw the new one), so
+        // rollback must restore the prior rule rather than deleting the
+        // entry outright — deleting would forget an attack mitigation that
+        // is, in fact, still live on the router.
+        let mut c = FlowSpecController::new(cfg());
+        c.install(ip("203.0.113.7"), &[(17, 53, 1000.0)], 1_000);
+        let a2 = c.install(ip("203.0.113.7"), &[(17, 53, 0.0)], 2_000);
+        let [FlowSpecAction::Announce(r)] = a2.as_slice() else {
+            panic!("expected Announce: {a2:?}")
+        };
+        let key = key_of(r);
+
+        c.rollback(key); // simulates the tightened announce failing
+
+        // Past hold-down, the surviving entry must withdraw the PRIOR rule
+        // (rate 1000.0), proving it was restored rather than left as the
+        // failed 0.0 rule or dropped entirely.
+        let withdraw = c.clear_target(ip("203.0.113.7"), 20_000);
+        let [FlowSpecAction::Withdraw(w)] = withdraw.as_slice() else {
+            panic!("entry must survive rollback, not vanish: {withdraw:?}")
+        };
+        assert_eq!(w.action, FlowAction::TrafficRate(1000.0));
+    }
+
+    #[test]
+    fn manual_add_rollback_after_changed_action_restores_prior_rule() {
+        let mut c = FlowSpecController::new(cfg());
+        c.install(ip("203.0.113.7"), &[(17, 53, 1000.0)], 0); // Auto
+        let actions = c.manual_add(rule("203.0.113.7/32", 17, 53, 0.0), 1_000);
+        let [FlowSpecAction::Announce(r)] = actions.as_slice() else {
+            panic!("expected Announce: {actions:?}")
+        };
+        let key = key_of(r);
+
+        c.rollback(key); // simulates the tightened manual announce failing
+
+        // manual_remove looks up by (dst, protocol, dst_port) only, so any
+        // rate in the passed-in rule is irrelevant to the lookup; the
+        // returned Withdraw carries the actual stored rule.
+        let withdrawn = c.manual_remove(rule("203.0.113.7/32", 17, 53, 0.0));
+        let [FlowSpecAction::Withdraw(w)] = withdrawn.as_slice() else {
+            panic!("entry must survive rollback, not vanish: {withdrawn:?}")
+        };
+        assert_eq!(
+            w.action,
+            FlowAction::TrafficRate(1000.0),
+            "rollback must restore the prior rule, not the failed one"
+        );
     }
 }

@@ -15,7 +15,10 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+# `signal` is needed only by the `armed_disarm_interop` gate driver (C5: it
+# installs its own SIGUSR1 handler, mirroring blackwalld's disarm_signal_task)
+# — not by any unit test, so it stays scoped to dev-dependencies.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "signal"] }
 
 [lints]
 workspace = true

@@ -231,6 +231,38 @@ jobs:
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/flowspec-auto-bird.kdl lab-junit-flowspec-auto.xml
+      - name: "Run the lab gate (armed: protected skip + rate re-announce)"
+        # M1 arming interlocks C1/C4 against real BIRD2: a target inside a
+        # `protect`ed prefix never reaches BIRD's RIB while a normal target
+        # in the same prefix does, and a FlowSpec rule re-asserted with a
+        # changed rate re-announces the new action.
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/armed-protect-reannounce-bird.kdl lab-junit-armed-protect-reannounce.xml
+      - name: "Run the lab gate (armed: no-reset on un-negotiated SAFI)"
+        # M1 arming interlock C3 against real BIRD2: a peer that never
+        # negotiates the FlowSpec SAFI is skipped, not NOTIFICATION-reset.
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/armed-noneg-flowspec-bird.kdl lab-junit-armed-noneg-flowspec.xml
+      - name: "Run the lab gate (armed: SIGUSR1 disarm)"
+        # M1 arming interlock C5 against real BIRD2: SIGUSR1 withdraws every
+        # active mitigation from BIRD's RIB while the daemon keeps running.
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/armed-disarm-bird.kdl lab-junit-armed-disarm.xml
       - name: Run the lab gate (xdp AF_XDP redirect)
         # B3.1: end-to-end AF_XDP redirect on a veth pair (attach xdp_filter, bind
         # an AF_XDP socket into XSKS, inject a UDP frame, assert it lands on the
@@ -302,3 +334,6 @@ jobs:
             lab-junit-bird-gen.xml
             lab-junit-flowspec.xml
             lab-junit-flowspec-auto.xml
+            lab-junit-armed-protect-reannounce.xml
+            lab-junit-armed-noneg-flowspec.xml
+            lab-junit-armed-disarm.xml

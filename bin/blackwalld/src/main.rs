@@ -661,6 +661,7 @@ fn rtbh_config_from(
         max_blackholes: rtbh.max_blackholes,
         hold_down: rtbh.hold_down,
         max_ttl: rtbh.max_ttl,
+        protected_prefixes: policy.protected_prefixes.clone(),
     }
 }
 
@@ -677,6 +678,7 @@ fn flowspec_config_from(
         max_rules: fs.max_rules,
         hold_down: fs.hold_down,
         max_ttl: fs.max_ttl,
+        protected_prefixes: policy.protected_prefixes.clone(),
     }
 }
 
@@ -760,6 +762,46 @@ async fn wait_for_shutdown() {
     }
 }
 
+/// Listen for SIGUSR1 and fan a one-shot disarm command out to every
+/// RTBH/FlowSpec/XDP manager task via `disarm_tx` (C5: in-daemon kill
+/// switch).
+///
+/// Each manager task withdraws its own active mitigations and switches to
+/// record-only on receipt (see [`rtbh_manager_task`]/[`flowspec_manager_task`]/
+/// [`xdp_manager_task`]'s `disarm_rx` arm); this task only relays the signal
+/// and flips the shared `blackwall_armed` gauge to `0`. One-way: a second
+/// SIGUSR1 re-broadcasts, but every manager's own `disarm` is idempotent (a
+/// no-op once already disarmed), and there is no re-arm signal — only a
+/// restart clears it. Detached for the process's lifetime (mirrors
+/// [`bgp_supervisor`]); if the signal handler fails to install (rare — e.g.
+/// exhausted signalfd resources), this logs once and returns, leaving
+/// SIGTERM/SIGINT shutdown (handled separately by [`wait_for_shutdown`])
+/// unaffected.
+async fn disarm_signal_task(
+    disarm_tx: tokio::sync::broadcast::Sender<()>,
+    armed: std::sync::Arc<std::sync::atomic::AtomicU8>,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
+        tracing::warn!(
+            "failed to install SIGUSR1 handler; in-daemon disarm (C5) is unavailable this run"
+        );
+        return;
+    };
+    loop {
+        if usr1.recv().await.is_none() {
+            return;
+        }
+        tracing::warn!(
+            "WARN: DISARMED — SIGUSR1 received: withdrawing all mitigations, now recording only (one-way; restart to re-arm)"
+        );
+        armed.store(0, std::sync::atomic::Ordering::Relaxed);
+        // No receivers (e.g. no rtbh/flowspec/xdp block configured) is not
+        // an error — there is simply nothing to disarm.
+        let _ = disarm_tx.send(());
+    }
+}
+
 /// Observe the BGP session and log loudly when it leaves `Established` — a down
 /// session means auto-mitigations are not reaching the peer (issue #79). Purely
 /// observational; the session task drives reconnect itself. Exits when the
@@ -795,11 +837,22 @@ async fn rtbh_manager_task<B, J>(
     mut manager: blackwall_rtbh::RtbhManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
+    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
+    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
+    ratecapped_metrics: Arc<shadow::RatecappedMetrics>,
+    mut disarm_rx: tokio::sync::broadcast::Receiver<()>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
     J: blackwall_rtbh::manager::BlackholeJournal + Send + 'static,
 {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    // Once `disarm_tx` (held by `disarm_signal_task`) is gone — e.g. SIGUSR1
+    // registration failed at startup — `disarm_rx.recv()` would return
+    // `Err(Closed)` on every poll forever; without this guard that turns
+    // into a busy loop (the branch is always immediately ready). Once
+    // observed, the `if` precondition below permanently disables polling
+    // this branch, so the task falls back to `rx`/`ticker` only.
+    let mut disarm_open = true;
     loop {
         tokio::select! {
             maybe_ev = rx.recv() => {
@@ -811,10 +864,38 @@ async fn rtbh_manager_task<B, J>(
                     }
                 }
             }
+            disarmed = disarm_rx.recv(), if disarm_open => {
+                // C5: withdraw every active blackhole and switch to
+                // record-only. A `Lagged` delivery still means "disarm was
+                // requested" (the payload is `()`, nothing to miss), so it
+                // is treated the same as `Ok`.
+                match disarmed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        tracing::warn!("RTBH: DISARMED — mitigations withdrawn, now recording only");
+                        manager.disarm(mono_now()).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        disarm_open = false;
+                    }
+                }
+            }
             _ = ticker.tick() => {
                 // Mandatory: without this, a `Cleared` arriving before hold-down
                 // elapses is deferred and never completed.
                 manager.tick(mono_now(), wall_now()).await;
+
+                protected_metrics.rtbh.store(
+                    manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                apply_failure_metrics.store(
+                    manager.apply_failures(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ratecapped_metrics.rtbh.store(
+                    manager.ratecapped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 match request_store.pending_requests().await {
                     Ok(reqs) => {
@@ -869,7 +950,9 @@ async fn apply_request<B, J>(
             }
         },
         "remove" => {
-            manager.apply_remove(req.target, wall_now()).await;
+            manager
+                .apply_remove(req.target, mono_now(), wall_now())
+                .await;
             // Cancel any other still-pending add for the same target: the
             // operator's remove is the newer intent, so a pending add must
             // not later announce this target once capacity frees.
@@ -909,11 +992,17 @@ async fn flowspec_manager_task<B, J>(
     mut manager: blackwall_rtbh::FlowSpecManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::FlowMitigationEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
+    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
+    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
+    ratecapped_metrics: Arc<shadow::RatecappedMetrics>,
+    mut disarm_rx: tokio::sync::broadcast::Receiver<()>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
     J: blackwall_rtbh::flowspec_manager::FlowSpecJournal + Send + 'static,
 {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    // See the matching guard in `rtbh_manager_task` for why this exists.
+    let mut disarm_open = true;
     loop {
         tokio::select! {
             maybe_ev = rx.recv() => {
@@ -934,9 +1023,35 @@ async fn flowspec_manager_task<B, J>(
                     }
                 }
             }
+            disarmed = disarm_rx.recv(), if disarm_open => {
+                // C5: see the matching arm in `rtbh_manager_task` for why a
+                // `Lagged` delivery still counts as "disarm was requested".
+                match disarmed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        tracing::warn!("FlowSpec: DISARMED — mitigations withdrawn, now recording only");
+                        manager.disarm(mono_now()).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        disarm_open = false;
+                    }
+                }
+            }
             _ = ticker.tick() => {
                 // Mandatory: completes deferred clears / TTL expiry.
                 manager.tick(mono_now(), wall_now()).await;
+
+                protected_metrics.flowspec.store(
+                    manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                apply_failure_metrics.store(
+                    manager.apply_failures(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ratecapped_metrics.flowspec.store(
+                    manager.ratecapped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 match request_store.pending_flowspec_requests().await {
                     Ok(reqs) => {
@@ -997,7 +1112,7 @@ async fn apply_flowspec_request<B, J>(
             }
         },
         "remove" => {
-            manager.apply_remove(rule, wall_now()).await;
+            manager.apply_remove(rule, mono_now(), wall_now()).await;
             // The operator's remove is the newer intent: cancel any earlier
             // still-pending add for the same flow key.
             if let Err(err) = request_store
@@ -1095,10 +1210,15 @@ async fn xdp_manager_task<J>(
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
     request_store: std::sync::Arc<blackwall_state::Store>,
     auto_enabled: bool,
+    protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
+    apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
+    mut disarm_rx: tokio::sync::broadcast::Receiver<()>,
 ) where
     J: blackwall_xdp::XdpJournal + 'static,
 {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    // See the matching guard in `rtbh_manager_task` for why this exists.
+    let mut disarm_open = true;
     loop {
         tokio::select! {
             maybe_ev = rx.recv() => {
@@ -1114,9 +1234,31 @@ async fn xdp_manager_task<J>(
                     }
                 }
             }
+            disarmed = disarm_rx.recv(), if disarm_open => {
+                // C5: see the matching arm in `rtbh_manager_task` for why a
+                // `Lagged` delivery still counts as "disarm was requested".
+                match disarmed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        tracing::warn!("XDP: DISARMED — mitigations withdrawn, now recording only");
+                        manager.disarm(mono_now()).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        disarm_open = false;
+                    }
+                }
+            }
             _ = ticker.tick() => {
                 // Drains any journal mirror-writes queued by a transient DB blip.
                 manager.tick().await;
+
+                protected_metrics.xdp.store(
+                    manager.protected_skipped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                apply_failure_metrics.store(
+                    manager.apply_failures(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 match request_store.xdp_pending_requests().await {
                     Ok(reqs) => {
@@ -1410,6 +1552,52 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the metrics endpoint. Built unconditionally — harmless all-zero
             // counters when shadow mode is off.
             let shadow_metrics = std::sync::Arc::new(shadow::ShadowMetrics::default());
+            // Shared anycast self-protection (C1) skip counters: each manager
+            // task below copies its controller's `protected_skipped()` value
+            // in here on every tick, in BOTH shadow and live sessions (unlike
+            // `shadow_metrics`, this guard is not shadow-specific). Built
+            // unconditionally — harmless all-zero counters when RTBH/FlowSpec/
+            // XDP aren't configured.
+            let protected_skipped_metrics =
+                std::sync::Arc::new(shadow::ProtectedSkippedMetrics::default());
+            // RTBH announces that failed at the BGP executor and were rolled
+            // back (C2): copied from `RtbhManager::apply_failures` on every
+            // tick, mirroring `protected_skipped_metrics` above. Built
+            // unconditionally — harmless all-zero counter when no `rtbh`
+            // block is configured.
+            let rtbh_apply_failure_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // FlowSpec announces that failed at the BGP executor and were
+            // rolled back (C2): copied from `FlowSpecManager::apply_failures`
+            // on every tick, mirroring `rtbh_apply_failure_metrics` above.
+            // Built unconditionally — harmless all-zero counter when no
+            // `flowspec` block is configured.
+            let flowspec_apply_failure_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // XDP executor (eBPF-map) applies that failed and were rolled
+            // back (C2): copied from `XdpManager::apply_failures` on every
+            // tick, mirroring `rtbh_apply_failure_metrics` above. Built
+            // unconditionally — harmless all-zero counter when no `xdp`
+            // block is configured.
+            let xdp_apply_failure_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // C6 cross-plane new-mitigation rate cap skip counters: copied
+            // from `RtbhManager`/`FlowSpecManager::ratecapped` on every tick,
+            // mirroring `protected_skipped_metrics` above. Built
+            // unconditionally — harmless all-zero counters when no `rtbh`
+            // block is configured or `max-new-per-min` is unset.
+            let ratecapped_metrics = std::sync::Arc::new(shadow::RatecappedMetrics::default());
+            // In-daemon disarm kill switch (C5): `blackwall_armed` starts at
+            // 1 (live) or 0 (shadow) and is flipped to 0 exactly once, on a
+            // SIGUSR1 disarm — there is no path back to 1 short of a
+            // restart. `disarm_tx` is the broadcast sender the SIGUSR1
+            // listener (spawned below, once every manager task below has
+            // subscribed) uses to fan a single disarm command out to every
+            // RTBH/FlowSpec/XDP manager task; each subscribes via
+            // `disarm_tx.subscribe()` when it is spawned.
+            let blackwall_armed =
+                std::sync::Arc::new(std::sync::atomic::AtomicU8::new(u8::from(!policy.shadow)));
+            let (disarm_tx, _disarm_rx) = tokio::sync::broadcast::channel::<()>(8);
 
             let sink: std::sync::Arc<dyn blackwall_flow::MitigationSink> = match policy.rtbh.clone()
             {
@@ -1422,6 +1610,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
                     let channel_cap = rtbh.max_blackholes.max(1024);
                     let (tx, rx) = mpsc::channel::<blackwall_flow::DetectionEvent>(channel_cap);
+
+                    // C6 cross-plane rate cap on new mitigations: ONE limiter
+                    // built from the rtbh block's `max-new-per-min` knob,
+                    // shared between RTBH and FlowSpec below (FlowSpec reuses
+                    // this block). Only wired on the live path (`!policy.shadow`)
+                    // — under shadow nothing is really announced, so
+                    // rate-capping would only corrupt the would-mitigate
+                    // signal; `None` here (either shadow, or the knob absent)
+                    // means neither manager ever gets `.with_rate_limiter`
+                    // called, so both stay unlimited (non-breaking default).
+                    let rate_limiter: Option<
+                        std::sync::Arc<std::sync::Mutex<blackwall_rtbh::ArmingRateLimiter>>,
+                    > = if policy.shadow {
+                        None
+                    } else {
+                        rtbh.max_new_per_min.map(|n| {
+                            std::sync::Arc::new(std::sync::Mutex::new(
+                                blackwall_rtbh::ArmingRateLimiter::new(n),
+                            ))
+                        })
+                    };
 
                     // The live BGP handle, threaded to the FlowSpec
                     // construction below so its live branch reuses this same
@@ -1440,7 +1649,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         // No rehydrate: the shadow mirror is intentionally
                         // empty — nothing was ever really announced, so there
                         // is nothing to replay.
-                        tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+                        tokio::spawn(rtbh_manager_task(
+                            manager,
+                            rx,
+                            store.clone(),
+                            protected_skipped_metrics.clone(),
+                            rtbh_apply_failure_metrics.clone(),
+                            ratecapped_metrics.clone(),
+                            disarm_tx.subscribe(),
+                        ));
                         None
                     } else {
                         let peer = blackwall_bgp::PeerConfig {
@@ -1465,6 +1682,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let journal: blackwall_state::Store = (*store).clone();
                         let mut manager =
                             blackwall_rtbh::RtbhManager::new(controller, bgp.clone(), journal);
+                        if let Some(limiter) = &rate_limiter {
+                            manager = manager.with_rate_limiter(limiter.clone());
+                        }
 
                         // Rehydrate the controller from the announced mirror
                         // before this session starts accepting new
@@ -1483,7 +1703,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 .collect();
                         manager.rehydrate(rehydrate_rows, mono_now()).await;
 
-                        tokio::spawn(rtbh_manager_task(manager, rx, store.clone()));
+                        tokio::spawn(rtbh_manager_task(
+                            manager,
+                            rx,
+                            store.clone(),
+                            protected_skipped_metrics.clone(),
+                            rtbh_apply_failure_metrics.clone(),
+                            ratecapped_metrics.clone(),
+                            disarm_tx.subscribe(),
+                        ));
                         Some(bgp)
                     };
 
@@ -1530,6 +1758,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_manager,
                                         fs_rx,
                                         store.clone(),
+                                        protected_skipped_metrics.clone(),
+                                        flowspec_apply_failure_metrics.clone(),
+                                        ratecapped_metrics.clone(),
+                                        disarm_tx.subscribe(),
                                     ));
                                 }
                                 Some(bgp) => {
@@ -1539,6 +1771,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         bgp,
                                         fs_journal,
                                     );
+                                    // FlowSpec reuses the rtbh block's
+                                    // `max-new-per-min` knob: the SAME shared
+                                    // limiter as the RTBH manager above, so
+                                    // ONE cap governs the combined
+                                    // cross-plane announce rate (C6).
+                                    if let Some(limiter) = &rate_limiter {
+                                        fs_manager = fs_manager.with_rate_limiter(limiter.clone());
+                                    }
 
                                     // Rehydrate FlowSpec rules from the announced mirror.
                                     let fs_mirror = store.list_active_flowspec().await?;
@@ -1570,6 +1810,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fs_manager,
                                         fs_rx,
                                         store.clone(),
+                                        protected_skipped_metrics.clone(),
+                                        flowspec_apply_failure_metrics.clone(),
+                                        ratecapped_metrics.clone(),
+                                        disarm_tx.subscribe(),
                                     ));
                                 }
                             }
@@ -1724,6 +1968,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             policy.prefixes.clone(),
                             XDP_MAX_ENTRIES,
                             default_pps,
+                            policy.protected_prefixes.clone(),
                         );
                         let (xdp_tx, xdp_rx) =
                             mpsc::channel::<blackwall_flow::DetectionEvent>(4096);
@@ -1757,6 +2002,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 xdp_rx,
                                 store.clone(),
                                 auto_enabled,
+                                protected_skipped_metrics.clone(),
+                                xdp_apply_failure_metrics.clone(),
+                                disarm_tx.subscribe(),
                             ))
                         } else {
                             let executor = shadow::XdpExec::Live(dataplane.clone());
@@ -1781,6 +2029,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 xdp_rx,
                                 store.clone(),
                                 auto_enabled,
+                                protected_skipped_metrics.clone(),
+                                xdp_apply_failure_metrics.clone(),
+                                disarm_tx.subscribe(),
                             ))
                         };
                         xdp_shutdown = Some((handle, dataplane));
@@ -1795,6 +2046,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sink
             };
 
+            // C5: every RTBH/FlowSpec/XDP manager task above has now
+            // subscribed to `disarm_tx`, so it is safe to start listening
+            // for the operator's SIGUSR1 disarm signal.
+            tokio::spawn(disarm_signal_task(disarm_tx, blackwall_armed.clone()));
+
             // Optional Prometheus metrics endpoint.
             if let Some(metrics_listen) = policy.metrics_listen {
                 let sources = metrics::MetricsSources {
@@ -1807,6 +2063,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     afxdp_udp_responses: afxdp_udp_metric.clone(),
                     agent_stats: Some(agent_snapshot.clone()),
                     shadow: Some(shadow_metrics.clone()),
+                    protected_skipped: Some(protected_skipped_metrics.clone()),
+                    ratecapped: Some(ratecapped_metrics.clone()),
+                    rtbh_apply_failures: Some(rtbh_apply_failure_metrics.clone()),
+                    flowspec_apply_failures: Some(flowspec_apply_failure_metrics.clone()),
+                    xdp_apply_failures: Some(xdp_apply_failure_metrics.clone()),
+                    armed: Some(blackwall_armed.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -2060,6 +2322,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     afxdp_udp_responses: None,
                     agent_stats: None,
                     shadow: None,
+                    protected_skipped: None,
+                    ratecapped: None,
+                    rtbh_apply_failures: None,
+                    flowspec_apply_failures: None,
+                    xdp_apply_failures: None,
+                    armed: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }

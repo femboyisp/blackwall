@@ -1,0 +1,52 @@
+// Armed-mode gate (M1): a native BGP speaker running ARMED (no `shadow`)
+// against real BIRD2 proves two of the arming interlocks end to end:
+//   - C1 (anycast self-protection): a target inside a `protect`ed prefix is
+//     rejected by the manager before any BGP announce is attempted — it must
+//     never reach BIRD's RIB — while a normal eligible target in the SAME
+//     prefix DOES appear (the positive control that rules out "the whole
+//     session is broken").
+//   - C4 (rate re-announce): a FlowSpec rule re-asserted with a changed rate
+//     re-announces the new action rather than silently keeping the stale
+//     one. BIRD 2.17 renders the RFC 8955 §7.1 traffic-rate extended
+//     community as `(generic, 0x80060000, <IEEE-754 be-hex rate>)`; the
+//     1,000,000.0 bytes/sec f32 used here is `0x49742400` (confirmed live
+//     against BIRD 2.17.1 — `0.0` renders as `0x0`).
+//
+// Same RFC 8955 §6 "safe update" validation gotcha as flowspec-bird.kdl:
+// resolved by the driver announcing a covering 203.0.113.0/24 unicast route
+// first, so BIRD's validator finds a same-peer covering route for all three
+// FlowSpec targets (.7, .8, .9) below.
+topology "armed-protect-reannounce-bird" {
+    node "peer" {
+        daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes" flowspec="yes"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="target/debug/lab-tests/blackwall-rtbh-armed_protect_reannounce_interop --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "protected-skip-and-rate-reannounce" {
+    step wait   node="peer" until="bgp-established" timeout="20s"
+
+    // Positive control: the normal eligible target (.7) IS announced.
+    step assert node="peer" cmd="birdc show route table flow4tab" \
+         contains="dst 203.0.113.7/32; proto 17; dport 53" timeout="15s"
+
+    // C1: the protected target (.9) never reaches BIRD's RIB — apply_add
+    // returned Rejected before any BGP announce was attempted. `grep -c`
+    // over flow4tab counting zero matches is the "no route" assertion the
+    // matcher's contains/equals/exit vocabulary can express.
+    step assert node="peer" \
+         cmd="birdc show route table flow4tab | grep -c 203.0.113.9/32" \
+         equals="0" timeout="15s"
+
+    // C4: the re-asserted rule (.8) shows its NEW rate's extended community
+    // in BIRD's RIB, proving the re-announce actually happened.
+    step assert node="peer" cmd="birdc show route table flow4tab all" \
+         contains="dst 203.0.113.8/32; proto 17; dport 53" timeout="15s"
+    step assert node="peer" cmd="birdc show route table flow4tab all" \
+         contains="0x49742400" timeout="15s"
+}

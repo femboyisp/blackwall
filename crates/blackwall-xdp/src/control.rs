@@ -90,6 +90,13 @@ pub struct XdpController {
     prefixes: Vec<IpNet>,
     max_entries: usize,
     default_rate_pps: u64,
+    /// Prefixes whose victim traffic must never trigger auto-mitigation (own
+    /// anycast VIPs and similar always-safe destinations), from
+    /// `Policy.protected_prefixes`. Empty (the default) protects nothing
+    /// extra. Unrelated to `XdpDataplane::set_protected_prefixes`, which
+    /// guards the SYN-cookie fast path's protected *ports* — a different
+    /// subsystem.
+    protected_prefixes: Vec<IpNet>,
     /// All currently rate-limited sources, with the origin and effective
     /// rate/burst that installed them.
     rate_limited: HashMap<IpAddr, RateLimitEntry>,
@@ -98,6 +105,9 @@ pub struct XdpController {
     /// Victim target -> the (auto) sources currently rate-limited on its
     /// behalf, so a `Cleared` for that target knows which sources to release.
     by_target: HashMap<IpAddr, HashSet<IpAddr>>,
+    /// Count of detections skipped by the protected-prefix guard (see
+    /// [`Self::protected_skipped`]).
+    protected_skipped: u64,
 }
 
 impl XdpController {
@@ -111,15 +121,25 @@ impl XdpController {
     ///   and block entries (mirrors the fixed-size eBPF maps).
     /// * `default_rate_pps` - The packets/second cap (and burst size) applied
     ///   to sources rate-limited automatically from a detection.
+    /// * `protected_prefixes` - Own anycast VIPs (and similar) that must
+    ///   never trigger auto-mitigation even when the victim also falls
+    ///   inside `prefixes`; from `Policy.protected_prefixes`.
     #[must_use]
-    pub fn new(prefixes: Vec<IpNet>, max_entries: usize, default_rate_pps: u64) -> Self {
+    pub fn new(
+        prefixes: Vec<IpNet>,
+        max_entries: usize,
+        default_rate_pps: u64,
+        protected_prefixes: Vec<IpNet>,
+    ) -> Self {
         Self {
             prefixes,
             max_entries,
             default_rate_pps,
+            protected_prefixes,
             rate_limited: HashMap::new(),
             blocked_nets: HashMap::new(),
             by_target: HashMap::new(),
+            protected_skipped: 0,
         }
     }
 
@@ -264,6 +284,68 @@ impl XdpController {
         self.total_active() >= self.max_entries
     }
 
+    /// Whether `net` is currently blocked (manually or automatically).
+    ///
+    /// Lets a caller (e.g. the manager) check freshness *before* calling
+    /// [`Self::manual_block`], to decide whether a subsequent executor
+    /// failure should [`Self::rollback`] a brand-new insert or leave an
+    /// already-active entry untouched.
+    #[must_use]
+    pub fn is_blocked(&self, net: IpNet) -> bool {
+        self.blocked_nets.contains_key(&net)
+    }
+
+    /// Whether `src` is currently rate-limited (manually or automatically).
+    ///
+    /// See [`Self::is_blocked`] for why this is exposed.
+    #[must_use]
+    pub fn is_rate_limited(&self, src: IpAddr) -> bool {
+        self.rate_limited.contains_key(&src)
+    }
+
+    /// Undo a just-inserted active entry after its executor apply failed
+    /// (C2: commit-after-confirm).
+    ///
+    /// Removes the entry `action` describes from the active set and emits
+    /// nothing — the map write never took, so there is nothing to unwind on
+    /// the data-plane side. Only meaningful for [`XdpAction::RateLimit`] and
+    /// [`XdpAction::Block`] (the two "insert" variants); called on an
+    /// [`XdpAction::Unblock`] or [`XdpAction::ClearRate`] it is a no-op,
+    /// since those represent a removal that already happened in the
+    /// controller's bookkeeping regardless of the executor outcome.
+    ///
+    /// Callers must only invoke this for an `action` known to be a brand-new
+    /// insert (see [`Self::is_blocked`]/[`Self::is_rate_limited`]) — calling
+    /// it after a re-assertion or a param upgrade of an already-active entry
+    /// would incorrectly drop state that predates this call. Mirrors
+    /// `blackwall_rtbh::controller::RtbhController::rollback`.
+    pub fn rollback(&mut self, action: &XdpAction) {
+        match *action {
+            XdpAction::RateLimit { src, victim, .. } => {
+                self.rate_limited.remove(&src);
+                if let Some(victim) = victim {
+                    if let Some(sources) = self.by_target.get_mut(&victim) {
+                        sources.remove(&src);
+                    }
+                }
+            }
+            XdpAction::Block { net } => {
+                self.blocked_nets.remove(&net);
+            }
+            XdpAction::Unblock { .. } | XdpAction::ClearRate { .. } => {}
+        }
+    }
+
+    /// Number of detections skipped because the victim fell inside a
+    /// configured protected prefix (own anycast VIP or similar always-safe
+    /// destination) — the anycast self-protection guard in
+    /// [`Self::handle_detection`]. Surfaced for `/metrics`
+    /// (`blackwall_mitigations_protected_skipped_total{plane="xdp"}`).
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.protected_skipped
+    }
+
     /// Snapshot the active set (for reconcile mirroring and restart rehydration).
     #[must_use]
     pub fn active_entries(&self) -> Vec<(XdpAction, XdpOrigin)> {
@@ -332,6 +414,22 @@ impl XdpController {
     }
 
     fn handle_detection(&mut self, d: &Detection) -> Vec<XdpAction> {
+        // Anycast self-protection (C1): a protected victim (own VIP) must
+        // never trigger auto-mitigation, even when it also falls inside an
+        // own prefix — checked BEFORE the own-prefix eligibility check, and
+        // decisive.
+        if self
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&d.target))
+        {
+            tracing::warn!(
+                target = %d.target,
+                "XDP: victim in a protected prefix; skipping (never mitigate own service)"
+            );
+            self.protected_skipped = self.protected_skipped.saturating_add(1);
+            return Vec::new();
+        }
         if !self.prefixes.iter().any(|p| p.contains(&d.target)) {
             return Vec::new();
         }
@@ -431,7 +529,7 @@ mod tests {
 
     #[test]
     fn opened_on_own_victim_rate_limits_each_source() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let acts = c.on_detection(&DetectionEvent::Opened(det(
             "203.0.113.7",
             vec!["198.51.100.9", "198.51.100.10"],
@@ -444,7 +542,7 @@ mod tests {
 
     #[test]
     fn detection_on_foreign_victim_is_ignored() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let acts = c.on_detection(&DetectionEvent::Opened(det(
             "8.8.8.8",
             vec!["198.51.100.9"],
@@ -453,14 +551,40 @@ mod tests {
     }
 
     #[test]
+    fn protected_victim_is_skipped_even_when_own() {
+        // 203.0.113.53 is inside own address space but is carved out as a
+        // protected VIP: a detection against it must never rate-limit
+        // sources on its behalf.
+        let mut c = XdpController::new(own(), 100, 1000, vec!["203.0.113.53/32".parse().unwrap()]);
+        let acts = c.on_detection(&DetectionEvent::Opened(det(
+            "203.0.113.53",
+            vec!["198.51.100.9"],
+        )));
+        assert!(acts.is_empty(), "protected VIP must not trigger mitigation");
+        assert!(c.active_entries().is_empty());
+        assert_eq!(c.protected_skipped(), 1);
+    }
+
+    #[test]
+    fn unprotected_own_victim_still_mitigates() {
+        let mut c = XdpController::new(own(), 100, 1000, vec!["203.0.113.53/32".parse().unwrap()]);
+        let acts = c.on_detection(&DetectionEvent::Opened(det(
+            "203.0.113.7",
+            vec!["198.51.100.9"],
+        )));
+        assert_eq!(acts.len(), 1);
+        assert_eq!(c.protected_skipped(), 0);
+    }
+
+    #[test]
     fn manual_block_of_own_prefix_is_rejected() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         assert!(c.manual_block("203.0.113.5/32".parse().unwrap()).is_err());
     }
 
     #[test]
     fn cap_defers_beyond_max_entries() {
-        let mut c = XdpController::new(own(), 1, 1000);
+        let mut c = XdpController::new(own(), 1, 1000, Vec::new());
         let acts = c.on_detection(&DetectionEvent::Opened(det(
             "203.0.113.7",
             vec!["198.51.100.9", "198.51.100.10"],
@@ -470,7 +594,7 @@ mod tests {
 
     #[test]
     fn cleared_emits_clear_rate_for_each_recorded_source() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         c.on_detection(&DetectionEvent::Opened(det(
             "203.0.113.7",
             vec!["198.51.100.9", "198.51.100.10"],
@@ -488,7 +612,7 @@ mod tests {
 
     #[test]
     fn manual_rate_limit_survives_auto_clear() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         c.on_detection(&DetectionEvent::Opened(det(
             "203.0.113.7",
             vec!["198.51.100.9"],
@@ -505,14 +629,14 @@ mod tests {
 
     #[test]
     fn manual_block_at_capacity_is_rejected() {
-        let mut c = XdpController::new(own(), 1, 1000);
+        let mut c = XdpController::new(own(), 1, 1000, Vec::new());
         c.manual_block("198.51.100.0/24".parse().unwrap()).unwrap();
         assert!(c.manual_block("198.51.101.0/24".parse().unwrap()).is_err());
     }
 
     #[test]
     fn manual_unblock_is_idempotent() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let net = "198.51.100.0/24".parse().unwrap();
         c.manual_block(net).unwrap();
         assert!(c.manual_unblock(net).is_ok());
@@ -523,7 +647,7 @@ mod tests {
     #[test]
     fn shared_source_kept_until_last_victim_clears() {
         // Source X floods two of our own victims, A and B, simultaneously.
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         c.on_detection(&DetectionEvent::Opened(det(
             "203.0.113.7", // A
             vec!["198.51.100.9"],
@@ -562,13 +686,13 @@ mod tests {
     fn manual_block_of_supernet_covering_own_space_is_rejected() {
         // Own space is 203.0.113.0/24; a supernet block of 203.0.0.0/16 would
         // swallow it — the self-block guard must catch this direction too.
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         assert!(c.manual_block("203.0.0.0/16".parse().unwrap()).is_err());
     }
 
     #[test]
     fn manual_clear_rate_removes_source() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let addr: IpAddr = "198.51.100.9".parse().unwrap();
         c.manual_rate_limit(addr, 500, 500).unwrap();
         assert_eq!(c.active_entries().len(), 1);
@@ -583,7 +707,7 @@ mod tests {
 
     #[test]
     fn manual_clear_rate_is_idempotent_for_unknown_source() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let addr: IpAddr = "198.51.100.9".parse().unwrap();
         let act = c.manual_clear_rate(addr).unwrap();
         assert!(matches!(act, XdpAction::ClearRate { src } if src == addr));
@@ -595,7 +719,7 @@ mod tests {
         // Rate-limit a source via a detection (populates by_target), then
         // manually clear it. A later `Cleared` for that target must not
         // re-emit a ClearRate for the already-cleared source.
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         c.on_detection(&DetectionEvent::Opened(det(
             "203.0.113.7",
             vec!["198.51.100.9"],
@@ -616,7 +740,7 @@ mod tests {
 
     #[test]
     fn manual_rate_limit_preserved_in_active_entries() {
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let addr: IpAddr = "198.51.100.9".parse().unwrap();
         c.manual_rate_limit(addr, 500, 500).unwrap();
 
@@ -644,7 +768,7 @@ mod tests {
         // forever. With the fix, `mark_resumed` repopulates `by_target` from
         // the resumed action's `victim`, so `Cleared` emits `ClearRate` for
         // the source, exactly as it would have in the pre-restart session.
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let victim: IpAddr = "203.0.113.7".parse().unwrap();
         let src: IpAddr = "198.51.100.9".parse().unwrap();
 
@@ -680,7 +804,7 @@ mod tests {
         // A resumed manual rate-limit (no victim) must not create a
         // `by_target` entry: nothing should auto-clear it, since it was
         // never tied to a detection in the first place.
-        let mut c = XdpController::new(own(), 100, 1000);
+        let mut c = XdpController::new(own(), 100, 1000, Vec::new());
         let victim: IpAddr = "203.0.113.7".parse().unwrap();
         let src: IpAddr = "198.51.100.9".parse().unwrap();
 

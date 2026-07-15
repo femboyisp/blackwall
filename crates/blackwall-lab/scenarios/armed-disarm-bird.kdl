@@ -1,0 +1,48 @@
+// Armed-mode gate (M1), C5 (in-daemon SIGUSR1 disarm): with an RTBH
+// blackhole AND a FlowSpec rule both live in real BIRD's RIB, sending
+// SIGUSR1 to the running speaker process must withdraw both — proving
+// `RtbhManager::disarm`/`FlowSpecManager::disarm` (Task 9) end to end — while
+// the process itself keeps running (a crash on signal receipt would be its
+// own, worse failure: it would take every other in-flight mitigation with
+// it). The driver installs its own SIGUSR1 handler and calls the same
+// `disarm` methods `blackwalld`'s `disarm_signal_task`
+// (bin/blackwalld/src/main.rs) calls, standing in for the full daemon
+// without needing Postgres.
+topology "armed-disarm-bird" {
+    node "peer" {
+        daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes" flowspec="yes"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="target/debug/lab-tests/blackwall-rtbh-armed_disarm_interop --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "sigusr1-withdraws-all-and-keeps-running" {
+    step wait   node="peer" until="bgp-established" timeout="20s"
+
+    // Both mitigations must be live in BIRD's RIB before disarming.
+    step assert node="peer" cmd="birdc show route 203.0.113.20/32 all" \
+         contains="(65535,666)" timeout="15s"
+    step assert node="peer" cmd="birdc show route table flow4tab" \
+         contains="dst 203.0.113.21/32; proto 17; dport 53" timeout="15s"
+
+    // C5: signal the running driver process (it installed its own SIGUSR1
+    // handler and stands in for blackwalld here — see the topology comment).
+    step exec   node="speaker" cmd="pkill -USR1 -f blackwall-rtbh-armed_disarm_interop"
+
+    // The process must still be alive after the signal — a crash here would
+    // be a worse failure than a missed withdraw (it takes every other
+    // in-flight mitigation down with it).
+    step assert node="speaker" cmd="pgrep -f blackwall-rtbh-armed_disarm_interop" \
+         exit="0" timeout="5s"
+
+    // Both mitigations must now be withdrawn from BIRD's RIB.
+    step assert node="peer" \
+         cmd="birdc show route table flow4tab | grep -c 203.0.113.21/32" \
+         equals="0" timeout="15s"
+    step assert node="peer" cmd="birdc show route 203.0.113.20/32" \
+         contains="Network not found" timeout="15s"
+}

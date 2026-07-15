@@ -46,6 +46,10 @@ pub struct RtbhConfig {
     /// Maximum lifetime of an auto blackhole (hygiene backstop against a dropped
     /// or missed `Cleared`); `None` disables the TTL.
     pub max_ttl: Option<Duration>,
+    /// Prefixes that must never be blackholed (own anycast VIPs and similar
+    /// always-safe destinations), from `Policy.protected_prefixes`. Empty
+    /// (the default) protects nothing extra.
+    pub protected_prefixes: Vec<IpNet>,
 }
 
 /// A decision the [`RtbhController`] emits for the sink to execute.
@@ -69,6 +73,9 @@ pub enum RtbhAction {
 pub struct RtbhController {
     config: RtbhConfig,
     active: HashMap<IpAddr, ActiveEntry>,
+    /// Count of targets skipped by the protected-prefix guard (see
+    /// [`Self::protected_skipped`]).
+    protected_skipped: u64,
 }
 
 impl RtbhController {
@@ -78,6 +85,7 @@ impl RtbhController {
         Self {
             config,
             active: HashMap::new(),
+            protected_skipped: 0,
         }
     }
 
@@ -212,6 +220,22 @@ impl RtbhController {
             .any(|p| p.contains(&target))
     }
 
+    /// Whether `target` falls inside a configured protected prefix (own
+    /// anycast VIP or similar always-safe destination that must never be
+    /// mitigated).
+    ///
+    /// Pure accessor over [`RtbhConfig::protected_prefixes`]; mirrors
+    /// [`Self::is_eligible`] so a caller (e.g. the manager) can classify a
+    /// rejected `manual_add` without duplicating the controller's
+    /// self-protection logic.
+    #[must_use]
+    pub fn is_protected(&self, target: IpAddr) -> bool {
+        self.config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+    }
+
     /// Whether a next-hop is configured for `target`'s address family.
     ///
     /// Pure accessor over [`RtbhConfig::next_hop_v4`] / `next_hop_v6`; lets a
@@ -223,6 +247,16 @@ impl RtbhController {
             IpAddr::V4(_) => self.config.next_hop_v4.is_some(),
             IpAddr::V6(_) => self.config.next_hop_v6.is_some(),
         }
+    }
+
+    /// Number of targets skipped because they fell inside a configured
+    /// [`RtbhConfig::protected_prefixes`] entry (own anycast VIP or similar
+    /// always-safe destination) — the anycast self-protection guard in
+    /// [`Self::insert_blackhole`]. Surfaced for `/metrics`
+    /// (`blackwall_mitigations_protected_skipped_total{plane="rtbh"}`).
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.protected_skipped
     }
 
     fn request_clear(&mut self, target: IpAddr, now: u64) -> Vec<RtbhAction> {
@@ -252,6 +286,19 @@ impl RtbhController {
         announced_at: u64,
         origin: BlackholeOrigin,
     ) -> Vec<RtbhAction> {
+        // Anycast self-protection (C1): a protected prefix (own VIP) must
+        // never be blackholed, even when it also falls inside an eligible
+        // prefix — checked BEFORE eligibility, and decisive.
+        if self
+            .config
+            .protected_prefixes
+            .iter()
+            .any(|p| p.contains(&target))
+        {
+            tracing::warn!(%target, "RTBH: target in a protected prefix; skipping (never mitigate own service)");
+            self.protected_skipped = self.protected_skipped.saturating_add(1);
+            return Vec::new();
+        }
         if !self
             .config
             .eligible_prefixes
@@ -287,6 +334,25 @@ impl RtbhController {
             },
         );
         vec![RtbhAction::Announce(route)]
+    }
+
+    /// Undo a just-inserted active entry after its BGP announce failed (C2:
+    /// commit-after-confirm).
+    ///
+    /// Removes `target` from the active set and emits nothing — the router
+    /// never took the route, so there is nothing to withdraw. Must only be
+    /// called immediately after an [`RtbhAction::Announce`] was returned for
+    /// `target` (by [`Self::on_event`], [`Self::manual_add`], or
+    /// [`Self::resume`]): [`Self::insert_blackhole`] emits `Announce` only
+    /// when it performs a brand-new insert — a re-assertion, an
+    /// Auto-to-Manual upgrade, an at-cap target, or an ineligible/protected
+    /// target all return an empty vector instead and never reach this call.
+    /// So at the point of a failed announce, `active[target]` is guaranteed
+    /// to still be exactly the entry this call is undoing — never a
+    /// pre-existing `Manual` blackhole or one touched by anything else in
+    /// between.
+    pub fn rollback(&mut self, target: IpAddr) {
+        self.active.remove(&target);
     }
 
     fn host_route(&self, target: IpAddr) -> Option<Route> {
@@ -330,6 +396,7 @@ mod tests {
             max_blackholes: 2,
             hold_down: Duration::from_secs(10),
             max_ttl: None,
+            protected_prefixes: Vec::new(),
         }
     }
 
@@ -626,6 +693,31 @@ mod tests {
         // counts against the cap
         assert_eq!(c.manual_add(ip("203.0.113.6"), 0).len(), 1);
         assert!(c.manual_add(ip("203.0.113.7"), 0).is_empty(), "at cap");
+    }
+
+    #[test]
+    fn protected_target_is_skipped_even_when_eligible() {
+        // 203.0.113.53 is inside the eligible /24 but is carved out as a
+        // protected VIP: it must never be blackholed.
+        let mut c = RtbhController::new(RtbhConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.on_event(&DetectionEvent::Opened(det("203.0.113.53")), 1_000);
+        assert!(actions.is_empty(), "protected VIP must not be blackholed");
+        assert!(c.active_blackholes().is_empty());
+        assert_eq!(c.protected_skipped(), 1);
+    }
+
+    #[test]
+    fn unprotected_eligible_target_still_mitigates() {
+        let mut c = RtbhController::new(RtbhConfig {
+            protected_prefixes: vec![net("203.0.113.53/32")],
+            ..cfg()
+        });
+        let actions = c.on_event(&DetectionEvent::Opened(det("203.0.113.7")), 1_000);
+        assert!(matches!(actions.as_slice(), [RtbhAction::Announce(_)]));
+        assert_eq!(c.protected_skipped(), 0);
     }
 
     #[test]

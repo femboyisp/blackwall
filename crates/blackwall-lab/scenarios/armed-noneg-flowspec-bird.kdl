@@ -1,0 +1,39 @@
+// Armed-mode gate (M1), C3 (capability-gated announce, no-reset): a peer
+// BIRD2 configured WITHOUT the flow4/flow6 channels never negotiates SAFI
+// 133 in its OPEN, so blackwall's `announce_allowed` gate (blackwall-bgp
+// commit b2bae52) must skip the FlowSpec announce instead of writing an
+// UPDATE for an unnegotiated SAFI — which some peers (and BIRD, confirmed
+// live) NOTIFICATION-reset the session over, dropping every other active
+// mitigation. This reuses the same `flowspec_interop` driver as
+// flowspec-bird.kdl (it always attempts both a covering unicast route and a
+// FlowSpec announce); the only difference is this peer's `daemon "bird"` has
+// no `flowspec="yes"`, so it never advertises the SAFI to negotiate.
+topology "armed-noneg-flowspec-bird" {
+    node "peer" {
+        // Deliberately no `flowspec="yes"`: this peer never negotiates SAFI
+        // 133, so the driver's FlowSpec announce below must be skipped, not
+        // sent — proving the C3 gate rather than the codec/session path
+        // flowspec-bird.kdl already covers.
+        daemon "bird" local-as="214806" neighbor-node="speaker" neighbor-as="214806" import="all" passive="yes"
+    }
+    node "speaker" {
+        run "speaker" \
+            cmd="target/debug/lab-tests/blackwall-bgp-flowspec_interop --ignored --nocapture" \
+            env="BW_BGP_PEER={peer.addr}:179"
+    }
+    link "peer" "speaker" subnet="10.0.0.0/30"
+}
+
+scenario "flowspec-skipped-session-survives" {
+    step wait   node="peer" until="bgp-established" timeout="20s"
+
+    // The covering unicast route is ordinary IPv4 unicast (always
+    // negotiated) and is unaffected by C3 — it must still land normally.
+    step assert node="peer" cmd="birdc show route 203.0.113.0/24" \
+         contains="203.0.113.0/24" timeout="15s"
+
+    // C3: no NOTIFICATION-reset from the (skipped) FlowSpec announce
+    // attempt — the session must still be Established.
+    step assert node="peer" cmd="birdc show protocols peer_speaker" \
+         contains="Established" timeout="15s"
+}

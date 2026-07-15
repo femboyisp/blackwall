@@ -15,10 +15,12 @@
 use crate::controller::BlackholeOrigin;
 use crate::flowspec_controller::{key_of, FlowKey, FlowSpecAction, FlowSpecController};
 use crate::manager::{ApplyOutcome, BgpExecutor, JournalError};
+use crate::rate_limit::ArmingRateLimiter;
 use async_trait::async_trait;
 use blackwall_bgp::FlowSpecRule;
 use blackwall_flow::FlowRule;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
 /// Mirrors FlowSpec rule state into persistent storage.
 ///
@@ -67,18 +69,48 @@ impl MirrorOp {
     }
 }
 
+/// Outcome of [`FlowSpecManager::execute_and_journal_announce`].
+///
+/// Mirrors [`crate::manager`]'s private `AnnounceOutcome`. The auto path
+/// (`apply_open`/`tick`, via [`FlowSpecManager::execute_and_journal`])
+/// ignores this — auto re-detection naturally compensates for a skip on its
+/// next tick. [`FlowSpecManager::apply_add`] (the manual path) consumes it
+/// to report a truthful [`ApplyOutcome`] rather than always claiming
+/// [`ApplyOutcome::Applied`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceOutcome {
+    /// The announce reached BGP; a journal-mirror failure afterward is still
+    /// `Applied` (self-healed via [`FlowSpecManager::retry_pending_mirror`])
+    /// — the live rule is active either way.
+    Applied,
+    /// Skipped: the shared cross-plane [`ArmingRateLimiter`] (C6) was at
+    /// capacity. The controller entry was rolled back.
+    RateCapped,
+    /// Skipped: the manager is [`FlowSpecManager::disarm`]ed (C5),
+    /// record-only. The controller entry was rolled back.
+    Disarmed,
+    /// Attempted and failed at the [`BgpExecutor`] (C2). The controller
+    /// entry was rolled back.
+    Failed,
+}
+
 /// Single-owner FlowSpec manager.
 ///
 /// Owns the pure [`FlowSpecController`] plus the I/O boundary: it executes the
 /// controller's decisions on a [`BgpExecutor`] and mirrors auto/manual rule
-/// state via a [`FlowSpecJournal`]. A BGP failure is logged and the action is
-/// not journaled — but note this is a known limitation, not a retry
-/// mechanism: on a failed first announce the controller entry is kept in
-/// memory while the rule itself is never re-announced automatically. A
-/// journal failure after a successful BGP operation is logged, never causes a
-/// live rule to be withdrawn, and is queued as a `MirrorOp` for a bounded
-/// self-heal retry on the next [`FlowSpecManager::tick`] — the BGP outcome is
-/// never re-issued, only the mirror write.
+/// state via a [`FlowSpecJournal`]. A BGP announce failure is logged, the
+/// action is not journaled, and the controller's freshly-inserted active
+/// entry is rolled back via [`FlowSpecController::rollback`] (C2:
+/// commit-after-confirm) — the control plane never believes an unconfirmed
+/// announce succeeded, so a future detection for the same rule is not deduped
+/// against a phantom entry. There is no retry queue for this: while the
+/// underlying attack persists, the detector naturally re-emits the detection
+/// on its next tick and the manager re-attempts through the same path. This
+/// differs from a *journal* failure after a successful BGP operation, which
+/// is logged, never causes a live rule to be withdrawn, and is queued as a
+/// `MirrorOp` for a bounded self-heal retry on the next
+/// [`FlowSpecManager::tick`] — the BGP outcome is never re-issued, only the
+/// mirror write.
 pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     controller: FlowSpecController,
     bgp: B,
@@ -87,6 +119,32 @@ pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     /// succeeded; retried (never re-issued to BGP) by
     /// `FlowSpecManager::retry_pending_mirror` on the next tick.
     pending_mirror: Vec<MirrorOp>,
+    /// Count of announces that failed at the BGP executor, each rolled back
+    /// (see [`Self::apply_failures`]).
+    apply_failures: u64,
+    /// Cross-plane cap (C6) on the arrival rate of NEW mitigations, shared
+    /// with the sibling `RtbhManager` via the same `Arc<Mutex<_>>` so ONE
+    /// limiter governs the combined RTBH+FlowSpec announce rate. `None` (the
+    /// default from [`Self::new`]) is unlimited — `main.rs` only attaches
+    /// `Some` via [`Self::with_rate_limiter`] on the live path (never under
+    /// shadow, where nothing is really announced).
+    rate_limiter: Option<Arc<Mutex<ArmingRateLimiter>>>,
+    /// Count of announces skipped because [`Self::rate_limiter`] was at
+    /// capacity (C6) — a SKIP (never attempted), distinct from
+    /// [`Self::apply_failures`] (attempted and failed at BGP). See
+    /// [`Self::ratecapped`].
+    ratecapped: u64,
+    /// One-way in-daemon disarm kill switch (C5), flipped by [`Self::disarm`].
+    /// While set, [`Self::execute_and_journal_announce`] skips every new
+    /// `Announce` (never reaches [`Self::bgp`]) while detection + selection
+    /// keep running unchanged. There is no re-arm entry point; a fresh
+    /// process (restart) is the only way back to armed. Mirrors
+    /// [`crate::manager::RtbhManager::disarmed`].
+    disarmed: bool,
+    /// Count of announces skipped because [`Self::disarmed`] was set (C5) —
+    /// a SKIP (never attempted), distinct from both [`Self::apply_failures`]
+    /// and [`Self::ratecapped`]. See [`Self::disarmed_skips`].
+    disarmed_skips: u64,
 }
 
 impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
@@ -97,7 +155,25 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             bgp,
             journal,
             pending_mirror: Vec::new(),
+            apply_failures: 0,
+            rate_limiter: None,
+            ratecapped: 0,
+            disarmed: false,
+            disarmed_skips: 0,
         }
+    }
+
+    /// Attach a shared cross-plane rate cap (C6) on new mitigations.
+    ///
+    /// Non-breaking: absent (the default from [`Self::new`]) is unlimited.
+    /// `main.rs` wires `Some` only on the live path (`!policy.shadow`) — the
+    /// shadow-mode construction never calls this, so shadow sessions are
+    /// always unlimited (rate-capping a mitigation that is never really
+    /// announced would only corrupt the would-mitigate signal).
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Arc<Mutex<ArmingRateLimiter>>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
     }
 
     /// Install the flow-scoped rules selected for `target` (from a
@@ -123,7 +199,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             .collect();
         let actions = self.controller.install(target, &tuples, mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -134,7 +210,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     pub async fn apply_clear(&mut self, target: IpAddr, mono_now: u64, wall_now: u64) {
         let actions = self.controller.clear_target(target, mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -163,7 +239,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         self.retry_pending_mirror().await;
         let actions = self.controller.tick(mono_now);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -172,8 +248,9 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     /// Returns [`ApplyOutcome::Applied`] if newly installed or upgraded from
     /// `Auto` to `Manual` (re-journaled as `Manual` in the latter case),
     /// [`ApplyOutcome::Deferred`] if the manager is at capacity, or
-    /// [`ApplyOutcome::Rejected`] if the target is ineligible. Unlike RTBH,
-    /// FlowSpec carries no next-hop, so there is no next-hop rejection case.
+    /// [`ApplyOutcome::Rejected`] if the target is protected or ineligible.
+    /// Unlike RTBH, FlowSpec carries no next-hop, so there is no next-hop
+    /// rejection case.
     pub async fn apply_add(
         &mut self,
         rule: FlowSpecRule,
@@ -184,9 +261,22 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         let target = rule.dst.addr();
         let actions = self.controller.manual_add(rule.clone(), mono_now);
         if let Some(FlowSpecAction::Announce(r)) = actions.into_iter().next() {
-            self.execute_and_journal_announce(r, BlackholeOrigin::Manual, wall_now)
+            let outcome = self
+                .execute_and_journal_announce(r, BlackholeOrigin::Manual, mono_now, wall_now)
                 .await;
-            return ApplyOutcome::Applied;
+            return match outcome {
+                AnnounceOutcome::Applied => ApplyOutcome::Applied,
+                // The window will have room again; the request row stays
+                // `pending` and is retried next tick.
+                AnnounceOutcome::RateCapped => ApplyOutcome::Deferred,
+                // One-way: retrying is pointless until re-armed via restart.
+                AnnounceOutcome::Disarmed => ApplyOutcome::Rejected(format!(
+                    "{target} was not announced: manager is disarmed (C5)"
+                )),
+                // No auto re-detection exists for a manual request, so a
+                // failed BGP announce must be retried, not marked applied.
+                AnnounceOutcome::Failed => ApplyOutcome::Deferred,
+            };
         }
         // Empty result: either already active (upgrade), at cap, or rejected.
         if self.is_active(key) {
@@ -205,6 +295,15 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             }
             return ApplyOutcome::Applied;
         }
+        // Checked before eligibility: a protected target is typically ALSO
+        // eligible (that's the point — protected VIPs live inside eligible
+        // prefixes), so it must be rejected outright here rather than falling
+        // through to Deferred, which would retry forever and never resolve.
+        if self.controller.is_protected(target) {
+            return ApplyOutcome::Rejected(format!(
+                "{target} is inside a protected prefix and is never mitigated"
+            ));
+        }
         if !self.controller.is_eligible(target) {
             return ApplyOutcome::Rejected(format!("{target} is outside eligible prefixes"));
         }
@@ -212,10 +311,16 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     }
 
     /// Manually withdraw a rule (bypasses hold-down).
-    pub async fn apply_remove(&mut self, rule: FlowSpecRule, wall_now: u64) {
+    ///
+    /// `mono_now` is accepted for symmetry with the other entry points that
+    /// funnel through [`Self::execute_and_journal`] (it is unused here: a
+    /// manual removal only ever produces a `Withdraw`, never an `Announce`,
+    /// so the shared rate limiter — which only gates `Announce` — is never
+    /// consulted on this path).
+    pub async fn apply_remove(&mut self, rule: FlowSpecRule, mono_now: u64, wall_now: u64) {
         let actions = self.controller.manual_remove(rule);
         for action in actions {
-            self.execute_and_journal(action, wall_now).await;
+            self.execute_and_journal(action, mono_now, wall_now).await;
         }
     }
 
@@ -256,6 +361,90 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         self.controller.active_rules()
     }
 
+    /// Number of targets skipped by the controller's protected-prefix guard
+    /// (own anycast VIPs never mitigated). Surfaced for `/metrics`; see
+    /// [`crate::manager::RtbhManager::protected_skipped`] for the analogous
+    /// RTBH accessor.
+    #[must_use]
+    pub fn protected_skipped(&self) -> u64 {
+        self.controller.protected_skipped()
+    }
+
+    /// Count of announces that failed at the [`BgpExecutor`] (C2). Each
+    /// failure rolls back the controller's freshly-inserted active entry
+    /// (see [`FlowSpecController::rollback`]) so the control plane never
+    /// believes an unconfirmed announce is active. Surfaced for `/metrics`
+    /// as `blackwall_flowspec_apply_failures_total`, mirroring
+    /// [`crate::manager::RtbhManager::apply_failures`].
+    #[must_use]
+    pub fn apply_failures(&self) -> u64 {
+        self.apply_failures
+    }
+
+    /// Count of announces skipped because the shared cross-plane
+    /// [`ArmingRateLimiter`] (C6) was at capacity. Each skip rolls back the
+    /// controller's freshly-inserted active entry (never left as a phantom
+    /// active rule) and is distinct from [`Self::apply_failures`] — a
+    /// rate-cap skip was never attempted at all. Surfaced for `/metrics` as
+    /// `blackwall_mitigations_ratecapped_total{plane="flowspec"}`.
+    #[must_use]
+    pub fn ratecapped(&self) -> u64 {
+        self.ratecapped
+    }
+
+    /// In-daemon disarm kill switch (C5): withdraw every currently-active
+    /// rule and switch to record-only for the rest of this process's life.
+    ///
+    /// Mirrors [`crate::manager::RtbhManager::disarm`]: each active rule is
+    /// withdrawn on BGP best-effort (a withdraw `Err` is logged and the
+    /// sweep continues), no journal write happens (disarm is runtime-only —
+    /// a restart re-arms and [`Self::rehydrate`]s the same active set), and
+    /// once disarmed every subsequent `Announce` is skipped in
+    /// [`Self::execute_and_journal_announce`] and counted in
+    /// [`Self::disarmed_skips`]. One-way and idempotent.
+    ///
+    /// `mono_now` is accepted for symmetry with the other entry points that
+    /// funnel through the execute path; it is unused here.
+    pub async fn disarm(&mut self, _mono_now: u64) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        let keys: Vec<FlowKey> = self
+            .controller
+            .active_rules()
+            .into_iter()
+            .map(|(key, ..)| key)
+            .collect();
+        for key in keys {
+            // The action on this synthetic rule is never read: `manual_remove`
+            // looks the entry up by `(dst, protocol, dst_port)` only (see
+            // `key_of`) and withdraws the *stored* rule, action included.
+            let placeholder = FlowSpecRule {
+                dst: key.0,
+                protocol: Some(key.1),
+                dst_port: Some(key.2),
+                action: blackwall_bgp::FlowAction::TrafficRate(0.0),
+            };
+            for action in self.controller.manual_remove(placeholder) {
+                if let FlowSpecAction::Withdraw(rule) = action {
+                    if let Err(e) = self.bgp.withdraw_flowspec(rule).await {
+                        tracing::warn!(?key, error = %e, "FlowSpec: disarm withdraw failed; continuing best-effort");
+                    }
+                }
+            }
+        }
+        tracing::warn!("FlowSpec: DISARMED — mitigations withdrawn, now recording only");
+    }
+
+    /// Count of new-mitigation announces skipped because the manager was
+    /// [`Self::disarm`]ed (C5) — a SKIP (never attempted), distinct from
+    /// both [`Self::apply_failures`] and [`Self::ratecapped`].
+    #[must_use]
+    pub fn disarmed_skips(&self) -> u64 {
+        self.disarmed_skips
+    }
+
     fn is_active(&self, key: FlowKey) -> bool {
         self.controller
             .active_rules()
@@ -276,10 +465,10 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     }
 
     /// Execute one controller action on BGP and mirror it into the journal.
-    async fn execute_and_journal(&mut self, action: FlowSpecAction, wall_now: u64) {
+    async fn execute_and_journal(&mut self, action: FlowSpecAction, mono_now: u64, wall_now: u64) {
         match action {
             FlowSpecAction::Announce(rule) => {
-                self.execute_and_journal_announce(rule, BlackholeOrigin::Auto, wall_now)
+                self.execute_and_journal_announce(rule, BlackholeOrigin::Auto, mono_now, wall_now)
                     .await;
             }
             FlowSpecAction::Withdraw(rule) => {
@@ -299,16 +488,49 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         }
     }
 
+    /// Execute one NEW-mitigation `Announce` on BGP and mirror it into the
+    /// journal.
+    ///
+    /// First consults the shared [`ArmingRateLimiter`] (C6), if attached: a
+    /// rejection rolls back the controller's freshly-inserted active entry
+    /// (same "commit-after-confirm" discipline as a BGP failure, see the
+    /// module docs) and counts against [`Self::ratecapped`] — never
+    /// [`Self::apply_failures`], since the announce was never attempted, not
+    /// attempted-and-failed. Only reached for `Announce` actions.
     async fn execute_and_journal_announce(
         &mut self,
         rule: FlowSpecRule,
         origin: BlackholeOrigin,
+        mono_now: u64,
         wall_now: u64,
-    ) {
+    ) -> AnnounceOutcome {
         let key = key_of(&rule);
+        if self.disarmed {
+            tracing::warn!(
+                ?key,
+                "FlowSpec: disarmed (C5); skipping announce, recording only"
+            );
+            self.controller.rollback(key);
+            self.disarmed_skips = self.disarmed_skips.saturating_add(1);
+            return AnnounceOutcome::Disarmed;
+        }
+        if let Some(limiter) = &self.rate_limiter {
+            let allowed = limiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_acquire(mono_now);
+            if !allowed {
+                tracing::warn!(?key, "FlowSpec: cross-plane new-mitigation rate cap exceeded (C6); skipping announce, not activating");
+                self.controller.rollback(key);
+                self.ratecapped = self.ratecapped.saturating_add(1);
+                return AnnounceOutcome::RateCapped;
+            }
+        }
         if let Err(e) = self.bgp.announce_flowspec(rule.clone()).await {
-            tracing::warn!(?key, error = %e, "FlowSpec: BGP announce failed; not journaling");
-            return;
+            tracing::warn!(?key, error = %e, "FlowSpec: BGP announce failed; rolling back active entry, not journaling");
+            self.controller.rollback(key);
+            self.apply_failures = self.apply_failures.saturating_add(1);
+            return AnnounceOutcome::Failed;
         }
         if let Err(e) = self
             .journal
@@ -322,6 +544,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
                 at_ms: wall_now,
             });
         }
+        AnnounceOutcome::Applied
     }
 
     /// Drain-retry queued mirror writes left over from a transient journal
@@ -476,6 +699,7 @@ mod tests {
             max_rules: 2,
             hold_down: Duration::from_secs(10),
             max_ttl: None,
+            protected_prefixes: Vec::new(),
         }
     }
     fn ip(s: &str) -> IpAddr {
@@ -649,6 +873,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_announce_does_not_leave_a_phantom_active_entry() {
+        // BGP fails: the router never took the rule, so the control plane
+        // must NOT believe it did (C2) — the freshly-inserted active entry
+        // must be rolled back, not left as a phantom "active" rule.
+        let mut m = mgr(true, false); // BGP fails
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key),
+            "a failed announce must not leave a phantom active entry"
+        );
+        assert_eq!(m.apply_failures(), 1);
+
+        // A subsequent identical detection re-attempts (not deduped against
+        // a phantom active entry) — no retry queue, just the natural
+        // re-detection on the next tick.
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            2_000,
+            2_000,
+        )
+        .await;
+        assert_eq!(m.apply_failures(), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_announce_activates_and_journals_no_apply_failures() {
+        let mut m = mgr(false, false);
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key));
+        assert_eq!(m.apply_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn rate_capped_announce_is_skipped_not_activated_and_not_an_apply_failure() {
+        // C6: mirrors `manager::tests::rate_capped_announce_is_skipped_...`
+        // for the FlowSpec side of the SAME shared limiter type.
+        let mut m =
+            mgr(false, false).with_rate_limiter(Arc::new(Mutex::new(ArmingRateLimiter::new(1))));
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key1 = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key1), "first announce is admitted");
+
+        m.apply_open(
+            ip("203.0.113.8"),
+            &[flow_rule("203.0.113.8", 17, 53, 0.0)],
+            1_500,
+            1_500,
+        )
+        .await;
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key2),
+            "rate-capped announce must not leave a phantom active entry"
+        );
+        assert_eq!(
+            m.bgp().announced.lock().unwrap().len(),
+            1,
+            "the rate-capped announce must never reach BGP"
+        );
+        assert_eq!(m.ratecapped(), 1);
+        assert_eq!(
+            m.apply_failures(),
+            0,
+            "a rate-cap skip is not an apply_failure (never attempted)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_rate_limiter_attached_is_unlimited() {
+        // Non-breaking: a manager with no limiter attached (the default from
+        // `new`) behaves exactly as before this feature existed.
+        let mut m = mgr(false, false);
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[
+                flow_rule("203.0.113.7", 17, 53, 0.0),
+                flow_rule("203.0.113.7", 6, 80, 0.0),
+            ],
+            0,
+            0,
+        )
+        .await;
+        assert_eq!(
+            m.bgp().announced.lock().unwrap().len(),
+            2,
+            "still bounded by max_rules=2 in cfg(), not by any rate cap"
+        );
+        assert_eq!(m.ratecapped(), 0);
+    }
+
+    #[tokio::test]
     async fn tick_drains_pending_mirror_once_journal_recovers() {
         let mut m = mgr_transient_journal_failures(1);
         m.apply_open(
@@ -699,7 +1035,7 @@ mod tests {
             m.journal().announced.lock().unwrap()[0].1,
             BlackholeOrigin::Manual
         );
-        m.apply_remove(r, 1000).await;
+        m.apply_remove(r, 1000, 1000).await;
         assert!(m.active().is_empty());
         assert_eq!(m.journal().withdrawn.lock().unwrap().len(), 1);
     }
@@ -741,6 +1077,41 @@ mod tests {
         assert_eq!(
             m.apply_add(rule("203.0.113.1/32", 6, 443, 0.0), 0, 0).await,
             ApplyOutcome::Deferred
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_add_protected_target_is_rejected_not_deferred() {
+        // Target sits inside BOTH an eligible prefix and a protected prefix —
+        // exactly the overlap the protected-prefix guard exists for (an
+        // anycast VIP inside a customer-eligible block). A manual add must be
+        // classified as Rejected, not Deferred: a Deferred outcome leaves the
+        // request row 'pending' forever, retried every tick, indistinguishable
+        // from a transient capacity wait that will never resolve (C1 follow-up).
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(FlowSpecConfig {
+                protected_prefixes: vec!["203.0.113.53/32".parse().unwrap()],
+                ..cfg()
+            }),
+            FakeBgp::default(),
+            FakeJournal::default(),
+        );
+        let outcome = m
+            .apply_add(rule("203.0.113.53/32", 17, 53, 0.0), 0, 0)
+            .await;
+        match &outcome {
+            ApplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("protected"),
+                    "reason should mention 'protected': {reason}"
+                );
+            }
+            other => panic!("protected target must be Rejected, not {other:?}"),
+        }
+        assert!(m.active().is_empty());
+        assert!(
+            m.bgp().announced.lock().unwrap().is_empty(),
+            "no Announce may be executed for a protected target"
         );
     }
 
@@ -789,7 +1160,7 @@ mod tests {
             1000,
         )
         .await;
-        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000)
+        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000, 2000)
             .await;
         m.apply_open(
             ip("203.0.113.7"),
@@ -806,6 +1177,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disarm_withdraws_all_and_switches_to_record_only() {
+        let mut m = mgr(false, false);
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key));
+
+        m.disarm(2_000).await;
+
+        assert_eq!(
+            m.bgp().withdrawn.lock().unwrap().len(),
+            1,
+            "disarm must withdraw every active rule"
+        );
+        assert!(!m.is_active(key), "disarm must clear the active set");
+
+        // A subsequent detection is recorded, not executed.
+        m.apply_open(
+            ip("203.0.113.8"),
+            &[flow_rule("203.0.113.8", 17, 53, 0.0)],
+            3_000,
+            3_000,
+        )
+        .await;
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(!m.is_active(key2));
+        assert_eq!(m.bgp().announced.lock().unwrap().len(), 1);
+        assert_eq!(m.apply_failures(), 0);
+        assert_eq!(m.ratecapped(), 0);
+        assert_eq!(m.disarmed_skips(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_add_while_disarmed_is_rejected_not_applied() {
+        // C5 + final-review fix: a manual add while disarmed must be
+        // classified Rejected (retrying is pointless — there is no re-arm
+        // entry point), never Applied — an "applied" operator-request row
+        // is never retried, which would silently lose operator intent.
+        let mut m = mgr(false, false);
+        m.disarm(0).await;
+
+        let outcome = m
+            .apply_add(rule("203.0.113.7/32", 17, 53, 0.0), 1_000, 1_000)
+            .await;
+        match &outcome {
+            ApplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("disarmed"),
+                    "reason should mention 'disarmed': {reason}"
+                );
+            }
+            other => panic!("disarmed manual add must be Rejected, not {other:?}"),
+        }
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key),
+            "a disarmed manual add must not leave a phantom active entry"
+        );
+        assert!(m.bgp().announced.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_add_while_rate_capped_is_deferred_not_applied() {
+        // C6 + final-review fix: a manual add rejected by the shared rate
+        // limiter must be classified Deferred (the request row stays
+        // `pending` and is retried next tick, once the window has room),
+        // never Applied.
+        let mut m =
+            mgr(false, false).with_rate_limiter(Arc::new(Mutex::new(ArmingRateLimiter::new(1))));
+        // Exhaust the limiter's one slot for this window via an auto path.
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key1 = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key1));
+
+        let outcome = m
+            .apply_add(rule("203.0.113.8/32", 17, 53, 0.0), 1_500, 1_500)
+            .await;
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Deferred,
+            "a rate-capped manual add must be Deferred, not Applied"
+        );
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key2),
+            "a rate-capped manual add must not leave a phantom active entry"
+        );
+        assert_eq!(m.ratecapped(), 1);
+    }
+
+    #[tokio::test]
     async fn queued_announce_then_withdraw_for_same_key_coalesces_to_withdraw() {
         let mut m = mgr_transient_journal_failures(2);
         m.apply_open(
@@ -817,7 +1290,7 @@ mod tests {
         .await;
         assert_eq!(m.pending_mirror_len(), 1);
 
-        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000)
+        m.apply_remove(rule("203.0.113.7/32", 17, 53, 0.0), 2000, 2000)
             .await;
         assert_eq!(
             m.pending_mirror_len(),

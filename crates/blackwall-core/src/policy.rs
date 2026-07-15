@@ -77,4 +77,8 @@ pub struct Policy {
     /// Shadow mode: log + record + meter mitigations (RTBH/FlowSpec/XDP)
     /// without applying them. `false` (the default) is live.
     pub shadow: bool,
+    /// Prefixes Blackwall must never mitigate against (own anycast VIPs and
+    /// similar always-safe destinations), set via the repeatable `protect`
+    /// directive. Empty (the default) protects nothing extra.
+    pub protected_prefixes: Vec<IpNet>,
 }

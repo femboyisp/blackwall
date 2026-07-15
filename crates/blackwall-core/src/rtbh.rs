@@ -40,6 +40,14 @@ pub struct RtbhPolicy {
     /// source and emitted as BIRD's `neighbor`. `None` = OS-chosen source (no
     /// generated BIRD session possible). Its family should match `peer_addr`.
     pub local_addr: Option<std::net::IpAddr>,
+    /// Cross-plane cap (C6) on how many NEW mitigations (BGP announces) may
+    /// be armed per rolling 60s window, shared between RTBH and FlowSpec
+    /// (FlowSpec reuses this block) — a safety ceiling on the *arrival rate*
+    /// of mitigations, distinct from `max_blackholes`/`FlowSpecPolicy::max_rules`
+    /// which only bound the steady-state active-set size. `None` (the
+    /// default; absent `max-new-per-min` key) is unlimited — today's
+    /// behavior.
+    pub max_new_per_min: Option<u32>,
 }
 
 #[cfg(test)]
@@ -61,6 +69,7 @@ mod tests {
             md5: Some(crate::Md5Secret::new("pw".into())),
             gtsm_hops: Some(1),
             local_addr: Some("10.222.255.2".parse().unwrap()),
+            max_new_per_min: Some(60),
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: RtbhPolicy = serde_json::from_str(&json).unwrap();

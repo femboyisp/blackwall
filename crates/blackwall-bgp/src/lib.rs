@@ -19,5 +19,6 @@ pub use render::{render_bird_ibgp, BirdGenError};
 pub use route::{Origin, Route};
 pub use session_net::{
     spawn, BgpHandle, BgpSendError, PeerConfig, PeerConfigError, SessionCommand, SessionState,
+    UnnegotiatedSkipCounts,
 };
 pub use update::{build_announce, build_withdraw};

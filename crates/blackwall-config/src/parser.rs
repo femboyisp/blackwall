@@ -29,6 +29,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut stateless_tcp_ports: Vec<u16> = Vec::new();
     let mut pops: Vec<PopEntry> = Vec::new();
     let mut shadow = false;
+    let mut protected_prefixes: Vec<ipnet::IpNet> = Vec::new();
 
     let mut i = 0;
     while i < lines.len() {
@@ -42,6 +43,10 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
             "ipv4" | "ipv6" => {
                 expect_len(line, 2, "<family> <cidr>")?;
                 prefixes.push(parse_cidr(line, &line.words[1])?);
+            }
+            "protect" => {
+                expect_len(line, 2, "protect <cidr>")?;
+                protected_prefixes.push(parse_cidr(line, &line.words[1])?);
             }
             "default" => {
                 expect_len(line, 2, "default deception|drop")?;
@@ -222,6 +227,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                             | "md5"
                             | "gtsm-hops"
                             | "local-addr"
+                            | "max-new-per-min"
                     ) {
                         return Err(ConfigError::BadValue {
                             line: line.number,
@@ -321,6 +327,16 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     }
                     None => None,
                 };
+                // C6: cross-plane rate cap on new mitigations. Absent =>
+                // `None` => unlimited (today's behavior, non-breaking).
+                // `0` is accepted (rejects every new announce) rather than
+                // treated as "unset" — an operator may deliberately want to
+                // freeze new arming while still allowing existing
+                // blackholes/rules and withdraws to proceed.
+                let max_new_per_min: Option<u32> = match kv.get("max-new-per-min") {
+                    Some(v) => Some(v.parse().map_err(|_| bad("rtbh max-new-per-min", v))?),
+                    None => None,
+                };
                 rtbh = Some(RtbhPolicy {
                     local_asn,
                     peer_asn,
@@ -340,6 +356,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         .get("local-addr")
                         .map(|v| v.parse().map_err(|_| bad("local-addr", v)))
                         .transpose()?,
+                    max_new_per_min,
                 });
             }
             "flowspec" => {
@@ -833,6 +850,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         xdp,
         stateless_tcp_ports,
         shadow,
+        protected_prefixes,
     })
 }
 
@@ -1634,6 +1652,34 @@ tenant t {
     }
 
     #[test]
+    fn rtbh_max_new_per_min_defaults_none_unlimited() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s\n",
+        ).unwrap();
+        assert_eq!(
+            p.rtbh.unwrap().max_new_per_min,
+            None,
+            "absent max-new-per-min must be unlimited (non-breaking)"
+        );
+    }
+
+    #[test]
+    fn rtbh_parses_max_new_per_min() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s max-new-per-min=30\n",
+        ).unwrap();
+        assert_eq!(p.rtbh.unwrap().max_new_per_min, Some(30));
+    }
+
+    #[test]
+    fn rtbh_rejects_bad_max_new_per_min() {
+        let err = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s max-new-per-min=notanumber\n",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
     fn rtbh_rejects_bad_local_addr() {
         let err = parse_text(
             "interface wan eth0\nipv4 203.0.113.0/24\nrtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 next-hop-v4=192.0.2.1 max=8 hold-down=60s local-addr=notanip\n",
@@ -2260,5 +2306,24 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
         };
         assert!(e.to_string().contains("line 7"));
         assert!(e.to_string().contains("xyz"));
+    }
+
+    #[test]
+    fn parses_protect_prefixes() {
+        let p = parse_text(
+            "interface wan eth0\nipv4 203.0.113.0/24\nprotect 203.0.113.53/32\nprotect 2001:db8::53/128\n",
+        ).unwrap();
+        assert_eq!(
+            p.protected_prefixes,
+            vec![
+                "203.0.113.53/32".parse::<ipnet::IpNet>().unwrap(),
+                "2001:db8::53/128".parse::<ipnet::IpNet>().unwrap(),
+            ]
+        );
+    }
+    #[test]
+    fn protect_defaults_empty() {
+        let p = parse_text("interface wan eth0\nipv4 203.0.113.0/24\n").unwrap();
+        assert!(p.protected_prefixes.is_empty());
     }
 }

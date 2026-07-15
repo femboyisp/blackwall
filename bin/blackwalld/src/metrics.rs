@@ -36,6 +36,37 @@ pub(crate) struct MetricsSources {
     /// Shadow-mode "would mitigate" counters (RTBH/FlowSpec/XDP); `None`
     /// outside the flow daemon (no RTBH/FlowSpec/XDP managers to shadow).
     pub shadow: Option<Arc<crate::shadow::ShadowMetrics>>,
+    /// Per-plane anycast self-protection skip counters (C1); `None` outside
+    /// the flow daemon (no RTBH/FlowSpec/XDP managers to guard). Unlike
+    /// `shadow`, populated in both shadow AND live sessions.
+    pub protected_skipped: Option<Arc<crate::shadow::ProtectedSkippedMetrics>>,
+    /// RTBH announces that failed at the BGP executor and were rolled back
+    /// (C2, `RtbhManager::apply_failures`); `None` when no `rtbh` block is
+    /// configured. Copied from the manager once per tick, mirroring how
+    /// `protected_skipped` reaches this endpoint.
+    pub rtbh_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// FlowSpec announces that failed at the BGP executor and were rolled
+    /// back (C2, `FlowSpecManager::apply_failures`); `None` when no
+    /// `flowspec` block is configured. Copied from the manager once per
+    /// tick, mirroring `rtbh_apply_failures`.
+    pub flowspec_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// XDP executor (eBPF-map) applies that failed and were rolled back (C2,
+    /// `blackwall_xdp::manager::XdpManager::apply_failures`); `None` when no
+    /// `xdp` block is configured. Copied from the manager once per tick,
+    /// mirroring `rtbh_apply_failures`.
+    pub xdp_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Per-plane cross-plane new-mitigation rate cap (C6) skip counters
+    /// (`RtbhManager`/`FlowSpecManager::ratecapped`); `None` outside the flow
+    /// daemon (no managers to cap). Populated (all-zero) even when no `rtbh`
+    /// block is configured or `max-new-per-min` is unset (unlimited), mirroring
+    /// `protected_skipped`.
+    pub ratecapped: Option<Arc<crate::shadow::RatecappedMetrics>>,
+    /// Whether mitigations are actually being applied: `1` live, `0` under
+    /// `shadow` or after an in-daemon disarm (C5, SIGUSR1) — flipped to `0`
+    /// exactly once, at process start (shadow) or on disarm; there is no
+    /// path back to `1` short of a restart. `None` outside the flow daemon
+    /// (no RTBH/FlowSpec/XDP managers to arm).
+    pub armed: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -113,6 +144,39 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             help: "AF_XDP UDP responder replies sent (reflection-safe, B3.2)",
             kind: MetricKind::Counter,
             value: u64_to_f64(afxdp_udp.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+
+    if let Some(rtbh_apply_failures) = &sources.rtbh_apply_failures {
+        m.push(Metric {
+            name: "blackwall_rtbh_apply_failures_total",
+            help: "RTBH announces that failed at the BGP executor and were rolled back (C2)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(rtbh_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(flowspec_apply_failures) = &sources.flowspec_apply_failures {
+        m.push(Metric {
+            name: "blackwall_flowspec_apply_failures_total",
+            help: "FlowSpec announces that failed at the BGP executor and were rolled back (C2)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(flowspec_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(xdp_apply_failures) = &sources.xdp_apply_failures {
+        m.push(Metric {
+            name: "blackwall_xdp_apply_failures_total",
+            help: "XDP executor (eBPF-map) applies that failed and were rolled back (C2)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(xdp_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(armed) = &sources.armed {
+        m.push(Metric {
+            name: "blackwall_armed",
+            help: "Whether mitigations are actually applied: 1 live, 0 shadow or disarmed (C5)",
+            kind: MetricKind::Gauge,
+            value: f64::from(armed.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
 
@@ -428,6 +492,93 @@ fn shadow_block(sources: &MetricsSources) -> Option<String> {
     Some(out)
 }
 
+/// Render `blackwall_mitigations_protected_skipped_total{plane}` from the
+/// shared per-plane counters, or `None` when they aren't wired up (outside
+/// the flow daemon). Labels are a fixed, known-at-compile-time set, but still
+/// hand-written since [`Metric`] only carries unlabelled series — mirrors
+/// [`shadow_block`].
+fn protected_skipped_block(sources: &MetricsSources) -> Option<String> {
+    use std::sync::atomic::Ordering;
+
+    let counters = sources.protected_skipped.as_ref()?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_mitigations_protected_skipped_total Targets skipped because they fell inside a configured protected prefix (own VIP), by plane"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_mitigations_protected_skipped_total counter"
+    );
+    for (plane, counter) in [
+        ("rtbh", &counters.rtbh),
+        ("flowspec", &counters.flowspec),
+        ("xdp", &counters.xdp),
+    ] {
+        let _ = writeln!(
+            out,
+            "blackwall_mitigations_protected_skipped_total{{plane=\"{plane}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        );
+    }
+    Some(out)
+}
+
+/// Render `blackwall_mitigations_ratecapped_total{plane}` (C6 cross-plane
+/// new-mitigation rate cap) from the shared per-plane counters, or `None`
+/// when they aren't wired up (outside the flow daemon) — mirrors
+/// [`protected_skipped_block`].
+fn ratecapped_block(sources: &MetricsSources) -> Option<String> {
+    use std::sync::atomic::Ordering;
+
+    let counters = sources.ratecapped.as_ref()?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_mitigations_ratecapped_total New-mitigation announces skipped because the shared cross-plane rate cap (C6, max-new-per-min) was at capacity, by plane"
+    );
+    let _ = writeln!(out, "# TYPE blackwall_mitigations_ratecapped_total counter");
+    for (plane, counter) in [("rtbh", &counters.rtbh), ("flowspec", &counters.flowspec)] {
+        let _ = writeln!(
+            out,
+            "blackwall_mitigations_ratecapped_total{{plane=\"{plane}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        );
+    }
+    Some(out)
+}
+
+/// Render `blackwall_bgp_unnegotiated_announce_skipped_total{safi}` (C3, C3
+/// follow-up) from the live `BgpHandle`, or `None` when no `rtbh`/`flowspec`
+/// block is configured (no BGP session to report — mirrors `sources.bgp`
+/// used by [`gather`]'s session-state/reconnect metrics). Labels are a fixed,
+/// known-at-compile-time set, but still hand-written since [`Metric`] only
+/// carries unlabelled series — mirrors [`shadow_block`]/[`protected_skipped_block`].
+fn unnegotiated_announce_skipped_block(sources: &MetricsSources) -> Option<String> {
+    let bgp = sources.bgp.as_ref()?;
+    let counts = bgp.unnegotiated_skip_counts();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blackwall_bgp_unnegotiated_announce_skipped_total FlowSpec/IPv6 announces or withdraws skipped because the peer never negotiated that SAFI in its OPEN (C3, C3 follow-up)"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE blackwall_bgp_unnegotiated_announce_skipped_total counter"
+    );
+    for (safi, count) in [
+        ("flowspec_v4", counts.flowspec_v4),
+        ("flowspec_v6", counts.flowspec_v6),
+        ("ipv6_unicast", counts.ipv6_unicast),
+    ] {
+        let _ = writeln!(
+            out,
+            "blackwall_bgp_unnegotiated_announce_skipped_total{{safi=\"{safi}\"}} {count}"
+        );
+    }
+    Some(out)
+}
+
 /// Serve `/metrics` forever. Each connection is handled on its own task so a
 /// slow client cannot block scrapes; a bind failure disables the endpoint (and
 /// is logged) without taking down the daemon.
@@ -480,6 +631,24 @@ async fn handle_conn(mut sock: tokio::net::TcpStream, sources: &MetricsSources) 
                 body.push('\n');
             }
             body.push_str(&shadow);
+        }
+        if let Some(protected) = protected_skipped_block(sources) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&protected);
+        }
+        if let Some(ratecapped) = ratecapped_block(sources) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&ratecapped);
+        }
+        if let Some(unnegotiated) = unnegotiated_announce_skipped_block(sources) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&unnegotiated);
         }
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
