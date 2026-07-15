@@ -288,14 +288,16 @@ const MAX_TCP_SEG: usize = 64;
 /// seconds-since-boot the cookie core slots (`>> COUNTER_SHIFT`) internally.
 const NS_PER_SEC: u64 = 1_000_000_000;
 
-/// Fixed burst cap for the global per-CPU [`TX_BUDGET`] token bucket
-/// (sub-project X3). Unlike [`RateBucket`], [`TxBucket`] carries no per-instance
-/// `burst` field (see its doc comment), so the cap is this compile-time
-/// constant: a round number comfortably above any sane sustained per-CPU
-/// SYN-ACK burst, so a correctly configured `rate_pps` is never truncated by
-/// this ceiling -- it only guards against `tokens` growing without bound
-/// between refills (e.g. after a long idle period).
-const TX_BUDGET_BURST: u64 = 1_000_000;
+/// Absolute overflow guard on the burst ceiling `tx_budget_ok` derives from
+/// [`TxBucket::rate_pps`] (sub-project X3 follow-up). Unlike [`RateBucket`],
+/// [`TxBucket`] carries no per-instance `burst` field (see its doc comment),
+/// so `tx_budget_ok` computes the actual burst as `min(2 x rate_pps,
+/// TX_BUDGET_BURST_MAX)` -- a small multiple of the configured rate, so a
+/// tight `rate_pps` yields a correspondingly tight burst instead of always
+/// refilling to this constant regardless of how small `rate_pps` is. This
+/// constant only bounds the *huge-rate_pps* case (and any idle-period
+/// wraparound) from growing `tokens` without limit.
+const TX_BUDGET_BURST_MAX: u64 = 1_000_000;
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
@@ -592,9 +594,12 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
 /// Mint the stateless SipHash SYN-cookie for the packet's IPv6 connection tuple,
 /// reading the (pre-swap) tuple straight from the packet at the v6 header
-/// offsets. Returns `(cookie_seq, mss_used)`, or `Err(())` when the cookie key
-/// is absent (never installed) — the caller **must** invoke this before any
-/// packet mutation so that a bail leaves the frame untouched.
+/// offsets, given the already-read cookie secret `(k0, k1)` — the caller
+/// **must** invoke this before any packet mutation so that a bail leaves the
+/// frame untouched. The key is now a parameter rather than being re-read here
+/// (sub-project X3 follow-up): [`try_synack_v6`] reads it first, before
+/// [`tx_budget_ok`], so a SYN with no cookie key installed never consumes
+/// global mint budget (mirrors [`try_synack_v4`]'s order).
 ///
 /// `#[inline(never)]`: this is deliberately its own bpf-to-bpf subprogram, so
 /// the SipHash scratch buffer (bigger for v6's 16-byte addresses) and the call
@@ -606,10 +611,10 @@ fn try_filter(ctx: &XdpContext) -> Result<u32, ()> {
 /// it. The v4 path keeps its cookie inline because its 4-byte-address scratch is
 /// small enough to fit self-contained.
 #[inline(never)]
-fn compute_cookie_v6(ctx: &XdpContext) -> Result<(u32, u16), ()> {
-    // Read the secret from the userspace-populated map. Absent => bail so the
-    // caller falls through to `XDP_PASS`; never mint under a zero/garbage key.
-    let (k0, k1) = cookie_keys()?;
+fn compute_cookie_v6(ctx: &XdpContext, k0: u64, k1: u64) -> Result<(u32, u16), ()> {
+    // `(k0, k1)` was already read (and validated present) by the caller,
+    // before the global `tx_budget_ok` check -- see this function's doc
+    // comment.
     // Cookie time base: real monotonic seconds-since-boot (`CLOCK_MONOTONIC`);
     // `make_cookie_raw` slots it with `>> COUNTER_SHIFT` internally. The
     // userspace responder validates the returning ACK against the same clock.
@@ -902,11 +907,20 @@ fn try_synack_v6(ctx: &XdpContext) -> Result<u32, ()> {
     let client_seq = load_be32(ctx, OFF_TCP6_SEQ)?;
     let ack = client_seq.wrapping_add(1);
 
-    // X3: the global per-CPU mint budget, checked immediately before minting
-    // (mirrors `try_synack_v4`) — a SYN that cleared every other gate
-    // (protected prefix+port, per-source `over_rate`) but exceeds the box's
-    // aggregate budget falls through instead of paying for the SipHash cookie
-    // that `compute_cookie_v6` would otherwise compute.
+    // Read the secret from the userspace-populated map **before** the X3
+    // budget check below (sub-project X3 follow-up, matching `try_synack_v4`'s
+    // order): absent => bail to `XDP_PASS` without ever touching `TX_BUDGET`,
+    // so a SYN with no cookie key installed is attributed to the correct
+    // fall-through reason instead of misleadingly consuming (and being
+    // counted against) the global mint budget.
+    let (k0, k1) = cookie_keys()?;
+
+    // X3: the global per-CPU mint budget, checked immediately before the
+    // (comparatively expensive) SipHash cookie computation -- a SYN that
+    // cleared every other gate (protected prefix+port, per-source
+    // `over_rate`, a valid cookie key) but exceeds the box's aggregate budget
+    // falls through instead of paying for the cookie that `compute_cookie_v6`
+    // would otherwise compute.
     // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
     let now_ns = unsafe { bpf_ktime_get_ns() };
     if !tx_budget_ok(now_ns) {
@@ -915,10 +929,9 @@ fn try_synack_v6(ctx: &XdpContext) -> Result<u32, ()> {
         return Err(());
     }
 
-    // Compute the stateless SYN-cookie **before** any mutation (bails to `Err` —
-    // hence `XDP_PASS`, frame untouched — if the cookie key is absent), over the
+    // Compute the stateless SYN-cookie **before** any mutation, over the
     // 16-byte v6 addresses read from the packet.
-    let (cookie_seq, mss) = compute_cookie_v6(ctx)?;
+    let (cookie_seq, mss) = compute_cookie_v6(ctx, k0, k1)?;
 
     // --- in-place, same-length SYN -> SYN-ACK surgery ---
     // Reflect the frame: swap MACs, IPv6 addresses, TCP ports. Data offset kept
@@ -1191,9 +1204,18 @@ fn over_rate(src: [u8; 16]) -> bool {
 /// the cap has never been configured by userspace and this always returns
 /// `true` -- see [`TxBucket`]'s doc comment. Once `rate_pps` is nonzero, the
 /// refill/decrement mirrors [`over_rate`] exactly: 64-bit-only math
-/// (`wrapping_mul` then `.min(TX_BUDGET_BURST)`; `saturating_mul`/
-/// `overflowing_mul` would emit an unsupported 128-bit `__multi3` on this
-/// target), so wraparound at absurd elapsed values cannot over-credit tokens.
+/// (`wrapping_mul` then `.min(burst)`; `saturating_mul`/`overflowing_mul`
+/// would emit an unsupported 128-bit `__multi3` on this target), so
+/// wraparound at absurd elapsed values cannot over-credit tokens.
+///
+/// The burst ceiling itself is `min(2 x rate_pps, TX_BUDGET_BURST_MAX)` --
+/// scaled to the configured rate rather than a fixed constant, so a
+/// conservative `rate_pps` (e.g. `1_000`) gets a correspondingly tight burst
+/// (`2_000`), not [`TX_BUDGET_BURST_MAX`] regardless of `rate_pps`. Without
+/// this, any idle window longer than `burst / rate_pps` seconds -- including
+/// the very first call after arming, since `last_ns` is seeded `0` -- would
+/// refill to the full fixed ceiling no matter how small `rate_pps` is,
+/// defeating the cap's purpose as a hard reflection ceiling.
 ///
 /// Per-CPU (see [`TX_BUDGET`]'s doc comment): `get_ptr_mut` returns a pointer
 /// to *this* CPU's own slot, so the RMW below is inherently race-free with no
@@ -1215,8 +1237,14 @@ fn tx_budget_ok(now: u64) -> bool {
             return true;
         }
         let elapsed_ns = now.saturating_sub((*b).last_ns);
+        // Plain 64-bit `wrapping_mul` (see the module-level rationale in
+        // `over_rate`): `saturating_mul`/`overflowing_mul` would emit an
+        // unsupported 128-bit `__multi3` on this target. The burst is scaled
+        // to the configured rate (~2 seconds of budget), not a fixed
+        // constant -- see this function's doc comment.
+        let burst = (*b).rate_pps.wrapping_mul(2).min(TX_BUDGET_BURST_MAX);
         let refill = elapsed_ns.wrapping_mul((*b).rate_pps) / NS_PER_SEC;
-        (*b).tokens = ((*b).tokens.saturating_add(refill)).min(TX_BUDGET_BURST);
+        (*b).tokens = ((*b).tokens.saturating_add(refill)).min(burst);
         (*b).last_ns = now;
         if (*b).tokens == 0 {
             return false;

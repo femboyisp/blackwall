@@ -130,6 +130,16 @@ pub struct RateBucket {
 /// or a value userspace explicitly leaves at zero) as "cap not configured" and
 /// never throttles -- this is what keeps the fast path's pre-X3 behavior (and
 /// tests) unchanged until Task 3's userspace setter installs a nonzero rate.
+///
+/// # Burst ceiling scales with `rate_pps`
+///
+/// Unlike [`RateBucket`], `TxBucket` carries no per-instance `burst` field:
+/// `tx_budget_ok` derives the ceiling as `min(2 x rate_pps,
+/// TX_BUDGET_BURST_MAX)` (roughly 2 seconds of budget), not a fixed
+/// constant -- otherwise any idle window (including the first call after
+/// arming, since `last_ns` is seeded `0`) would refill `tokens` all the way to
+/// a fixed ceiling regardless of how small `rate_pps` is, defeating the "hard
+/// reflection ceiling" this cap exists for.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TxBucket {
