@@ -833,6 +833,10 @@ async fn bgp_supervisor(mut states: tokio::sync::watch::Receiver<blackwall_bgp::
 
 /// Runs until `rx` is closed (i.e. for the process's lifetime, since the
 /// paired `ChannelSink`'s sender is held by the running collector).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one Arc per /metrics gauge/counter this task feeds (mirrors the sibling flowspec/xdp reconcile tasks); bundling into a struct would only relocate the coupling, not reduce it"
+)]
 async fn rtbh_manager_task<B, J>(
     mut manager: blackwall_rtbh::RtbhManager<B, J>,
     mut rx: mpsc::Receiver<blackwall_flow::DetectionEvent>,
@@ -840,6 +844,7 @@ async fn rtbh_manager_task<B, J>(
     protected_metrics: Arc<shadow::ProtectedSkippedMetrics>,
     apply_failure_metrics: Arc<std::sync::atomic::AtomicU64>,
     ratecapped_metrics: Arc<shadow::RatecappedMetrics>,
+    reapply_pending_metrics: Arc<std::sync::atomic::AtomicUsize>,
     mut disarm_rx: tokio::sync::broadcast::Receiver<()>,
 ) where
     B: blackwall_rtbh::manager::BgpExecutor + Send + 'static,
@@ -894,6 +899,10 @@ async fn rtbh_manager_task<B, J>(
                 );
                 ratecapped_metrics.rtbh.store(
                     manager.ratecapped(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                reapply_pending_metrics.store(
+                    manager.reapply_pending(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
@@ -1587,6 +1596,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // unconditionally — harmless all-zero counters when no `rtbh`
             // block is configured or `max-new-per-min` is unset.
             let ratecapped_metrics = std::sync::Arc::new(shadow::RatecappedMetrics::default());
+            // `rehydrate` re-announces queued for a self-heal retry after a
+            // failed BGP announce on restart (issue #194): copied from
+            // `RtbhManager::reapply_pending` on every tick, mirroring
+            // `rtbh_apply_failure_metrics` above. Built unconditionally —
+            // harmless all-zero gauge when no `rtbh` block is configured.
+            let rtbh_reapply_pending_metrics =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             // In-daemon disarm kill switch (C5): `blackwall_armed` starts at
             // 1 (live) or 0 (shadow) and is flipped to 0 exactly once, on a
             // SIGUSR1 disarm — there is no path back to 1 short of a
@@ -1656,6 +1672,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             protected_skipped_metrics.clone(),
                             rtbh_apply_failure_metrics.clone(),
                             ratecapped_metrics.clone(),
+                            rtbh_reapply_pending_metrics.clone(),
                             disarm_tx.subscribe(),
                         ));
                         None
@@ -1710,6 +1727,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             protected_skipped_metrics.clone(),
                             rtbh_apply_failure_metrics.clone(),
                             ratecapped_metrics.clone(),
+                            rtbh_reapply_pending_metrics.clone(),
                             disarm_tx.subscribe(),
                         ));
                         Some(bgp)
@@ -2068,6 +2086,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     rtbh_apply_failures: Some(rtbh_apply_failure_metrics.clone()),
                     flowspec_apply_failures: Some(flowspec_apply_failure_metrics.clone()),
                     xdp_apply_failures: Some(xdp_apply_failure_metrics.clone()),
+                    rtbh_reapply_pending: Some(rtbh_reapply_pending_metrics.clone()),
                     armed: Some(blackwall_armed.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
@@ -2327,6 +2346,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     rtbh_apply_failures: None,
                     flowspec_apply_failures: None,
                     xdp_apply_failures: None,
+                    rtbh_reapply_pending: None,
                     armed: None,
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));

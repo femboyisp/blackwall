@@ -55,6 +55,12 @@ pub(crate) struct MetricsSources {
     /// `xdp` block is configured. Copied from the manager once per tick,
     /// mirroring `rtbh_apply_failures`.
     pub xdp_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// `rehydrate` re-announces currently queued for a self-heal retry after
+    /// a failed BGP announce on restart (issue #194,
+    /// `RtbhManager::reapply_pending`); `None` when no `rtbh` block is
+    /// configured. Copied from the manager once per tick, mirroring how
+    /// `rtbh_apply_failures` reaches this endpoint.
+    pub rtbh_reapply_pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Per-plane cross-plane new-mitigation rate cap (C6) skip counters
     /// (`RtbhManager`/`FlowSpecManager::ratecapped`); `None` outside the flow
     /// daemon (no managers to cap). Populated (all-zero) even when no `rtbh`
@@ -169,6 +175,14 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             help: "XDP executor (eBPF-map) applies that failed and were rolled back (C2)",
             kind: MetricKind::Counter,
             value: u64_to_f64(xdp_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(rtbh_reapply_pending) = &sources.rtbh_reapply_pending {
+        m.push(Metric {
+            name: "blackwall_rtbh_reapply_pending",
+            help: "RTBH rehydrate re-announces queued for a self-heal retry after a failed BGP announce on restart (#194)",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(rtbh_reapply_pending.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
     if let Some(armed) = &sources.armed {
