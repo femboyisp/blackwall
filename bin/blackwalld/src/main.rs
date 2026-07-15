@@ -695,13 +695,24 @@ fn flowspec_config_from(
 /// Never on the mitigation hot path: this task only fails open (logs a
 /// WARN/INFO and updates a metric) — it never touches RTBH/FlowSpec/XDP
 /// state itself.
+///
+/// Returns `true` iff the task was actually spawned (both `rpki_validator`
+/// and `rtbh` present). Callers must use this return value — not just
+/// "did I construct the atomics" — to decide whether to wire `Some(...)`
+/// into [`metrics::MetricsSources`]'s `rpki_validator_up` /
+/// `rpki_uncovered_prefixes` fields: those fields must be `None` (and thus
+/// rendered as absent, per the `Option` convention documented on
+/// `MetricsSources`) whenever the check isn't actually running, so a daemon
+/// with no `rpki-validator=` configured never reports a falsely-healthy
+/// `blackwall_rpki_validator_up 1`.
+#[must_use]
 fn spawn_rpki_check_task(
     policy: &blackwall_core::Policy,
     validator_up: std::sync::Arc<std::sync::atomic::AtomicU8>,
     uncovered_prefixes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) {
+) -> bool {
     let Some(base) = policy.rpki_validator.clone() else {
-        return;
+        return false;
     };
     let Some(rtbh) = policy.rtbh.as_ref() else {
         tracing::warn!(
@@ -709,7 +720,7 @@ fn spawn_rpki_check_task(
              skipping the periodic RPKI validity cross-check (no local ASN \
              to query the validator with)"
         );
-        return;
+        return false;
     };
     let asn = rtbh.local_asn;
     let interval = policy.rpki_check_interval;
@@ -741,6 +752,7 @@ fn spawn_rpki_check_task(
         validator_up,
         uncovered_prefixes,
     ));
+    true
 }
 
 /// The periodic RPKI validity cross-check loop (#5 C2): runs
@@ -1817,14 +1829,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (disarm_tx, _disarm_rx) = tokio::sync::broadcast::channel::<()>(8);
 
             // Periodic RPKI validity cross-check (#5 C2): a no-op unless
-            // `rpki-validator=` is configured. Built unconditionally
-            // (harmless — starts at "reachable"/"nothing uncovered") so
-            // `/metrics` can report them regardless, mirroring
-            // `rtbh_apply_failure_metrics` and friends above.
+            // `rpki-validator=` is configured (and an `rtbh` block is
+            // present — see `spawn_rpki_check_task`). The atomics are
+            // constructed unconditionally (harmless — starts at
+            // "reachable"/"nothing uncovered"), but `rpki_check_running`
+            // (the task's own condition) gates whether they are actually
+            // wired into `/metrics` below: the metric must be *absent*,
+            // not just idle, when the check never runs.
             let rpki_validator_up = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
             let rpki_uncovered_prefixes =
                 std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            spawn_rpki_check_task(
+            let rpki_check_running = spawn_rpki_check_task(
                 &policy,
                 rpki_validator_up.clone(),
                 rpki_uncovered_prefixes.clone(),
@@ -2293,8 +2308,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     flowspec_reapply_pending: Some(flowspec_reapply_pending_metrics.clone()),
                     xdp_reapply_pending: Some(xdp_reapply_pending_metrics.clone()),
                     armed: Some(blackwall_armed.clone()),
-                    rpki_validator_up: Some(rpki_validator_up.clone()),
-                    rpki_uncovered_prefixes: Some(rpki_uncovered_prefixes.clone()),
+                    rpki_validator_up: rpki_check_running.then(|| rpki_validator_up.clone()),
+                    rpki_uncovered_prefixes: rpki_check_running
+                        .then(|| rpki_uncovered_prefixes.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
@@ -2383,14 +2399,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ensure_flowtable_devices_exist(&policy)?;
 
             // Periodic RPKI validity cross-check (#5 C2): a no-op unless
-            // `rpki-validator=` is configured. The deception engine (`run`)
-            // does not itself manage RTBH/FlowSpec/XDP, but this monitoring
-            // task is independent of that and belongs wherever the policy is
-            // parsed — see `spawn_rpki_check_task`'s docs.
+            // `rpki-validator=` is configured (and an `rtbh` block is
+            // present — see `spawn_rpki_check_task`). The deception engine
+            // (`run`) does not itself manage RTBH/FlowSpec/XDP, but this
+            // monitoring task is independent of that and belongs wherever
+            // the policy is parsed. `rpki_check_running` gates whether the
+            // atomics are wired into `/metrics` below.
             let rpki_validator_up = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
             let rpki_uncovered_prefixes =
                 std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            spawn_rpki_check_task(
+            let rpki_check_running = spawn_rpki_check_task(
                 &policy,
                 rpki_validator_up.clone(),
                 rpki_uncovered_prefixes.clone(),
@@ -2571,8 +2589,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     flowspec_reapply_pending: None,
                     xdp_reapply_pending: None,
                     armed: None,
-                    rpki_validator_up: Some(rpki_validator_up.clone()),
-                    rpki_uncovered_prefixes: Some(rpki_uncovered_prefixes.clone()),
+                    rpki_validator_up: rpki_check_running.then(|| rpki_validator_up.clone()),
+                    rpki_uncovered_prefixes: rpki_check_running
+                        .then(|| rpki_uncovered_prefixes.clone()),
                 };
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }

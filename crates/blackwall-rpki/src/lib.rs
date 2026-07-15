@@ -8,12 +8,18 @@
 //! I/O-free pieces of the cross-check against a
 //! [Routinator](https://nlnetlabs.nl/projects/routinator/) 0.14.2
 //! `/api/v1/validity` endpoint: the more-specific former, the response
-//! classifier, and the request-URL builder. The HTTP fetch and periodic
-//! task live in `blackwalld` (not here), so this crate stays trivially unit
-//! testable and never performs network I/O.
+//! classifier, and the request-URL builder. The periodic *task* (the tokio
+//! loop that drives the checks on an interval) lives in `blackwalld`, not
+//! here.
 //!
-//! This crate has no I/O of its own; that is a design invariant, not an
-//! implementation detail — keep it that way.
+//! The one deliberate exception to "no I/O" is the [`fetch`] module: it
+//! owns the actual `reqwest` HTTP call to the validator and is the sole,
+//! isolated I/O boundary of this crate — kept intentionally small,
+//! coverage-excluded, and free of any classification/formation logic of its
+//! own. Everything else in this crate (the classifier, the more-specific
+//! former, the URL builder, [`aggregate_report`], [`RpkiWarnState`]) is pure
+//! and trivially unit-testable; that separation is the design invariant to
+//! keep, not the absence of a `fetch` module.
 
 use std::collections::HashMap;
 
@@ -142,18 +148,18 @@ pub struct RpkiReport {
 /// so it is unit-tested directly.
 ///
 /// **Validator-reachability rule** (documented here, not just in code, since
-/// it's a judgment call): `validator_up` is `true` only if the check found at
-/// least one prefix to test AND the *first* prefix's fetch succeeded at the
-/// transport/parse level. A validator that answers the first request is
-/// assumed reachable for the rest of the pass — this avoids flapping
-/// `validator_up` on a single flaky prefix lookup while still catching the
-/// common "validator down" case (every fetch fails, so the first one does
-/// too). An empty prefix set has nothing to disprove reachability, so it
-/// reports `validator_up: true` (nothing to fail open on). A per-prefix
-/// fetch error (regardless of position) always means that prefix's state is
-/// unknown, so it's dropped from `per_prefix` rather than guessed at.
+/// it's a judgment call): `validator_up` is `true` if AT LEAST ONE checked
+/// prefix's fetch succeeded at the transport/parse level, and `false` only
+/// when EVERY fetch failed — i.e. the validator is reported down only when
+/// it is genuinely unreachable for the whole pass, not merely for one flaky
+/// lookup among several successes. An empty prefix set has nothing to
+/// disprove reachability, so it reports `validator_up: true` (nothing to
+/// fail open on). A per-prefix fetch error always means that prefix's state
+/// is unknown, so it's dropped from `per_prefix` rather than guessed at —
+/// this per-prefix fail-open is unconditional and independent of the
+/// aggregate `validator_up` verdict.
 pub fn aggregate_report<E>(results: Vec<(ipnet::IpNet, Result<RpkiState, E>)>) -> RpkiReport {
-    let validator_up = results.first().is_none_or(|(_, r)| r.is_ok());
+    let validator_up = results.is_empty() || results.iter().any(|(_, r)| r.is_ok());
     let per_prefix = results
         .into_iter()
         .filter_map(|(net, r)| r.ok().map(|state| (net, state)))
@@ -366,17 +372,36 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_report_validator_down_when_first_fetch_fails() {
+    fn aggregate_report_validator_up_when_only_a_later_fetch_succeeds() {
+        // A single flaky lookup FIRST in the list must not report the
+        // validator down when a later fetch in the same pass succeeds.
         let results: Vec<(ipnet::IpNet, Result<RpkiState, ()>)> = vec![
             (pfx("94.156.238.0/32"), Err(())),
             (pfx("203.0.113.0/32"), Ok(RpkiState::Valid)),
         ];
         let report = aggregate_report(results);
-        assert!(!report.validator_up);
+        assert!(
+            report.validator_up,
+            "at least one fetch succeeded, so the validator is up"
+        );
         assert_eq!(
             report.per_prefix,
             vec![(pfx("203.0.113.0/32"), RpkiState::Valid)]
         );
+    }
+
+    #[test]
+    fn aggregate_report_validator_down_only_when_every_fetch_fails() {
+        let results: Vec<(ipnet::IpNet, Result<RpkiState, ()>)> = vec![
+            (pfx("94.156.238.0/32"), Err(())),
+            (pfx("203.0.113.0/32"), Err(())),
+        ];
+        let report = aggregate_report(results);
+        assert!(
+            !report.validator_up,
+            "every fetch failed, so the validator is genuinely unreachable"
+        );
+        assert!(report.per_prefix.is_empty());
     }
 
     #[test]
