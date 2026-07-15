@@ -374,6 +374,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackwall-rpki"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "blackwall-rtbh"
 version = "0.1.0"
 dependencies = [
@@ -384,6 +395,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -483,6 +495,7 @@ dependencies = [
  "blackwall-flow",
  "blackwall-metrics",
  "blackwall-nft",
+ "blackwall-rpki",
  "blackwall-rtbh",
  "blackwall-shaper",
  "blackwall-speedtest",

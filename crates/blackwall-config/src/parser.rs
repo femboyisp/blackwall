@@ -30,6 +30,8 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut pops: Vec<PopEntry> = Vec::new();
     let mut shadow = false;
     let mut protected_prefixes: Vec<ipnet::IpNet> = Vec::new();
+    let mut rpki_validator: Option<String> = None;
+    let mut rpki_check_interval = std::time::Duration::from_secs(3600);
 
     let mut i = 0;
     while i < lines.len() {
@@ -805,6 +807,38 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 }
                 shadow = true;
             }
+            // `rpki-validator=<url>` / `rpki-check-interval=<dur>` are single
+            // `key=value` tokens (the whole line), not a leading keyword
+            // followed by `key=value` pairs like `metrics`/`rtbh` — matched
+            // by prefix rather than as an exact `directive` string.
+            d if d.starts_with("rpki-validator=") => {
+                expect_len(line, 1, "rpki-validator=<url>")?;
+                if rpki_validator.is_some() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "rpki-validator",
+                        value: "duplicate".to_owned(),
+                    });
+                }
+                let url = d
+                    .strip_prefix("rpki-validator=")
+                    .expect("checked by starts_with guard above");
+                if url.is_empty() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "rpki-validator",
+                        value: "empty url".to_owned(),
+                    });
+                }
+                rpki_validator = Some(url.to_owned());
+            }
+            d if d.starts_with("rpki-check-interval=") => {
+                expect_len(line, 1, "rpki-check-interval=<dur>")?;
+                let v = d
+                    .strip_prefix("rpki-check-interval=")
+                    .expect("checked by starts_with guard above");
+                rpki_check_interval = parse_duration(line, v)?;
+            }
             other => {
                 return Err(ConfigError::UnknownDirective {
                     line: line.number,
@@ -851,6 +885,8 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         stateless_tcp_ports,
         shadow,
         protected_prefixes,
+        rpki_validator,
+        rpki_check_interval,
     })
 }
 
@@ -2325,5 +2361,86 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
     fn protect_defaults_empty() {
         let p = parse_text("interface wan eth0\nipv4 203.0.113.0/24\n").unwrap();
         assert!(p.protected_prefixes.is_empty());
+    }
+
+    #[test]
+    fn parses_rpki_validator() {
+        let p = parse_text("interface wan eth0\nrpki-validator=http://h:8323\n").unwrap();
+        assert_eq!(p.rpki_validator, Some("http://h:8323".to_owned()));
+    }
+
+    #[test]
+    fn rpki_validator_absent_by_default() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert_eq!(p.rpki_validator, None);
+    }
+
+    #[test]
+    fn parses_rpki_check_interval() {
+        let p = parse_text(
+            "interface wan eth0\nrpki-validator=http://h:8323\nrpki-check-interval=30m\n",
+        )
+        .unwrap();
+        assert_eq!(p.rpki_check_interval, std::time::Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn rpki_check_interval_defaults_to_one_hour() {
+        let p = parse_text("interface wan eth0\nrpki-validator=http://h:8323\n").unwrap();
+        assert_eq!(p.rpki_check_interval, std::time::Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn rpki_check_interval_defaults_even_without_validator() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert_eq!(p.rpki_check_interval, std::time::Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn rejects_duplicate_rpki_validator() {
+        let err = parse_text(
+            "interface wan eth0\nrpki-validator=http://a:1\nrpki-validator=http://b:2\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "rpki-validator",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_rpki_validator_url() {
+        let err = parse_text("interface wan eth0\nrpki-validator=\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "rpki-validator",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_rpki_check_interval() {
+        let err = parse_text("interface wan eth0\nrpki-check-interval=notaduration\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "duration",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 }

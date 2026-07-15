@@ -81,4 +81,14 @@ pub struct Policy {
     /// similar always-safe destinations), set via the repeatable `protect`
     /// directive. Empty (the default) protects nothing extra.
     pub protected_prefixes: Vec<IpNet>,
+    /// Base URL of a Routinator `/api/v1/validity` RPKI validator (the
+    /// `rpki-validator=<url>` directive, e.g. `http://h:8323`), used to
+    /// cross-check that RTBH blackhole more-specifics will not be
+    /// RPKI-invalid at validating upstreams. `None` (the default) disables
+    /// the check entirely.
+    pub rpki_validator: Option<String>,
+    /// How often to re-run the RPKI cross-check (the `rpki-check-interval=`
+    /// directive). Defaults to one hour; meaningless when `rpki_validator`
+    /// is `None`.
+    pub rpki_check_interval: std::time::Duration,
 }

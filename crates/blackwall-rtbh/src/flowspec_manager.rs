@@ -69,6 +69,38 @@ impl MirrorOp {
     }
 }
 
+/// A [`FlowSpecManager::rehydrate`] re-announce that failed at the
+/// [`BgpExecutor`] and is queued for a self-heal retry (issue #194).
+///
+/// Mirrors [`crate::manager`]'s private `ReapplyOp`, keyed by [`FlowKey`]
+/// instead of target IP — unlike [`MirrorOp`] (which only ever replays a
+/// journal write, the BGP side already having succeeded), a queued
+/// `ReapplyOp` re-attempts the BGP `announce_flowspec` itself: rehydrate's
+/// failure happens on the BGP side, not the journal side (rehydrate never
+/// journals in the first place).
+///
+/// Holds only the [`FlowKey`], not the rule that was captured when the op
+/// was queued: [`FlowSpecManager::retry_pending_reapply`] re-derives the
+/// CURRENT rule from [`FlowSpecController::active_rule`] at retry time
+/// rather than replaying a snapshot, so a fresh, successful re-assertion of
+/// the same key with a changed action (C4 — e.g. `manual_add`'s
+/// `changed_action_re_announces`) that lands between the failed rehydrate
+/// and the retry is never clobbered by the stale queued content (#194 C1
+/// follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReapplyOp {
+    /// The key of the rule to re-announce; the current rule content is
+    /// looked up fresh from the controller at retry time.
+    key: FlowKey,
+}
+
+impl ReapplyOp {
+    /// The `FlowKey` this reapply op concerns.
+    fn key(&self) -> FlowKey {
+        self.key
+    }
+}
+
 /// Outcome of [`FlowSpecManager::execute_and_journal_announce`].
 ///
 /// Mirrors [`crate::manager`]'s private `AnnounceOutcome`. The auto path
@@ -119,6 +151,16 @@ pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     /// succeeded; retried (never re-issued to BGP) by
     /// `FlowSpecManager::retry_pending_mirror` on the next tick.
     pending_mirror: Vec<MirrorOp>,
+    /// `rehydrate` re-announces that failed at the [`BgpExecutor`]; retried
+    /// by [`Self::retry_pending_reapply`] on the next tick (issue #194). The
+    /// controller's active entry from [`FlowSpecController::resume`] is kept
+    /// (never rolled back) while queued — unlike a live BGP failure on the
+    /// `apply_open`/`apply_add` path, a rehydrated rule is a known-good
+    /// persisted mitigation with no fresh detection to naturally re-attempt
+    /// it, so rollback would strand the control plane believing nothing is
+    /// announced while the journal still says otherwise (mirrors
+    /// `blackwall_rtbh::manager::RtbhManager`'s private `pending_reapply`).
+    pending_reapply: Vec<ReapplyOp>,
     /// Count of announces that failed at the BGP executor, each rolled back
     /// (see [`Self::apply_failures`]).
     apply_failures: u64,
@@ -155,6 +197,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             bgp,
             journal,
             pending_mirror: Vec::new(),
+            pending_reapply: Vec::new(),
             apply_failures: 0,
             rate_limiter: None,
             ratecapped: 0,
@@ -233,10 +276,14 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     ///
     /// Starts by retrying any journal mirror writes queued by a previous
     /// tick's transient failure (see
-    /// `FlowSpecManager::retry_pending_mirror`), so a self-heal converges
-    /// within one tick interval of the DB recovering.
+    /// `FlowSpecManager::retry_pending_mirror`), then any `rehydrate`
+    /// re-announces queued by a previous tick's transient BGP failure (see
+    /// [`Self::retry_pending_reapply`], issue #194), so both self-heals
+    /// converge within one tick interval of the respective dependency
+    /// recovering.
     pub async fn tick(&mut self, mono_now: u64, wall_now: u64) {
         self.retry_pending_mirror().await;
+        self.retry_pending_reapply().await;
         let actions = self.controller.tick(mono_now);
         for action in actions {
             self.execute_and_journal(action, mono_now, wall_now).await;
@@ -328,6 +375,12 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     ///
     /// For each row, calls [`FlowSpecController::resume`] and re-announces on
     /// BGP (without journaling — the row already exists in the journal). If
+    /// the re-announce fails, the controller's entry is kept active (it is a
+    /// known-good persisted mitigation, not rolled back the way a fresh
+    /// `apply_open`/`apply_add` failure is — see the module docs) and queued
+    /// via [`Self::queue_reapply`] for a retry on the next [`Self::tick`]
+    /// (issue #194): unlike a live detection, a rehydrated rule has no
+    /// natural re-detection to compensate for a dropped announce. If
     /// `resume` returns no action (over cap or ineligible), this logs a
     /// warning naming the target; a row is never silently dropped.
     pub async fn rehydrate(
@@ -339,8 +392,9 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             let target = rule.dst.addr();
             let actions = self.controller.resume(rule.clone(), mono_now, origin);
             if let Some(FlowSpecAction::Announce(r)) = actions.into_iter().next() {
-                if let Err(e) = self.bgp.announce_flowspec(r).await {
-                    tracing::warn!(%target, error = %e, "FlowSpec: rehydrate re-announce failed");
+                if let Err(e) = self.bgp.announce_flowspec(r.clone()).await {
+                    tracing::warn!(%target, error = %e, "FlowSpec: rehydrate re-announce failed; queuing for retry");
+                    self.queue_reapply(ReapplyOp { key: key_of(&r) });
                 }
                 continue;
             }
@@ -390,6 +444,18 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
     #[must_use]
     pub fn ratecapped(&self) -> u64 {
         self.ratecapped
+    }
+
+    /// Number of `rehydrate` re-announces currently queued for a self-heal
+    /// retry after a failed BGP announce on restart (issue #194). Each
+    /// queued rule is still active in the controller (kept, not rolled back)
+    /// but not yet confirmed on the wire; drained by
+    /// [`Self::retry_pending_reapply`] on the next [`Self::tick`]. Surfaced
+    /// for `/metrics` as `blackwall_flowspec_reapply_pending`, mirroring
+    /// `blackwall_rtbh::manager::RtbhManager::reapply_pending`.
+    #[must_use]
+    pub fn reapply_pending(&self) -> usize {
+        self.pending_reapply.len()
     }
 
     /// In-daemon disarm kill switch (C5): withdraw every currently-active
@@ -462,6 +528,18 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         let key = op.key();
         self.pending_mirror.retain(|o| o.key() != key);
         self.pending_mirror.push(op);
+    }
+
+    /// Queue a failed `rehydrate` re-announce for retry, coalescing by
+    /// [`FlowKey`] (issue #194).
+    ///
+    /// Mirrors [`Self::queue_mirror`]'s coalescing: only the latest queued
+    /// op per key is kept, since a repeat rehydrate failure for the same
+    /// rule during an outage should never grow the queue past one entry.
+    fn queue_reapply(&mut self, op: ReapplyOp) {
+        let key = op.key();
+        self.pending_reapply.retain(|o| o.key() != key);
+        self.pending_reapply.push(op);
     }
 
     /// Execute one controller action on BGP and mirror it into the journal.
@@ -583,6 +661,44 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         }
     }
 
+    /// Drain-retry queued `rehydrate` re-announces left over from a
+    /// transient BGP failure (issue #194).
+    ///
+    /// Each queued op re-derives the CURRENT rule for its key from
+    /// [`FlowSpecController::active_rule`] rather than replaying the rule
+    /// snapshot captured when the op was queued: if the key is no longer
+    /// active (e.g. cleared by a manual remove or a hold-down expiry between
+    /// the failed rehydrate and this tick), `active_rule` returns `None` and
+    /// the op is dropped — re-announcing a rule the control plane no longer
+    /// wants live would itself create a phantom. If the key is still active
+    /// but a fresh, successful re-assertion changed its action in the
+    /// meantime (C4 — e.g. a detection or operator call tightening the
+    /// rate), re-deriving picks up that CURRENT action instead of replaying
+    /// the stale queued one, which would otherwise silently revert the fresh
+    /// update (#194 C1 follow-up). Otherwise the announce is re-attempted;
+    /// ops that still fail are kept (retried again on the next call), ops
+    /// that succeed are dropped.
+    async fn retry_pending_reapply(&mut self) {
+        if self.pending_reapply.is_empty() {
+            return;
+        }
+        let ops = std::mem::take(&mut self.pending_reapply);
+        for op in ops {
+            let key = op.key();
+            let Some(rule) = self.controller.active_rule(key) else {
+                tracing::info!(
+                    ?key,
+                    "FlowSpec: dropping queued rehydrate reapply; entry no longer active"
+                );
+                continue;
+            };
+            if let Err(e) = self.bgp.announce_flowspec(rule).await {
+                tracing::warn!(?key, error = %e, "FlowSpec: rehydrate reapply retry failed; re-queuing");
+                self.pending_reapply.push(op);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn bgp(&self) -> &B {
         &self.bgp
@@ -609,11 +725,43 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct FakeBgp {
-        announced: Mutex<Vec<FlowSpecRule>>,
-        withdrawn: Mutex<Vec<FlowSpecRule>>,
-        fail: bool,
+        announced: Arc<Mutex<Vec<FlowSpecRule>>>,
+        withdrawn: Arc<Mutex<Vec<FlowSpecRule>>>,
+        fail: Arc<Mutex<bool>>,
+        /// Independent withdraw-only failure toggle, for exercising disarm's
+        /// best-effort tolerance of a withdraw `Err` without also blocking
+        /// the announce that must precede it (unlike `fail`, which fails
+        /// both). Mirrors `crate::manager::RtbhManager`'s test fake.
+        fail_withdraw: Arc<Mutex<bool>>,
+    }
+    impl FakeBgp {
+        /// Build a fake whose `announce_flowspec`/`withdraw_flowspec` fail
+        /// from the start.
+        fn with_fail(fail: bool) -> Self {
+            let f = Self::default();
+            f.set_fail(fail);
+            f
+        }
+        /// Build a fake whose `withdraw_flowspec` alone fails from the start
+        /// (`announce_flowspec` still succeeds).
+        fn with_fail_withdraw(fail_withdraw: bool) -> Self {
+            let f = Self::default();
+            *f.fail_withdraw.lock().unwrap() = fail_withdraw;
+            f
+        }
+        /// Flip the announce/withdraw failure toggle at runtime — lets a
+        /// test simulate a BGP session recovering mid-scenario (a clone
+        /// shares the same underlying flag with whatever manager holds this
+        /// fake).
+        fn set_fail(&self, fail: bool) {
+            *self.fail.lock().unwrap() = fail;
+        }
+        /// Whether `rule` was ever announced.
+        fn announced_contains(&self, rule: &FlowSpecRule) -> bool {
+            self.announced.lock().unwrap().contains(rule)
+        }
     }
     #[async_trait]
     impl BgpExecutor for FakeBgp {
@@ -630,7 +778,7 @@ mod tests {
             &self,
             rule: FlowSpecRule,
         ) -> Result<(), crate::manager::BgpError> {
-            if self.fail {
+            if *self.fail.lock().unwrap() {
                 return Err(crate::manager::BgpError);
             }
             self.announced.lock().unwrap().push(rule);
@@ -640,7 +788,7 @@ mod tests {
             &self,
             rule: FlowSpecRule,
         ) -> Result<(), crate::manager::BgpError> {
-            if self.fail {
+            if *self.fail.lock().unwrap() || *self.fail_withdraw.lock().unwrap() {
                 return Err(crate::manager::BgpError);
             }
             self.withdrawn.lock().unwrap().push(rule);
@@ -724,10 +872,7 @@ mod tests {
     fn mgr(fail_bgp: bool, fail_j: bool) -> FlowSpecManager<FakeBgp, FakeJournal> {
         FlowSpecManager::new(
             FlowSpecController::new(cfg()),
-            FakeBgp {
-                fail: fail_bgp,
-                ..Default::default()
-            },
+            FakeBgp::with_fail(fail_bgp),
             FakeJournal {
                 fail: fail_j,
                 ..Default::default()
@@ -1215,6 +1360,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disarm_tolerates_a_withdraw_error() {
+        // Best-effort: a withdraw_flowspec Err during disarm must not abort
+        // the sweep (a second active rule is still withdrawn) or stop the
+        // manager from switching to record-only. Mirrors
+        // `crate::manager::RtbhManager`'s `disarm_tolerates_a_withdraw_error`.
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(cfg()),
+            FakeBgp::with_fail_withdraw(true),
+            FakeJournal::default(),
+        );
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            0,
+            0,
+        )
+        .await;
+        m.apply_open(
+            ip("203.0.113.8"),
+            &[flow_rule("203.0.113.8", 17, 53, 0.0)],
+            0,
+            0,
+        )
+        .await;
+        let key1 = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(m.is_active(key1));
+        assert!(m.is_active(key2));
+
+        m.disarm(1_000).await;
+
+        assert!(
+            m.bgp().withdrawn.lock().unwrap().is_empty(),
+            "every withdraw errored, so none was recorded by the fake"
+        );
+        assert!(!m.is_active(key1));
+        assert!(
+            !m.is_active(key2),
+            "disarm clears the active set even when every withdraw errors (best-effort)"
+        );
+
+        // Record-only holds even though disarm itself never got a
+        // confirmed withdraw.
+        m.apply_open(
+            ip("203.0.113.9"),
+            &[flow_rule("203.0.113.9", 17, 53, 0.0)],
+            2_000,
+            2_000,
+        )
+        .await;
+        let key3 = key_of(&rule("203.0.113.9/32", 17, 53, 0.0));
+        assert!(!m.is_active(key3));
+    }
+
+    #[tokio::test]
     async fn apply_add_while_disarmed_is_rejected_not_applied() {
         // C5 + final-review fix: a manual add while disarmed must be
         // classified Rejected (retrying is pointless — there is no re-arm
@@ -1304,5 +1504,112 @@ mod tests {
         assert_eq!(m.pending_mirror_len(), 0);
         assert!(m.journal().announced.lock().unwrap().is_empty());
         assert_eq!(m.journal().withdrawn.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_failure_queues_reapply_and_tick_reconverges() {
+        // #194 C1: a persisted, eligible rule whose rehydrate re-announce
+        // fails must NOT be left stranded (active in the controller but
+        // never on the wire) — it is queued for retry and the queue drains
+        // once the BGP session recovers.
+        let bgp = FakeBgp::with_fail(true); // announce errors
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(cfg()),
+            bgp.clone(),
+            FakeJournal::default(),
+        );
+        let r = rule("203.0.113.7/32", 17, 53, 0.0);
+        m.rehydrate(vec![(r.clone(), 1_000, BlackholeOrigin::Auto)], 1_000)
+            .await;
+        let key = key_of(&r);
+        assert!(m.is_active(key), "entry kept (not dropped)");
+        assert_eq!(
+            m.reapply_pending(),
+            1,
+            "failed re-announce queued for retry"
+        );
+
+        // Session recovers; the next tick re-announces and drains the queue.
+        bgp.set_fail(false);
+        m.tick(2_000, 2_000).await;
+        assert_eq!(m.reapply_pending(), 0);
+        assert!(bgp.announced_contains(&r));
+    }
+
+    #[tokio::test]
+    async fn queue_reapply_dedupes_and_drops_if_cleared() {
+        // A still-failing tick must coalesce (not double-enqueue) the retry
+        // for the same rule; and once the rule is cleared before it ever
+        // succeeds, the queued reapply must be dropped rather than
+        // re-announcing a no-longer-wanted rule.
+        let bgp = FakeBgp::with_fail(true);
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(cfg()),
+            bgp.clone(),
+            FakeJournal::default(),
+        );
+        let r = rule("203.0.113.7/32", 17, 53, 0.0);
+        m.rehydrate(vec![(r.clone(), 1_000, BlackholeOrigin::Auto)], 1_000)
+            .await;
+        m.tick(2_000, 2_000).await; // still failing -> re-queued, NOT double-enqueued
+        assert_eq!(m.reapply_pending(), 1, "coalesced, not doubled");
+
+        // Cleared before it ever succeeded (manual withdraw).
+        m.apply_remove(r.clone(), 3_000, 3_000).await;
+        bgp.set_fail(false);
+        m.tick(4_000, 4_000).await;
+        assert_eq!(m.reapply_pending(), 0, "dropped: entry no longer active");
+        assert!(!bgp.announced_contains(&r), "not re-announced after clear");
+    }
+
+    #[tokio::test]
+    async fn stale_reapply_does_not_clobber_a_fresh_successful_update() {
+        // #194 C1 follow-up: `retry_pending_reapply` must re-derive the
+        // controller's CURRENT rule for the key at retry time, not replay
+        // the rule snapshot captured when the op was queued. Otherwise a
+        // fresh, successful re-assertion of the SAME key with a CHANGED
+        // action (C4 — a re-assert may legitimately change the action, see
+        // `manual_add_upgrade_with_changed_action_re_announces`) that lands
+        // between the failed rehydrate and the retry gets silently reverted
+        // by the stale queued content — a mitigation-weakening regression.
+        let bgp = FakeBgp::with_fail(true); // rehydrate re-announce fails
+        let mut m = FlowSpecManager::new(
+            FlowSpecController::new(cfg()),
+            bgp.clone(),
+            FakeJournal::default(),
+        );
+        let old = rule("203.0.113.7/32", 17, 53, 500.0);
+        m.rehydrate(vec![(old.clone(), 1_000, BlackholeOrigin::Auto)], 1_000)
+            .await;
+        let key = key_of(&old);
+        assert!(m.is_active(key), "entry kept (not dropped)");
+        assert_eq!(m.reapply_pending(), 1, "failed rehydrate queued for retry");
+
+        // BGP recovers just in time for a FRESH, successful re-assertion
+        // with a tighter (different) action for the SAME key, landing
+        // before the next tick drains the stale queue.
+        bgp.set_fail(false);
+        let new = rule("203.0.113.7/32", 17, 53, 100.0);
+        let outcome = m.apply_add(new.clone(), 1_500, 1_500).await;
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            bgp.announced_contains(&new),
+            "the fresh, tighter update reached BGP"
+        );
+
+        // The next tick drains the (now-stale) queued reapply. It must
+        // re-derive and re-announce the CURRENT rule (rate 100.0), not
+        // replay the stale queued snapshot (rate 500.0) — which would
+        // silently revert the fresh tightening.
+        m.tick(2_000, 2_000).await;
+        assert_eq!(m.reapply_pending(), 0);
+
+        let announced = m.bgp().announced.lock().unwrap();
+        let last = announced.last().expect("at least one announce recorded");
+        assert_eq!(
+            last.action,
+            FlowAction::TrafficRate(100.0),
+            "the drained retry must re-announce the CURRENT rule, not the stale queued one"
+        );
     }
 }

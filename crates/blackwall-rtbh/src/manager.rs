@@ -99,6 +99,15 @@ pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     /// succeeded; retried (never re-issued to BGP) by
     /// `RtbhManager::retry_pending_mirror` on the next tick.
     pending_mirror: Vec<MirrorOp>,
+    /// `rehydrate` re-announces that failed at the [`BgpExecutor`]; retried
+    /// by [`Self::retry_pending_reapply`] on the next tick (issue #194). The
+    /// controller's active entry from [`RtbhController::resume`] is kept
+    /// (never rolled back) while queued — unlike a live BGP failure on the
+    /// `apply_event`/`apply_add` path (see the module docs), a rehydrated row
+    /// is a known-good persisted mitigation with no fresh detection to
+    /// naturally re-attempt it, so rollback would strand the control plane
+    /// believing nothing is announced while the journal still says otherwise.
+    pending_reapply: Vec<ReapplyOp>,
     /// Count of announces that failed at the BGP executor, each rolled back
     /// (see [`Self::apply_failures`]).
     apply_failures: u64,
@@ -153,6 +162,21 @@ impl MirrorOp {
     }
 }
 
+/// A [`RtbhManager::rehydrate`] re-announce that failed at the
+/// [`BgpExecutor`] and is queued for a self-heal retry (issue #194).
+///
+/// Unlike [`MirrorOp`] (which only ever replays a journal write, the BGP
+/// side already having succeeded), a queued `ReapplyOp` re-attempts the BGP
+/// `announce` itself — rehydrate's failure happens on the BGP side, not the
+/// journal side (rehydrate never journals in the first place).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReapplyOp {
+    /// The blackhole target this re-announce concerns.
+    target: IpAddr,
+    /// The route to re-announce.
+    route: Route,
+}
+
 /// Outcome of [`RtbhManager::execute_and_journal_announce`].
 ///
 /// The auto path (`apply_event`/`tick`, via [`RtbhManager::execute_and_journal`])
@@ -185,6 +209,7 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
             bgp,
             journal,
             pending_mirror: Vec::new(),
+            pending_reapply: Vec::new(),
             apply_failures: 0,
             rate_limiter: None,
             ratecapped: 0,
@@ -227,10 +252,13 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     ///
     /// Starts by retrying any journal mirror writes queued by a previous
     /// tick's transient failure (see `RtbhManager::retry_pending_mirror`),
-    /// so a self-heal converges within one tick interval of the DB
-    /// recovering.
+    /// then any `rehydrate` re-announces queued by a previous tick's
+    /// transient BGP failure (see `RtbhManager::retry_pending_reapply`,
+    /// issue #194), so both self-heals converge within one tick interval of
+    /// the respective dependency recovering.
     pub async fn tick(&mut self, mono_now: u64, wall_now: u64) {
         self.retry_pending_mirror().await;
+        self.retry_pending_reapply().await;
         let actions = self.controller.tick(mono_now);
         for action in actions {
             self.execute_and_journal(action, mono_now, wall_now).await;
@@ -328,7 +356,13 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     /// Re-install persisted blackholes on a fresh session (rehydration).
     ///
     /// For each row, calls [`RtbhController::resume`] and re-announces on BGP
-    /// (without journaling — the row already exists in the journal). If
+    /// (without journaling — the row already exists in the journal). If the
+    /// re-announce fails, the controller's entry is kept active (it is a
+    /// known-good persisted mitigation, not rolled back the way a fresh
+    /// `apply_event`/`apply_add` failure is — see the module docs) and
+    /// queued via [`Self::queue_reapply`] for a retry on the next
+    /// [`Self::tick`] (issue #194): unlike a live detection, a rehydrated row
+    /// has no natural re-detection to compensate for a dropped announce. If
     /// `resume` returns no action (over cap, ineligible, or no next-hop),
     /// this logs a warning naming the target; a row is never silently
     /// dropped.
@@ -336,8 +370,9 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         for (target, _persisted_at, origin) in rows {
             let actions = self.controller.resume(target, mono_now, origin);
             if let Some(RtbhAction::Announce(route)) = actions.into_iter().next() {
-                if let Err(e) = self.bgp.announce(route).await {
-                    tracing::warn!(%target, error = %e, "RTBH: rehydrate re-announce failed");
+                if let Err(e) = self.bgp.announce(route.clone()).await {
+                    tracing::warn!(%target, error = %e, "RTBH: rehydrate re-announce failed; queuing for retry");
+                    self.queue_reapply(ReapplyOp { target, route });
                 }
                 continue;
             }
@@ -390,6 +425,18 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     #[must_use]
     pub fn ratecapped(&self) -> u64 {
         self.ratecapped
+    }
+
+    /// Number of `rehydrate` re-announces currently queued for a self-heal
+    /// retry after a failed BGP announce on restart (issue #194). Each
+    /// queued target is still active in the controller (kept, not rolled
+    /// back) but not yet confirmed on the wire; drained by
+    /// [`Self::retry_pending_reapply`] on the next [`Self::tick`]. Surfaced
+    /// for `/metrics` as `blackwall_rtbh_reapply_pending`, mirroring how
+    /// [`Self::apply_failures`] reaches the endpoint.
+    #[must_use]
+    pub fn reapply_pending(&self) -> usize {
+        self.pending_reapply.len()
     }
 
     /// In-daemon disarm kill switch (C5): withdraw every currently-active
@@ -463,6 +510,17 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         let target = op.target();
         self.pending_mirror.retain(|o| o.target() != target);
         self.pending_mirror.push(op);
+    }
+
+    /// Queue a failed `rehydrate` re-announce for retry, coalescing by
+    /// target (issue #194).
+    ///
+    /// Mirrors [`Self::queue_mirror`]'s coalescing: only the latest queued
+    /// op per target is kept, since a repeat rehydrate failure for the same
+    /// target during an outage should never grow the queue past one entry.
+    fn queue_reapply(&mut self, op: ReapplyOp) {
+        self.pending_reapply.retain(|o| o.target != op.target);
+        self.pending_reapply.push(op);
     }
 
     /// Execute one controller action on BGP and mirror it into the journal.
@@ -581,6 +639,33 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         }
     }
 
+    /// Drain-retry queued `rehydrate` re-announces left over from a
+    /// transient BGP failure (issue #194).
+    ///
+    /// Each queued op is first re-checked against the current active set:
+    /// if the target is no longer active (e.g. cleared by a manual remove
+    /// or a hold-down expiry between the failed rehydrate and this tick),
+    /// the op is dropped — re-announcing a route the control plane no
+    /// longer wants live would itself create a phantom. Otherwise the
+    /// announce is re-attempted; ops that still fail are kept (retried
+    /// again on the next call), ops that succeed are dropped.
+    async fn retry_pending_reapply(&mut self) {
+        if self.pending_reapply.is_empty() {
+            return;
+        }
+        let ops = std::mem::take(&mut self.pending_reapply);
+        for op in ops {
+            if !self.is_active(op.target) {
+                tracing::info!(target = %op.target, "RTBH: dropping queued rehydrate reapply; entry no longer active");
+                continue;
+            }
+            if let Err(e) = self.bgp.announce(op.route.clone()).await {
+                tracing::warn!(target = %op.target, error = %e, "RTBH: rehydrate reapply retry failed; re-queuing");
+                self.pending_reapply.push(op);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn bgp(&self) -> &B {
         &self.bgp
@@ -606,34 +691,60 @@ fn ip_of(prefix: &IpNet) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlackholeOrigin, RtbhConfig, RtbhController};
+    use crate::{BlackholeOrigin, NoOpJournal, RtbhConfig, RtbhController};
     use blackwall_flow::{AttackKind, Detection, DetectionEvent, Severity};
     use std::net::IpAddr;
     use std::sync::Mutex;
     use std::time::Duration;
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct FakeBgp {
-        announced: Mutex<Vec<IpNet>>,
-        withdrawn: Mutex<Vec<IpNet>>,
-        fail: bool,
+        announced: Arc<Mutex<Vec<IpNet>>>,
+        withdrawn: Arc<Mutex<Vec<IpNet>>>,
+        fail: Arc<Mutex<bool>>,
         /// Independent withdraw-only failure toggle, for exercising disarm's
         /// best-effort tolerance of a withdraw `Err` without also blocking
         /// the announce that must precede it (unlike `fail`, which fails
         /// both).
-        fail_withdraw: bool,
+        fail_withdraw: Arc<Mutex<bool>>,
+    }
+    impl FakeBgp {
+        /// Build a fake whose `announce`/`withdraw` fail from the start.
+        fn with_fail(fail: bool) -> Self {
+            let f = Self::default();
+            f.set_fail(fail);
+            f
+        }
+        /// Build a fake whose `withdraw` alone fails from the start
+        /// (`announce` still succeeds).
+        fn with_fail_withdraw(fail_withdraw: bool) -> Self {
+            let f = Self::default();
+            *f.fail_withdraw.lock().unwrap() = fail_withdraw;
+            f
+        }
+        /// Flip the announce/withdraw failure toggle at runtime — lets a test
+        /// simulate a BGP session recovering mid-scenario (a clone shares the
+        /// same underlying flag with whatever manager holds this fake).
+        fn set_fail(&self, fail: bool) {
+            *self.fail.lock().unwrap() = fail;
+        }
+        /// Whether `prefix` (e.g. `"203.0.113.7/32"`) was ever announced.
+        fn announced_contains(&self, prefix: &str) -> bool {
+            let net: IpNet = prefix.parse().expect("valid prefix in test");
+            self.announced.lock().unwrap().contains(&net)
+        }
     }
     #[async_trait]
     impl BgpExecutor for FakeBgp {
         async fn announce(&self, route: Route) -> Result<(), BgpError> {
-            if self.fail {
+            if *self.fail.lock().unwrap() {
                 return Err(BgpError);
             }
             self.announced.lock().unwrap().push(route.prefix);
             Ok(())
         }
         async fn withdraw(&self, prefix: IpNet) -> Result<(), BgpError> {
-            if self.fail || self.fail_withdraw {
+            if *self.fail.lock().unwrap() || *self.fail_withdraw.lock().unwrap() {
                 return Err(BgpError);
             }
             self.withdrawn.lock().unwrap().push(prefix);
@@ -647,7 +758,7 @@ mod tests {
             &self,
             _rule: blackwall_bgp::FlowSpecRule,
         ) -> Result<(), BgpError> {
-            if self.fail {
+            if *self.fail.lock().unwrap() {
                 return Err(BgpError);
             }
             Ok(())
@@ -656,7 +767,7 @@ mod tests {
             &self,
             _rule: blackwall_bgp::FlowSpecRule,
         ) -> Result<(), BgpError> {
-            if self.fail {
+            if *self.fail.lock().unwrap() {
                 return Err(BgpError);
             }
             Ok(())
@@ -737,13 +848,16 @@ mod tests {
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
+    /// A fresh controller over the same eligible-prefix config `mgr` uses —
+    /// named for readability at rehydrate-focused call sites that build a
+    /// [`RtbhManager`] directly rather than through `mgr`.
+    fn controller_eligible() -> RtbhController {
+        RtbhController::new(cfg())
+    }
     fn mgr(fail_bgp: bool, fail_j: bool) -> RtbhManager<FakeBgp, FakeJournal> {
         RtbhManager::new(
             RtbhController::new(cfg()),
-            FakeBgp {
-                fail: fail_bgp,
-                ..Default::default()
-            },
+            FakeBgp::with_fail(fail_bgp),
             FakeJournal {
                 fail: fail_j,
                 ..Default::default()
@@ -1201,10 +1315,7 @@ mod tests {
         // manager from switching to record-only.
         let mut m = RtbhManager::new(
             RtbhController::new(cfg()),
-            FakeBgp {
-                fail_withdraw: true,
-                ..Default::default()
-            },
+            FakeBgp::with_fail_withdraw(true),
             FakeJournal::default(),
         );
         m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 0)
@@ -1229,6 +1340,76 @@ mod tests {
         m.apply_event(&DetectionEvent::Opened(det("203.0.113.9")), 2_000, 2_000)
             .await;
         assert!(!m.is_active(ip("203.0.113.9")));
+    }
+
+    /// Counts `tracing` events whose formatted message contains `DISARMED`.
+    ///
+    /// Test-only counting [`Layer`] standing in for `tracing-test` (not a
+    /// workspace dependency — see the `blackwall-rtbh/Cargo.toml` dev-dep
+    /// comment): guards the #193 final-review fix that `disarm()` logs its
+    /// banner exactly once. Before that fix, `bin/blackwalld/src/main.rs`
+    /// ALSO logged a pre-call `DISARMED` warn in each manager task's
+    /// `select!` arm, ahead of `disarm()` actually running — a second,
+    /// premature copy of the same banner. This test only exercises
+    /// `RtbhManager::disarm` directly (the manager-side log), so it can't see
+    /// that main.rs duplicate; it exists to pin the manager side at exactly
+    /// 1 so a future regression there is caught too.
+    #[derive(Clone, Default)]
+    struct DisarmedCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DisarmedCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct MessageContains<'a> {
+                needle: &'a str,
+                found: bool,
+            }
+            impl tracing::field::Visit for MessageContains<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" && format!("{value:?}").contains(self.needle) {
+                        self.found = true;
+                    }
+                }
+            }
+            let mut visitor = MessageContains {
+                needle: "DISARMED",
+                found: false,
+            };
+            event.record(&mut visitor);
+            if visitor.found {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disarm_logs_disarmed_exactly_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let counter = DisarmedCounter::default();
+        let subscriber = tracing_subscriber::registry().with(counter.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut m = mgr(false, false);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 0)
+            .await;
+
+        // A repeated disarm is a no-op (idempotent) and must not re-log.
+        m.disarm(1_000).await;
+        m.disarm(2_000).await;
+
+        assert_eq!(
+            counter.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "DISARMED must be logged exactly once by the manager, even across a repeated disarm() call"
+        );
     }
 
     #[tokio::test]
@@ -1309,6 +1490,62 @@ mod tests {
             *m.journal().announced.lock().unwrap(),
             vec![(ip("203.0.113.7"), BlackholeOrigin::Manual)],
             "self-heal recorded the Manual upgrade, not the stale Auto origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn rehydrate_failure_queues_reapply_and_tick_reconverges() {
+        // #194 C1: a persisted, eligible row whose rehydrate re-announce
+        // fails must NOT be left stranded (active in the controller but
+        // never on the wire) — it is queued for retry and the queue drains
+        // once the BGP session recovers.
+        let bgp = FakeBgp::default();
+        bgp.set_fail(true); // announce errors
+        let mut mgr = RtbhManager::new(controller_eligible(), bgp.clone(), NoOpJournal);
+        mgr.rehydrate(
+            vec![(ip("203.0.113.7"), 1_000, BlackholeOrigin::Auto)],
+            1_000,
+        )
+        .await;
+        assert!(mgr.is_active(ip("203.0.113.7")), "entry kept (not dropped)");
+        assert_eq!(
+            mgr.reapply_pending(),
+            1,
+            "failed re-announce queued for retry"
+        );
+
+        // Session recovers; the next tick re-announces and drains the queue.
+        bgp.set_fail(false);
+        mgr.tick(2_000, 2_000).await;
+        assert_eq!(mgr.reapply_pending(), 0);
+        assert!(bgp.announced_contains("203.0.113.7/32"));
+    }
+
+    #[tokio::test]
+    async fn queue_reapply_dedupes_and_drops_if_cleared() {
+        // A still-failing tick must coalesce (not double-enqueue) the retry
+        // for the same target; and once the entry is cleared before it ever
+        // succeeds, the queued reapply must be dropped rather than
+        // re-announcing a no-longer-wanted route.
+        let bgp = FakeBgp::default();
+        bgp.set_fail(true);
+        let mut mgr = RtbhManager::new(controller_eligible(), bgp.clone(), NoOpJournal);
+        mgr.rehydrate(
+            vec![(ip("203.0.113.7"), 1_000, BlackholeOrigin::Auto)],
+            1_000,
+        )
+        .await;
+        mgr.tick(2_000, 2_000).await; // still failing -> re-queued, NOT double-enqueued
+        assert_eq!(mgr.reapply_pending(), 1, "coalesced, not doubled");
+
+        // Cleared before it ever succeeded (manual withdraw).
+        mgr.apply_remove(ip("203.0.113.7"), 3_000, 3_000).await;
+        bgp.set_fail(false);
+        mgr.tick(4_000, 4_000).await;
+        assert_eq!(mgr.reapply_pending(), 0, "dropped: entry no longer active");
+        assert!(
+            !bgp.announced_contains("203.0.113.7/32"),
+            "not re-announced after clear"
         );
     }
 }

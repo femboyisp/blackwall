@@ -55,6 +55,24 @@ pub(crate) struct MetricsSources {
     /// `xdp` block is configured. Copied from the manager once per tick,
     /// mirroring `rtbh_apply_failures`.
     pub xdp_apply_failures: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// `rehydrate` re-announces currently queued for a self-heal retry after
+    /// a failed BGP announce on restart (issue #194,
+    /// `RtbhManager::reapply_pending`); `None` when no `rtbh` block is
+    /// configured. Copied from the manager once per tick, mirroring how
+    /// `rtbh_apply_failures` reaches this endpoint.
+    pub rtbh_reapply_pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// `rehydrate` re-announces currently queued for a self-heal retry after
+    /// a failed BGP announce on restart (issue #194,
+    /// `FlowSpecManager::reapply_pending`); `None` when no `flowspec` block
+    /// is configured. Copied from the manager once per tick, mirroring
+    /// `rtbh_reapply_pending`.
+    pub flowspec_reapply_pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// `reapply_active` re-applies currently queued for a self-heal retry
+    /// after a failed executor apply on restart (issue #194,
+    /// `blackwall_xdp::manager::XdpManager::reapply_pending`); `None` when no
+    /// `xdp` block is configured. Copied from the manager once per tick,
+    /// mirroring `rtbh_reapply_pending`.
+    pub xdp_reapply_pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Per-plane cross-plane new-mitigation rate cap (C6) skip counters
     /// (`RtbhManager`/`FlowSpecManager::ratecapped`); `None` outside the flow
     /// daemon (no managers to cap). Populated (all-zero) even when no `rtbh`
@@ -67,6 +85,19 @@ pub(crate) struct MetricsSources {
     /// path back to `1` short of a restart. `None` outside the flow daemon
     /// (no RTBH/FlowSpec/XDP managers to arm).
     pub armed: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Whether the RPKI validator (`rpki-validator=`) answered the most
+    /// recent periodic validity check pass: `1` reachable, `0` unreachable
+    /// (fail-open, C2). `None` when `rpki-validator` is not configured, or
+    /// it is configured but no `rtbh` block is present (no ASN to query
+    /// with — the task never spawns). Built unconditionally as `Some(1)`
+    /// (assumed reachable) whenever the check task is spawned, mirroring
+    /// `armed`'s "flipped on observation" pattern.
+    pub rpki_validator_up: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Count of RTBH-eligible prefixes whose RPKI validity state was
+    /// `invalid` or `not-found` at the last periodic check pass (C2) — i.e.
+    /// blackhole more-specifics a validating upstream would silently drop.
+    /// `None` under the same conditions as `rpki_validator_up`.
+    pub rpki_uncovered_prefixes: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -171,12 +202,54 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             value: u64_to_f64(xdp_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
+    if let Some(rtbh_reapply_pending) = &sources.rtbh_reapply_pending {
+        m.push(Metric {
+            name: "blackwall_rtbh_reapply_pending",
+            help: "RTBH rehydrate re-announces queued for a self-heal retry after a failed BGP announce on restart (#194)",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(rtbh_reapply_pending.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(flowspec_reapply_pending) = &sources.flowspec_reapply_pending {
+        m.push(Metric {
+            name: "blackwall_flowspec_reapply_pending",
+            help: "FlowSpec rehydrate re-announces queued for a self-heal retry after a failed BGP announce on restart (#194)",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(
+                flowspec_reapply_pending.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        });
+    }
+    if let Some(xdp_reapply_pending) = &sources.xdp_reapply_pending {
+        m.push(Metric {
+            name: "blackwall_xdp_reapply_pending",
+            help: "XDP reapply_active re-applies queued for a self-heal retry after a failed executor apply on restart (#194)",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(xdp_reapply_pending.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
     if let Some(armed) = &sources.armed {
         m.push(Metric {
             name: "blackwall_armed",
             help: "Whether mitigations are actually applied: 1 live, 0 shadow or disarmed (C5)",
             kind: MetricKind::Gauge,
             value: f64::from(armed.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(validator_up) = &sources.rpki_validator_up {
+        m.push(Metric {
+            name: "blackwall_rpki_validator_up",
+            help: "Whether the RPKI validator answered the last periodic validity check: 1 reachable, 0 unreachable (fail-open, C2)",
+            kind: MetricKind::Gauge,
+            value: f64::from(validator_up.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(uncovered) = &sources.rpki_uncovered_prefixes {
+        m.push(Metric {
+            name: "blackwall_rpki_uncovered_prefixes",
+            help: "RTBH-eligible prefixes whose RPKI validity was invalid/not-found at the last periodic check (C2)",
+            kind: MetricKind::Gauge,
+            value: count_to_f64(uncovered.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
 

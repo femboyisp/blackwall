@@ -724,6 +724,8 @@ mod tests {
             stateless_tcp_ports: Vec::new(),
             protected_prefixes: Vec::new(),
             shadow: false,
+            rpki_validator: None,
+            rpki_check_interval: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -756,6 +758,8 @@ mod tests {
             stateless_tcp_ports: Vec::new(),
             protected_prefixes: Vec::new(),
             shadow: false,
+            rpki_validator: None,
+            rpki_check_interval: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -1264,6 +1268,8 @@ mod tests {
             stateless_tcp_ports: Vec::new(),
             protected_prefixes: Vec::new(),
             shadow: false,
+            rpki_validator: None,
+            rpki_check_interval: std::time::Duration::from_secs(3600),
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.

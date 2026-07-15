@@ -37,6 +37,8 @@ fn sample() -> Policy {
         stateless_tcp_ports: Vec::new(),
         protected_prefixes: Vec::new(),
         shadow: false,
+        rpki_validator: None,
+        rpki_check_interval: std::time::Duration::from_secs(3600),
     }
 }
 
@@ -96,6 +98,8 @@ fn stale_set_elements_removed_on_second_apply() {
         stateless_tcp_ports: Vec::new(),
         protected_prefixes: Vec::new(),
         shadow: false,
+        rpki_validator: None,
+        rpki_check_interval: std::time::Duration::from_secs(3600),
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 

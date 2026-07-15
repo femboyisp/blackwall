@@ -19,6 +19,10 @@ thiserror = { workspace = true }
 # installs its own SIGUSR1 handler, mirroring blackwalld's disarm_signal_task)
 # — not by any unit test, so it stays scoped to dev-dependencies.
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "signal"] }
+# Test-only counting `Layer` for the `disarm` log-once assertion (#193
+# residual) — avoids adding `tracing-test` as a new dependency; reuses the
+# workspace-pinned version already used by `blackwalld`.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

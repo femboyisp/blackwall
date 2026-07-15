@@ -94,18 +94,56 @@ struct MirrorOp {
 impl MirrorOp {
     /// The identity this mirror op concerns, for coalescing purposes.
     fn key(&self) -> MirrorKey {
-        match self.action {
-            XdpAction::RateLimit { src, .. } | XdpAction::ClearRate { src } => MirrorKey::Src(src),
-            XdpAction::Block { net } | XdpAction::Unblock { net } => MirrorKey::Net(net),
-        }
+        mirror_key_of(&self.action)
     }
 }
 
-/// The identity a queued mirror op is coalesced on.
+/// The identity a queued mirror/reapply op is coalesced on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MirrorKey {
     Src(IpAddr),
     Net(IpNet),
+}
+
+/// The coalescing identity of `action` — shared by [`MirrorOp::key`] and
+/// [`ReapplyOp::key`].
+fn mirror_key_of(action: &XdpAction) -> MirrorKey {
+    match *action {
+        XdpAction::RateLimit { src, .. } | XdpAction::ClearRate { src } => MirrorKey::Src(src),
+        XdpAction::Block { net } | XdpAction::Unblock { net } => MirrorKey::Net(net),
+    }
+}
+
+/// A [`XdpManager::reapply_active`] re-apply that failed at the
+/// [`XdpExecutor`] and is queued for a self-heal retry (issue #194).
+///
+/// Unlike [`MirrorOp`] (which only ever replays a journal write, the
+/// executor side already having succeeded), a queued `ReapplyOp` re-attempts
+/// the executor `apply` itself — `reapply_active`'s failure happens on the
+/// executor side, not the journal side (`reapply_active` never re-journals
+/// in the first place).
+///
+/// Holds only the coalescing [`MirrorKey`] identity, not the action that was
+/// captured when the op was queued: [`XdpManager::retry_pending_reapply`]
+/// re-derives the CURRENT action from [`XdpController::current_rate_limit`]/
+/// [`XdpController::current_block`] at retry time rather than replaying a
+/// snapshot, so a fresh, successful re-apply of the same identity with
+/// different parameters (e.g. an operator or detection tightening a
+/// `RateLimit`'s `pps`) that lands between the failed reapply and the retry
+/// is never clobbered by the stale queued content (#194 C1 follow-up).
+/// Mirrors `blackwall_rtbh::manager::RtbhManager`'s private `ReapplyOp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReapplyOp {
+    /// The identity of the action to re-apply; the current action content
+    /// is looked up fresh from the controller at retry time.
+    key: MirrorKey,
+}
+
+impl ReapplyOp {
+    /// The identity this reapply op concerns, for coalescing purposes.
+    fn key(&self) -> MirrorKey {
+        self.key
+    }
 }
 
 /// Outcome of [`XdpManager::execute_and_journal`].
@@ -157,6 +195,16 @@ pub struct XdpManager<E: XdpExecutor, J: XdpJournal> {
     /// succeeded; retried (never re-issued to the executor) by
     /// [`XdpManager::retry_pending_mirror`] on the next tick.
     pending_mirror: Vec<MirrorOp>,
+    /// [`Self::reapply_active`] re-applies that failed at the
+    /// [`XdpExecutor`]; retried by [`Self::retry_pending_reapply`] on the
+    /// next tick (issue #194). The controller's active entry from
+    /// [`XdpController::mark_resumed`] is kept (never rolled back) while
+    /// queued — a re-installed entry is a known-good persisted mitigation
+    /// with no fresh detection to naturally re-attempt it, so rollback would
+    /// strand the control plane believing nothing is installed while the
+    /// journal still says otherwise (mirrors
+    /// `blackwall_rtbh::manager::RtbhManager`'s private `pending_reapply`).
+    pending_reapply: Vec<ReapplyOp>,
     /// Count of executor applies that failed, each counted here (see
     /// [`Self::apply_failures`]); a fresh insert among them is also rolled
     /// back (see [`XdpController::rollback`]).
@@ -182,6 +230,7 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
             executor,
             journal,
             pending_mirror: Vec::new(),
+            pending_reapply: Vec::new(),
             apply_failures: 0,
             disarmed: false,
             disarmed_skips: 0,
@@ -297,11 +346,16 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     /// Drain-retry any journal mirror writes queued by a previous transient
     /// failure. Call periodically.
     ///
-    /// The executor side of each queued op already succeeded when it was
-    /// queued, so this only ever re-attempts the matching journal call — it
-    /// never re-applies to the executor.
+    /// The executor side of each queued mirror op already succeeded when it
+    /// was queued, so that retry only ever re-attempts the matching journal
+    /// call — it never re-applies to the executor. Then retries any
+    /// `reapply_active` re-applies queued by a previous tick's transient
+    /// executor failure (see [`Self::retry_pending_reapply`], issue #194),
+    /// so both self-heals converge within one tick interval of the
+    /// respective dependency recovering.
     pub async fn tick(&mut self) {
         self.retry_pending_mirror().await;
+        self.retry_pending_reapply().await;
     }
 
     /// Re-install persisted active entries on a fresh session (rehydration).
@@ -311,12 +365,18 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     /// but does **not** re-journal, since the row already exists in the
     /// journal. An executor failure here is logged; the entry is still kept
     /// in the controller's active set (matching `RtbhManager::rehydrate`'s
-    /// "never silently drop a persisted row" invariant).
+    /// "never silently drop a persisted row" invariant) and queued via
+    /// [`Self::queue_reapply`] for a retry on the next [`Self::tick`] (issue
+    /// #194): unlike a live detection, a re-installed entry has no natural
+    /// re-detection to compensate for a dropped map write.
     pub async fn reapply_active(&mut self, rows: Vec<(XdpAction, XdpOrigin)>) {
         for (action, origin) in rows {
             self.controller.mark_resumed(&action, origin);
             if let Err(e) = self.executor.apply(action).await {
-                tracing::warn!(error = %e, ?action, "XDP: reapply_active executor call failed");
+                tracing::warn!(error = %e, ?action, "XDP: reapply_active executor call failed; queuing for retry");
+                self.queue_reapply(ReapplyOp {
+                    key: mirror_key_of(&action),
+                });
             }
         }
     }
@@ -345,6 +405,18 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
     #[must_use]
     pub fn apply_failures(&self) -> u64 {
         self.apply_failures
+    }
+
+    /// Number of [`Self::reapply_active`] re-applies currently queued for a
+    /// self-heal retry after a failed executor apply on restart (issue
+    /// #194). Each queued entry is still active in the controller (kept, not
+    /// rolled back) but not yet confirmed on the map; drained by
+    /// [`Self::retry_pending_reapply`] on the next [`Self::tick`]. Surfaced
+    /// for `/metrics` as `blackwall_xdp_reapply_pending`, mirroring
+    /// `blackwall_rtbh::manager::RtbhManager::reapply_pending`.
+    #[must_use]
+    pub fn reapply_pending(&self) -> usize {
+        self.pending_reapply.len()
     }
 
     /// In-daemon disarm kill switch (C5): withdraw every currently-active
@@ -410,6 +482,15 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         let key = op.key();
         self.pending_mirror.retain(|o| o.key() != key);
         self.pending_mirror.push(op);
+    }
+
+    /// Queue a failed [`Self::reapply_active`] re-apply for retry, coalescing
+    /// by identity (source or network), same as [`Self::queue_mirror`]
+    /// (issue #194).
+    fn queue_reapply(&mut self, op: ReapplyOp) {
+        let key = op.key();
+        self.pending_reapply.retain(|o| o.key() != key);
+        self.pending_reapply.push(op);
     }
 
     /// Execute one controller action on the executor and mirror it into the journal.
@@ -489,6 +570,44 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         }
     }
 
+    /// Drain-retry queued [`Self::reapply_active`] re-applies left over from
+    /// a transient executor failure (issue #194).
+    ///
+    /// Each queued op re-derives the CURRENT action for its identity from
+    /// [`XdpController::current_rate_limit`]/[`XdpController::current_block`]
+    /// rather than replaying the action snapshot captured when the op was
+    /// queued: if the identity is no longer active (e.g. cleared by a manual
+    /// remove between the failed reapply and this tick), the lookup returns
+    /// `None` and the op is dropped — re-applying an entry the control plane
+    /// no longer wants live would itself create a phantom. If the identity
+    /// is still active but a fresh, successful re-apply changed its
+    /// parameters in the meantime (e.g. tightening a `RateLimit`'s `pps`),
+    /// re-deriving picks up that CURRENT action instead of replaying the
+    /// stale queued one, which would otherwise silently revert the fresh
+    /// update (#194 C1 follow-up). Otherwise the apply is re-attempted; ops
+    /// that still fail are kept (retried again on the next call), ops that
+    /// succeed are dropped.
+    async fn retry_pending_reapply(&mut self) {
+        if self.pending_reapply.is_empty() {
+            return;
+        }
+        let ops = std::mem::take(&mut self.pending_reapply);
+        for op in ops {
+            let current = match op.key {
+                MirrorKey::Src(src) => self.controller.current_rate_limit(src),
+                MirrorKey::Net(net) => self.controller.current_block(net),
+            };
+            let Some(action) = current else {
+                tracing::info!(key = ?op.key, "XDP: dropping queued reapply; entry no longer active");
+                continue;
+            };
+            if let Err(e) = self.executor.apply(action).await {
+                tracing::warn!(error = %e, ?action, "XDP: reapply retry failed; re-queuing");
+                self.pending_reapply.push(op);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn executor(&self) -> &E {
         &self.executor
@@ -510,17 +629,31 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
 mod tests {
     use super::*;
     use blackwall_flow::{AttackKind, Detection, DetectionEvent, Severity};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct FakeExecutor {
-        applied: Mutex<Vec<XdpAction>>,
-        fail: bool,
+        applied: Arc<Mutex<Vec<XdpAction>>>,
+        fail: Arc<Mutex<bool>>,
         /// If `Some(n)`, the n-th call (1-indexed) onward fails; earlier
         /// calls succeed. Used to simulate a successful fresh insert
         /// followed by a failing upgrade apply (Fix 2 regression test).
         fail_from_call: Option<usize>,
-        call_count: Mutex<usize>,
+        call_count: Arc<Mutex<usize>>,
+    }
+    impl FakeExecutor {
+        /// Build a fake whose `apply` fails from the start.
+        fn with_fail(fail: bool) -> Self {
+            let f = Self::default();
+            f.set_fail(fail);
+            f
+        }
+        /// Flip the failure toggle at runtime — lets a test simulate the
+        /// executor recovering mid-scenario (a clone shares the same
+        /// underlying flag with whatever manager holds this fake).
+        fn set_fail(&self, fail: bool) {
+            *self.fail.lock().unwrap() = fail;
+        }
     }
     #[async_trait]
     impl XdpExecutor for FakeExecutor {
@@ -530,7 +663,8 @@ mod tests {
                 *count += 1;
                 *count
             };
-            if self.fail || self.fail_from_call.is_some_and(|from| call_no >= from) {
+            if *self.fail.lock().unwrap() || self.fail_from_call.is_some_and(|from| call_no >= from)
+            {
                 return Err(XdpExecError);
             }
             self.applied.lock().unwrap().push(action);
@@ -600,10 +734,7 @@ mod tests {
     fn mgr(fail_exec: bool, fail_journal: bool) -> XdpManager<FakeExecutor, FakeJournal> {
         XdpManager::new(
             XdpController::new(own(), 100, 1000, Vec::new()),
-            FakeExecutor {
-                fail: fail_exec,
-                ..Default::default()
-            },
+            FakeExecutor::with_fail(fail_exec),
             FakeJournal {
                 fail: fail_journal,
                 ..Default::default()
@@ -882,6 +1013,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disarm_tolerates_a_withdraw_error() {
+        // Best-effort: an executor Err on disarm's withdraw (ClearRate) apply
+        // must not abort the sweep (a second active entry is still swept) or
+        // stop the manager from switching to record-only. Mirrors
+        // `blackwall_rtbh::manager::RtbhManager`'s
+        // `disarm_tolerates_a_withdraw_error`.
+        let mut m = XdpManager::new(
+            XdpController::new(own(), 100, 1000, Vec::new()),
+            FakeExecutor {
+                // Calls 1-2 (the two fresh rate-limit installs) succeed;
+                // call 3 onward (disarm's ClearRate withdraws) fail.
+                fail_from_call: Some(3),
+                ..Default::default()
+            },
+            FakeJournal::default(),
+        );
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.7", vec!["198.51.100.9"])),
+            0,
+        )
+        .await;
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.8", vec!["198.51.100.10"])),
+            0,
+        )
+        .await;
+        assert_eq!(m.active().len(), 2);
+
+        m.disarm(1_000).await;
+
+        assert!(
+            !m.executor()
+                .applied
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| matches!(a, XdpAction::ClearRate { .. })),
+            "every withdraw errored, so no ClearRate was recorded by the fake"
+        );
+        assert!(
+            m.active().is_empty(),
+            "disarm clears the active set even when every withdraw errors (best-effort)"
+        );
+
+        // Record-only holds even though disarm itself never got a
+        // confirmed withdraw.
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.9", vec!["198.51.100.11"])),
+            2_000,
+        )
+        .await;
+        assert!(m.active().is_empty());
+    }
+
+    #[tokio::test]
     async fn apply_add_while_disarmed_is_rejected_not_applied() {
         // C5 + final-review fix: a manual add while disarmed must be
         // classified Rejected (retrying is pointless — there is no re-arm
@@ -1004,5 +1190,124 @@ mod tests {
         };
         assert!(journal.record(&block, XdpOrigin::Manual, 0).await.is_ok());
         assert!(journal.record(&rate, XdpOrigin::Auto, 1000).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reapply_active_failure_queues_reapply_and_tick_reconverges() {
+        // #194 C1: a persisted, active entry whose reapply fails at the
+        // executor must NOT be left stranded (active in the controller but
+        // never written to the eBPF map) — it is queued for retry and the
+        // queue drains once the executor recovers.
+        let executor = FakeExecutor::with_fail(true); // apply errors
+        let mut m = XdpManager::new(
+            XdpController::new(own(), 100, 1000, Vec::new()),
+            executor.clone(),
+            FakeJournal::default(),
+        );
+        let net: IpNet = "198.51.100.0/24".parse().unwrap();
+        let action = XdpAction::Block { net };
+        m.reapply_active(vec![(action, XdpOrigin::Manual)]).await;
+        assert!(
+            m.active().iter().any(|(a, _)| *a == action),
+            "entry kept (not dropped)"
+        );
+        assert_eq!(m.reapply_pending(), 1, "failed reapply queued for retry");
+
+        // Executor recovers; the next tick re-applies and drains the queue.
+        executor.set_fail(false);
+        m.tick().await;
+        assert_eq!(m.reapply_pending(), 0);
+        assert!(m.executor().applied.lock().unwrap().contains(&action));
+    }
+
+    #[tokio::test]
+    async fn queue_reapply_dedupes_and_drops_if_cleared() {
+        // A still-failing tick must coalesce (not double-enqueue) the retry
+        // for the same entry; and once the entry is cleared before it ever
+        // succeeds, the queued reapply must be dropped rather than
+        // re-applying a no-longer-wanted action.
+        let executor = FakeExecutor::with_fail(true);
+        let mut m = XdpManager::new(
+            XdpController::new(own(), 100, 1000, Vec::new()),
+            executor.clone(),
+            FakeJournal::default(),
+        );
+        let net: IpNet = "198.51.100.0/24".parse().unwrap();
+        let action = XdpAction::Block { net };
+        m.reapply_active(vec![(action, XdpOrigin::Manual)]).await;
+        m.tick().await; // still failing -> re-queued, NOT double-enqueued
+        assert_eq!(m.reapply_pending(), 1, "coalesced, not doubled");
+
+        // Cleared before it ever succeeded (manual unblock).
+        m.apply_remove(net, 3_000).await;
+        executor.set_fail(false);
+        m.tick().await;
+        assert_eq!(m.reapply_pending(), 0, "dropped: entry no longer active");
+        assert!(
+            !m.executor().applied.lock().unwrap().contains(&action),
+            "not re-applied after clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reapply_does_not_clobber_a_fresh_successful_update() {
+        // #194 C1 follow-up: `retry_pending_reapply` must re-derive the
+        // controller's CURRENT action for the identity at retry time, not
+        // replay the action snapshot captured when the op was queued.
+        // Otherwise a fresh, successful re-apply of the SAME source with
+        // DIFFERENT parameters that lands between the failed reapply and
+        // the retry gets silently reverted by the stale queued content — a
+        // mitigation-weakening regression (e.g. a fresh `pps:1000` reverted
+        // back to a stale queued `pps:500`).
+        let executor = FakeExecutor::with_fail(true); // reapply_active apply fails
+        let mut m = XdpManager::new(
+            XdpController::new(own(), 100, 1000, Vec::new()),
+            executor.clone(),
+            FakeJournal::default(),
+        );
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        let old = XdpAction::RateLimit {
+            src: addr,
+            pps: 500,
+            burst: 500,
+            victim: None,
+        };
+        m.reapply_active(vec![(old, XdpOrigin::Manual)]).await;
+        assert!(
+            m.active().iter().any(|(a, _)| *a == old),
+            "entry kept (not dropped)"
+        );
+        assert_eq!(m.reapply_pending(), 1, "failed reapply queued for retry");
+
+        // Executor recovers just in time for a FRESH, successful re-apply
+        // with DIFFERENT parameters for the SAME source, landing before the
+        // next tick drains the stale queue.
+        executor.set_fail(false);
+        let outcome = m.apply_rate_limit(addr, 1000, 1000, 1_500).await;
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        let new = XdpAction::RateLimit {
+            src: addr,
+            pps: 1000,
+            burst: 1000,
+            victim: None,
+        };
+        assert!(
+            m.executor().applied.lock().unwrap().contains(&new),
+            "the fresh update reached the executor"
+        );
+
+        // The next tick drains the (now-stale) queued reapply. It must
+        // re-derive and re-apply the CURRENT action (pps 1000), not replay
+        // the stale queued snapshot (pps 500) — which would silently revert
+        // the fresh update.
+        m.tick().await;
+        assert_eq!(m.reapply_pending(), 0);
+
+        let applied = m.executor().applied.lock().unwrap();
+        let last = applied.last().expect("at least one apply recorded");
+        assert_eq!(
+            *last, new,
+            "the drained retry must re-apply the CURRENT action, not the stale queued one"
+        );
     }
 }
