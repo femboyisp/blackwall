@@ -136,6 +136,17 @@ pub struct XdpManager<E: XdpExecutor, J: XdpJournal> {
     /// [`Self::apply_failures`]); a fresh insert among them is also rolled
     /// back (see [`XdpController::rollback`]).
     apply_failures: u64,
+    /// One-way in-daemon disarm kill switch (C5), flipped by [`Self::disarm`].
+    /// While set, [`Self::execute_and_journal`] skips every new install
+    /// (`Block`/`RateLimit`, never reaching [`Self::executor`]) while
+    /// detection keeps running unchanged. There is no re-arm entry point; a
+    /// fresh process (restart) is the only way back to armed. Mirrors
+    /// `blackwall_rtbh::manager::RtbhManager::disarmed`.
+    disarmed: bool,
+    /// Count of installs skipped because [`Self::disarmed`] was set (C5) —
+    /// a SKIP (never attempted), distinct from [`Self::apply_failures`]
+    /// (attempted and failed at the executor). See [`Self::disarmed_skips`].
+    disarmed_skips: u64,
 }
 
 impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
@@ -147,6 +158,8 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
             journal,
             pending_mirror: Vec::new(),
             apply_failures: 0,
+            disarmed: false,
+            disarmed_skips: 0,
         }
     }
 
@@ -289,6 +302,57 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         self.apply_failures
     }
 
+    /// In-daemon disarm kill switch (C5): withdraw every currently-active
+    /// block/rate-limit and switch to record-only for the rest of this
+    /// process's life.
+    ///
+    /// Mirrors `blackwall_rtbh::manager::RtbhManager::disarm`: each active
+    /// entry is undone on the executor best-effort (an apply `Err` is logged
+    /// and the sweep continues), no journal write happens (disarm is
+    /// runtime-only — a restart re-arms and [`Self::reapply_active`]s the
+    /// same active set), and once disarmed every subsequent new
+    /// `Block`/`RateLimit` install is skipped in [`Self::execute_and_journal`]
+    /// and counted in [`Self::disarmed_skips`] — an `Unblock`/`ClearRate`
+    /// (a removal, not an install) is never gated. One-way and idempotent.
+    ///
+    /// `mono_now` is accepted for symmetry with the RTBH/FlowSpec managers'
+    /// `disarm` entry points; it is unused here.
+    pub async fn disarm(&mut self, _mono_now: u64) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        let actives: Vec<XdpAction> = self
+            .controller
+            .active_entries()
+            .into_iter()
+            .map(|(action, _origin)| action)
+            .collect();
+        for action in actives {
+            let inverse = match action {
+                XdpAction::Block { net } => self.controller.manual_unblock(net),
+                XdpAction::RateLimit { src, .. } => self.controller.manual_clear_rate(src),
+                // `active_entries` never yields a removal variant.
+                XdpAction::Unblock { .. } | XdpAction::ClearRate { .. } => continue,
+            };
+            if let Ok(inv) = inverse {
+                if let Err(e) = self.executor.apply(inv).await {
+                    tracing::warn!(error = %e, ?action, "XDP: disarm apply (withdraw) failed; continuing best-effort");
+                }
+            }
+        }
+        tracing::warn!("XDP: DISARMED — mitigations withdrawn, now recording only");
+    }
+
+    /// Count of new installs (`Block`/`RateLimit`) skipped because the
+    /// manager was [`Self::disarm`]ed (C5) — a SKIP (never attempted),
+    /// distinct from [`Self::apply_failures`] (attempted and failed at the
+    /// executor).
+    #[must_use]
+    pub fn disarmed_skips(&self) -> u64 {
+        self.disarmed_skips
+    }
+
     /// Queue a failed mirror write for self-heal, coalescing by identity
     /// (source or network).
     ///
@@ -320,6 +384,22 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         wall_now: u64,
         fresh: bool,
     ) {
+        if self.disarmed
+            && matches!(
+                action,
+                XdpAction::Block { .. } | XdpAction::RateLimit { .. }
+            )
+        {
+            tracing::warn!(
+                ?action,
+                "XDP: disarmed (C5); skipping install, recording only"
+            );
+            if fresh {
+                self.controller.rollback(&action);
+            }
+            self.disarmed_skips = self.disarmed_skips.saturating_add(1);
+            return;
+        }
         if let Err(e) = self.executor.apply(action).await {
             self.apply_failures = self.apply_failures.saturating_add(1);
             if fresh {
@@ -708,6 +788,41 @@ mod tests {
             1,
             "repeated failures for one source coalesce to a single queued op"
         );
+    }
+
+    #[tokio::test]
+    async fn disarm_withdraws_all_and_switches_to_record_only() {
+        let mut m = mgr(false, false);
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.7", vec!["198.51.100.9"])),
+            1000,
+        )
+        .await;
+        assert_eq!(m.active().len(), 1);
+
+        m.disarm(2_000).await;
+
+        assert!(m.active().is_empty(), "disarm must clear the active set");
+        // The withdraw (ClearRate) reached the executor.
+        assert!(m
+            .executor()
+            .applied
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| matches!(a, XdpAction::ClearRate { .. })));
+
+        // A subsequent detection is recorded, not executed.
+        let applied_before = m.executor().applied.lock().unwrap().len();
+        m.on_detection(
+            &DetectionEvent::Opened(det("203.0.113.7", vec!["198.51.100.10"])),
+            3000,
+        )
+        .await;
+        assert!(m.active().is_empty());
+        assert_eq!(m.executor().applied.lock().unwrap().len(), applied_before);
+        assert_eq!(m.apply_failures(), 0);
+        assert_eq!(m.disarmed_skips(), 1);
     }
 
     #[tokio::test]

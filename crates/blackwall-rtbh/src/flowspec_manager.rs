@@ -109,6 +109,17 @@ pub struct FlowSpecManager<B: BgpExecutor, J: FlowSpecJournal> {
     /// [`Self::apply_failures`] (attempted and failed at BGP). See
     /// [`Self::ratecapped`].
     ratecapped: u64,
+    /// One-way in-daemon disarm kill switch (C5), flipped by [`Self::disarm`].
+    /// While set, [`Self::execute_and_journal_announce`] skips every new
+    /// `Announce` (never reaches [`Self::bgp`]) while detection + selection
+    /// keep running unchanged. There is no re-arm entry point; a fresh
+    /// process (restart) is the only way back to armed. Mirrors
+    /// [`crate::manager::RtbhManager::disarmed`].
+    disarmed: bool,
+    /// Count of announces skipped because [`Self::disarmed`] was set (C5) —
+    /// a SKIP (never attempted), distinct from both [`Self::apply_failures`]
+    /// and [`Self::ratecapped`]. See [`Self::disarmed_skips`].
+    disarmed_skips: u64,
 }
 
 impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
@@ -122,6 +133,8 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             apply_failures: 0,
             rate_limiter: None,
             ratecapped: 0,
+            disarmed: false,
+            disarmed_skips: 0,
         }
     }
 
@@ -341,6 +354,59 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         self.ratecapped
     }
 
+    /// In-daemon disarm kill switch (C5): withdraw every currently-active
+    /// rule and switch to record-only for the rest of this process's life.
+    ///
+    /// Mirrors [`crate::manager::RtbhManager::disarm`]: each active rule is
+    /// withdrawn on BGP best-effort (a withdraw `Err` is logged and the
+    /// sweep continues), no journal write happens (disarm is runtime-only —
+    /// a restart re-arms and [`Self::rehydrate`]s the same active set), and
+    /// once disarmed every subsequent `Announce` is skipped in
+    /// [`Self::execute_and_journal_announce`] and counted in
+    /// [`Self::disarmed_skips`]. One-way and idempotent.
+    ///
+    /// `mono_now` is accepted for symmetry with the other entry points that
+    /// funnel through the execute path; it is unused here.
+    pub async fn disarm(&mut self, _mono_now: u64) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        let keys: Vec<FlowKey> = self
+            .controller
+            .active_rules()
+            .into_iter()
+            .map(|(key, ..)| key)
+            .collect();
+        for key in keys {
+            // The action on this synthetic rule is never read: `manual_remove`
+            // looks the entry up by `(dst, protocol, dst_port)` only (see
+            // `key_of`) and withdraws the *stored* rule, action included.
+            let placeholder = FlowSpecRule {
+                dst: key.0,
+                protocol: Some(key.1),
+                dst_port: Some(key.2),
+                action: blackwall_bgp::FlowAction::TrafficRate(0.0),
+            };
+            for action in self.controller.manual_remove(placeholder) {
+                if let FlowSpecAction::Withdraw(rule) = action {
+                    if let Err(e) = self.bgp.withdraw_flowspec(rule).await {
+                        tracing::warn!(?key, error = %e, "FlowSpec: disarm withdraw failed; continuing best-effort");
+                    }
+                }
+            }
+        }
+        tracing::warn!("FlowSpec: DISARMED — mitigations withdrawn, now recording only");
+    }
+
+    /// Count of new-mitigation announces skipped because the manager was
+    /// [`Self::disarm`]ed (C5) — a SKIP (never attempted), distinct from
+    /// both [`Self::apply_failures`] and [`Self::ratecapped`].
+    #[must_use]
+    pub fn disarmed_skips(&self) -> u64 {
+        self.disarmed_skips
+    }
+
     fn is_active(&self, key: FlowKey) -> bool {
         self.controller
             .active_rules()
@@ -401,6 +467,15 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         wall_now: u64,
     ) {
         let key = key_of(&rule);
+        if self.disarmed {
+            tracing::warn!(
+                ?key,
+                "FlowSpec: disarmed (C5); skipping announce, recording only"
+            );
+            self.controller.rollback(key);
+            self.disarmed_skips = self.disarmed_skips.saturating_add(1);
+            return;
+        }
         if let Some(limiter) = &self.rate_limiter {
             let allowed = limiter
                 .lock()
@@ -1060,6 +1135,44 @@ mod tests {
             1,
             "repeated failures for one key coalesce to a single queued op"
         );
+    }
+
+    #[tokio::test]
+    async fn disarm_withdraws_all_and_switches_to_record_only() {
+        let mut m = mgr(false, false);
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key));
+
+        m.disarm(2_000).await;
+
+        assert_eq!(
+            m.bgp().withdrawn.lock().unwrap().len(),
+            1,
+            "disarm must withdraw every active rule"
+        );
+        assert!(!m.is_active(key), "disarm must clear the active set");
+
+        // A subsequent detection is recorded, not executed.
+        m.apply_open(
+            ip("203.0.113.8"),
+            &[flow_rule("203.0.113.8", 17, 53, 0.0)],
+            3_000,
+            3_000,
+        )
+        .await;
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(!m.is_active(key2));
+        assert_eq!(m.bgp().announced.lock().unwrap().len(), 1);
+        assert_eq!(m.apply_failures(), 0);
+        assert_eq!(m.ratecapped(), 0);
+        assert_eq!(m.disarmed_skips(), 1);
     }
 
     #[tokio::test]

@@ -61,6 +61,12 @@ pub(crate) struct MetricsSources {
     /// block is configured or `max-new-per-min` is unset (unlimited), mirroring
     /// `protected_skipped`.
     pub ratecapped: Option<Arc<crate::shadow::RatecappedMetrics>>,
+    /// Whether mitigations are actually being applied: `1` live, `0` under
+    /// `shadow` or after an in-daemon disarm (C5, SIGUSR1) — flipped to `0`
+    /// exactly once, at process start (shadow) or on disarm; there is no
+    /// path back to `1` short of a restart. `None` outside the flow daemon
+    /// (no RTBH/FlowSpec/XDP managers to arm).
+    pub armed: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 /// Correctly-rounded `u64 -> f64` without an `as` cast: `u32 -> f64` is exact
@@ -163,6 +169,14 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             help: "XDP executor (eBPF-map) applies that failed and were rolled back (C2)",
             kind: MetricKind::Counter,
             value: u64_to_f64(xdp_apply_failures.load(std::sync::atomic::Ordering::Relaxed)),
+        });
+    }
+    if let Some(armed) = &sources.armed {
+        m.push(Metric {
+            name: "blackwall_armed",
+            help: "Whether mitigations are actually applied: 1 live, 0 shadow or disarmed (C5)",
+            kind: MetricKind::Gauge,
+            value: f64::from(armed.load(std::sync::atomic::Ordering::Relaxed)),
         });
     }
 

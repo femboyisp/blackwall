@@ -114,6 +114,18 @@ pub struct RtbhManager<B: BgpExecutor, J: BlackholeJournal> {
     /// [`Self::apply_failures`] (attempted and failed at BGP). See
     /// [`Self::ratecapped`].
     ratecapped: u64,
+    /// One-way in-daemon disarm kill switch (C5), flipped by [`Self::disarm`].
+    /// While set, [`Self::execute_and_journal_announce`] skips every new
+    /// `Announce` (never reaches [`Self::bgp`]) while detection + selection
+    /// keep running unchanged — the manager keeps recording, it just stops
+    /// applying. There is no re-arm entry point; a fresh process (restart)
+    /// is the only way back to armed.
+    disarmed: bool,
+    /// Count of announces skipped because [`Self::disarmed`] was set (C5) —
+    /// a SKIP (never attempted), distinct from both [`Self::apply_failures`]
+    /// (attempted and failed) and [`Self::ratecapped`] (skipped for a
+    /// different reason). See [`Self::disarmed_skips`].
+    disarmed_skips: u64,
 }
 
 /// A journal mirror write that failed and is queued for a self-heal retry.
@@ -152,6 +164,8 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
             apply_failures: 0,
             rate_limiter: None,
             ratecapped: 0,
+            disarmed: false,
+            disarmed_skips: 0,
         }
     }
 
@@ -341,6 +355,60 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         self.ratecapped
     }
 
+    /// In-daemon disarm kill switch (C5): withdraw every currently-active
+    /// blackhole and switch to record-only for the rest of this process's
+    /// life.
+    ///
+    /// Each active target is withdrawn on BGP best-effort — a withdraw
+    /// `Err` is logged and the sweep continues with the next target (never
+    /// aborts), mirroring how [`Self::execute_and_journal`] already treats a
+    /// withdraw failure elsewhere: log and move on. No journal write happens
+    /// here, unlike a normal withdraw: disarm is a *runtime-only* state, not
+    /// a persisted decision — a restart re-arms and [`Self::rehydrate`]s the
+    /// very same active set from the journal, exactly as if disarm had never
+    /// happened. Once disarmed, every subsequent `Announce` reaching
+    /// [`Self::execute_and_journal_announce`] is skipped (never sent to
+    /// [`Self::bgp`]) and counted in [`Self::disarmed_skips`] — detection
+    /// and selection keep running unchanged (visibility retained), only the
+    /// apply step is gated. One-way: calling this again is a no-op (idempotent
+    /// under a repeated SIGUSR1), and there is no re-arm entry point.
+    ///
+    /// `mono_now` is accepted for symmetry with the other entry points that
+    /// funnel through the execute path; it is unused here (a disarm withdraw
+    /// bypasses hold-down via [`RtbhController::manual_remove`] and needs no
+    /// time arithmetic).
+    pub async fn disarm(&mut self, _mono_now: u64) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        let targets: Vec<IpAddr> = self
+            .controller
+            .active_blackholes()
+            .into_iter()
+            .map(|(target, ..)| target)
+            .collect();
+        for target in targets {
+            for action in self.controller.manual_remove(target) {
+                if let RtbhAction::Withdraw(prefix) = action {
+                    if let Err(e) = self.bgp.withdraw(prefix).await {
+                        tracing::warn!(%target, error = %e, "RTBH: disarm withdraw failed; continuing best-effort");
+                    }
+                }
+            }
+        }
+        tracing::warn!("RTBH: DISARMED — mitigations withdrawn, now recording only");
+    }
+
+    /// Count of new-mitigation announces skipped because the manager was
+    /// [`Self::disarm`]ed (C5) — a SKIP (never attempted), distinct from
+    /// both [`Self::apply_failures`] (attempted and failed at BGP) and
+    /// [`Self::ratecapped`] (skipped for a different reason).
+    #[must_use]
+    pub fn disarmed_skips(&self) -> u64 {
+        self.disarmed_skips
+    }
+
     fn is_active(&self, target: IpAddr) -> bool {
         self.controller
             .active_blackholes()
@@ -409,6 +477,12 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         mono_now: u64,
         wall_now: u64,
     ) {
+        if self.disarmed {
+            tracing::warn!(%target, "RTBH: disarmed (C5); skipping announce, recording only");
+            self.controller.rollback(target);
+            self.disarmed_skips = self.disarmed_skips.saturating_add(1);
+            return;
+        }
         if let Some(limiter) = &self.rate_limiter {
             let allowed = limiter
                 .lock()
@@ -505,6 +579,11 @@ mod tests {
         announced: Mutex<Vec<IpNet>>,
         withdrawn: Mutex<Vec<IpNet>>,
         fail: bool,
+        /// Independent withdraw-only failure toggle, for exercising disarm's
+        /// best-effort tolerance of a withdraw `Err` without also blocking
+        /// the announce that must precede it (unlike `fail`, which fails
+        /// both).
+        fail_withdraw: bool,
     }
     #[async_trait]
     impl BgpExecutor for FakeBgp {
@@ -516,7 +595,7 @@ mod tests {
             Ok(())
         }
         async fn withdraw(&self, prefix: IpNet) -> Result<(), BgpError> {
-            if self.fail {
+            if self.fail || self.fail_withdraw {
                 return Err(BgpError);
             }
             self.withdrawn.lock().unwrap().push(prefix);
@@ -1027,6 +1106,91 @@ mod tests {
             1,
             "repeated failures for one target coalesce to a single queued op"
         );
+    }
+
+    #[tokio::test]
+    async fn disarm_withdraws_all_and_switches_to_record_only() {
+        // C5: disarm must withdraw every active blackhole on BGP (best
+        // effort), clear the active set, and thereafter skip every new
+        // Announce (record-only) — detection/selection keep running (the
+        // manager still accepts events), only the apply step is gated.
+        let mut m = mgr(false, false);
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 1_000, 1_000)
+            .await;
+        assert!(m.is_active(ip("203.0.113.7")));
+
+        m.disarm(2_000).await;
+
+        assert!(
+            m.bgp()
+                .withdrawn
+                .lock()
+                .unwrap()
+                .contains(&"203.0.113.7/32".parse::<IpNet>().unwrap()),
+            "disarm must withdraw every active target"
+        );
+        assert!(
+            !m.is_active(ip("203.0.113.7")),
+            "disarm must clear the active set"
+        );
+
+        // A subsequent detection is recorded (the controller still runs),
+        // but must NOT be announced — record-only.
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.8")), 3_000, 3_000)
+            .await;
+        assert_eq!(
+            m.bgp().announced.lock().unwrap().len(),
+            1,
+            "no new announce may execute once disarmed"
+        );
+        assert!(
+            !m.is_active(ip("203.0.113.8")),
+            "a disarmed skip must not leave a phantom active entry"
+        );
+        assert_eq!(
+            m.apply_failures(),
+            0,
+            "a disarmed skip is not an apply_failure (never attempted)"
+        );
+        assert_eq!(m.ratecapped(), 0, "a disarmed skip is not a rate-cap skip");
+        assert_eq!(m.disarmed_skips(), 1);
+    }
+
+    #[tokio::test]
+    async fn disarm_tolerates_a_withdraw_error() {
+        // Best-effort: a withdraw Err during disarm must not abort the
+        // sweep (a second active target is still withdrawn) or stop the
+        // manager from switching to record-only.
+        let mut m = RtbhManager::new(
+            RtbhController::new(cfg()),
+            FakeBgp {
+                fail_withdraw: true,
+                ..Default::default()
+            },
+            FakeJournal::default(),
+        );
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 0, 0)
+            .await;
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.8")), 0, 0)
+            .await;
+        assert_eq!(m.active().len(), 2);
+
+        m.disarm(1_000).await;
+
+        assert!(
+            m.bgp().withdrawn.lock().unwrap().is_empty(),
+            "every withdraw errored, so none was recorded by the fake"
+        );
+        assert!(
+            m.active().is_empty(),
+            "disarm clears the active set even when every withdraw errors (best-effort)"
+        );
+
+        // Record-only holds even though disarm itself never got a
+        // confirmed withdraw.
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.9")), 2_000, 2_000)
+            .await;
+        assert!(!m.is_active(ip("203.0.113.9")));
     }
 
     #[tokio::test]
