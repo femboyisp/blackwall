@@ -105,7 +105,8 @@ Then follow the two runbooks for the hands-on first-run procedure:
 Set `metrics listen=127.0.0.1:9100` in the config and scrape `GET /metrics`:
 - `flow`: BGP session state + reconnects, sFlow datagrams/decode-errors, active
   RTBH/FlowSpec counts, pending queue depths, detection/session/audit totals,
-  and (with `cookie-ports=` set) `blackwall_xdp_syn_cookies_sent_total`.
+  and (with `cookie-ports=` set) `blackwall_xdp_syn_cookies_sent_total` +
+  `blackwall_xdp_syn_cookies_txcapped_total`.
 - `run`: `blackwall_deception_sessions_active` (live in-flight) + session/audit
   totals, and (with `stateless-tcp ports=` set) `blackwall_stateless_syn_cookies_sent_total`,
   `blackwall_stateless_acks_validated_total`, `blackwall_stateless_acks_rejected_total`,
@@ -194,11 +195,28 @@ install steps above) for this to work.
   services) passes through untouched. A legitimate client's follow-up ACK falls
   through (`XDP_PASS`) to the userspace stateless responder above, which
   validates the byte-identical cookie and serves the banner.
+- **Global SYN-cookie mint-rate cap** — the in-kernel cookie fast path is a
+  gain-1 reflector against a spoofed-source flood (each spoofed source's
+  per-source rate limit never re-triggers, since the address is never reused),
+  so a global `syn-cookie-tx-cap=<pps>` bounds the *aggregate* rate of
+  `XDP_TX`-emitted cookie SYN-ACKs regardless of how many distinct sources the
+  flood spreads across:
+  ```
+  xdp interface=eth0 cookie-ports=8080,443 syn-cookie-tx-cap=2000
+  ```
+  Always enforced once `cookie-ports` is armed — if you omit
+  `syn-cookie-tx-cap`, blackwall installs a conservative built-in default
+  (1000 pps) rather than leaving the reflector uncapped, so there is no way to
+  turn on the cookie fast path with an unbounded amplification ceiling. SYNs
+  denied a cookie because the cap is exhausted fall through to their normal
+  (non-cookie) verdict rather than being answered.
 - **Metrics:** `blackwall_stateless_syn_cookies_sent_total`,
   `blackwall_stateless_acks_validated_total`,
   `blackwall_stateless_acks_rejected_total`, and
   `blackwall_stateless_udp_responses_total` on the `run` daemon's `/metrics`;
-  `blackwall_xdp_syn_cookies_sent_total` on the `flow` daemon's `/metrics`.
+  `blackwall_xdp_syn_cookies_sent_total` and
+  `blackwall_xdp_syn_cookies_txcapped_total` (SYNs denied a cookie because
+  `syn-cookie-tx-cap` was exhausted) on the `flow` daemon's `/metrics`.
 
 ## POP sensor (sFlow)
 Anycast POPs are not `blackwalld` hosts: each POP runs `hsflowd` (host-sflow)

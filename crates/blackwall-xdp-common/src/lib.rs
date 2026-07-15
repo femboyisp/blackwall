@@ -21,8 +21,16 @@ pub const REASON_SYNCOOKIE: u32 = 3;
 /// (sub-project B3.1). Counts frames matching the redirect condition that were
 /// handed to the zero-copy/copy-mode `AF_XDP` receiver ahead of the kernel stack.
 pub const REASON_REDIRECT: u32 = 4;
+/// A TCP SYN that cleared every gate (protected prefix + port, per-source
+/// `RATE` budget, valid `COOKIE_KEY`) but was denied a SipHash-cookie SYN-ACK
+/// because the global per-CPU [`TxBucket`] mint budget (sub-project X3) was
+/// exhausted. The SYN falls through to its normal non-cookie verdict instead
+/// of being answered via `XDP_TX`. Distinguishing this from [`REASON_PASS`]
+/// lets userspace tell "the box is at its configured SYN-ACK ceiling" apart
+/// from "nothing matched the fast path".
+pub const REASON_SYNCOOKIE_TXCAPPED: u32 = 5;
 /// Number of reason codes (stats array length).
-pub const REASON_COUNT: u32 = 5;
+pub const REASON_COUNT: u32 = 6;
 
 /// LPM-trie key for the IPv4 source blocklist (`bpf_lpm_trie_key` layout).
 #[repr(C)]
@@ -45,6 +53,36 @@ pub struct LpmKeyV6 {
 }
 
 /// Per-source token bucket value for the rate-limit map.
+///
+/// # Race-free RMW (X1): per-CPU fallback
+///
+/// A `bpf_spin_lock`-guarded single shared bucket (one `LruHashMap` entry per
+/// source, locked around the refill + decrement) was attempted first and
+/// **rejected by the verifier** on this toolchain: aya-ebpf 0.1.1's `#[map]`
+/// macro emits the legacy `bpf_map_def`-based `maps` ELF section rather than
+/// a BTF-defined map, so aya never populates
+/// `btf_key_type_id`/`btf_value_type_id` at map-creation time and the kernel
+/// refuses `bpf_spin_lock` with `map 'RATE' has to have BTF in order to use
+/// bpf_spin_lock` (reproduced live via `BPF_PROG_TEST_RUN`, kernel 6.18).
+/// Fixing that would mean hand-rolling a BTF-defined-map ELF layout aya-ebpf
+/// 0.1.1 doesn't emit for `#[map]` statics -- out of scope here.
+///
+/// The shipped fix instead makes `RATE` an `LruPerCpuHashMap` (see the `RATE`
+/// map declaration in `blackwall-xdp-ebpf/src/main.rs`): each CPU gets its
+/// own independent [`RateBucket`] copy for a given source, so
+/// `bpf_map_lookup_elem` from the eBPF program is inherently isolated per CPU
+/// (the kernel indexes it by the running CPU) and the refill/decrement RMW in
+/// `over_rate` needs no lock -- there is no other CPU that can observe or
+/// mutate the same memory.
+///
+/// This is race-free but **looser than the single shared-bucket design**: a
+/// source's effective admitted rate becomes up to `N_cpus x configured
+/// burst` (RSS can spread one spoofed-source flood across every RX
+/// queue/CPU, each with its own full token bucket) rather than the exact
+/// configured limit -- never *tighter*, only looser. Userspace
+/// summing/reconciling per-CPU bucket state into a single reported rate is a
+/// follow-on (not implemented here); today each CPU is seeded with the same
+/// `tokens = burst` on install.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateBucket {
@@ -56,6 +94,63 @@ pub struct RateBucket {
     pub rate_pps: u64,
     /// Maximum token capacity (burst).
     pub burst: u64,
+}
+
+/// Value of the single-entry, per-CPU `TX_BUDGET` map: the global SYN-cookie
+/// `XDP_TX` mint-rate token bucket (sub-project X3).
+///
+/// # Why a *global* cap on top of the per-source `RATE` limiter
+///
+/// [`RateBucket`] throttles per **source** address, but a spoofed SYN flood
+/// rotates through addresses the attacker does not own -- each spoofed source
+/// gets its own fresh, never-reused bucket, so the per-source limiter never
+/// engages and the in-kernel cookie fast path mints (and `XDP_TX`-bounces) a
+/// SYN-ACK for every single spoofed SYN. `TxBucket` bounds the **aggregate**
+/// mint rate regardless of how many distinct (spoofed) sources are involved,
+/// turning an unbounded gain-1 reflector into one with a hard ceiling.
+///
+/// # Per-CPU fallback (mirrors [`RateBucket`])
+///
+/// Same X1 rationale applies here: this toolchain's `#[map]` macro cannot
+/// emit a BTF-defined map, so a `bpf_spin_lock`-guarded single shared bucket
+/// is rejected by the verifier. `TX_BUDGET` is instead a `PerCpuArray` with
+/// one slot -- each CPU holds its own independent copy, so the refill/decrement
+/// RMW in `tx_budget_ok` needs no lock. The **aggregate** ceiling across the
+/// box is therefore up to `N_cpus x rate_pps` admitted SYN-ACKs per second,
+/// not the single configured `rate_pps` -- looser than the nominal rate under
+/// RSS spread, never tighter (same tradeoff [`RateBucket`] documents).
+///
+/// # `rate_pps == 0` means "not configured"
+///
+/// Unlike [`RateBucket`] (which is per-source and simply has no entry when
+/// unconfigured, so the `HashMap` lookup misses and the caller never
+/// throttles), `TX_BUDGET` is a `PerCpuArray` -- slot `0` always exists, even
+/// before userspace ever writes to it, and reads back as all-zero. The eBPF
+/// side's `tx_budget_ok` treats `rate_pps == 0` (the zero-initialised default,
+/// or a value userspace explicitly leaves at zero) as "cap not configured" and
+/// never throttles -- this is what keeps the fast path's pre-X3 behavior (and
+/// tests) unchanged until Task 3's userspace setter installs a nonzero rate.
+///
+/// # Burst ceiling scales with `rate_pps`
+///
+/// Unlike [`RateBucket`], `TxBucket` carries no per-instance `burst` field:
+/// `tx_budget_ok` derives the ceiling as `min(2 x rate_pps,
+/// TX_BUDGET_BURST_MAX)` (roughly 2 seconds of budget), not a fixed
+/// constant -- otherwise any idle window (including the first call after
+/// arming, since `last_ns` is seeded `0`) would refill `tokens` all the way to
+/// a fixed ceiling regardless of how small `rate_pps` is, defeating the "hard
+/// reflection ceiling" this cap exists for.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxBucket {
+    /// Tokens currently available.
+    pub tokens: u64,
+    /// `bpf_ktime_get_ns()` of the last refill.
+    pub last_ns: u64,
+    /// Refill rate in packets (SYN-ACKs) per second. `0` means the cap is not
+    /// configured (see the struct-level doc comment) -- `tx_budget_ok` never
+    /// throttles in that case.
+    pub rate_pps: u64,
 }
 
 /// A single per-CPU counter entry.
@@ -181,6 +276,28 @@ mod tests {
     fn rate_bucket_and_stat_are_pod() {
         assert_eq!(core::mem::size_of::<RateBucket>(), 32);
         assert_eq!(core::mem::size_of::<Stat>(), 16);
+    }
+
+    #[test]
+    fn tx_bucket_is_pod_no_padding() {
+        // Three `u64`s, no padding: the byte layout shared with the eBPF
+        // `TX_BUDGET` reader/writer.
+        assert_eq!(core::mem::size_of::<TxBucket>(), 24);
+        assert_eq!(core::mem::align_of::<TxBucket>(), 8);
+        let b = TxBucket {
+            tokens: 1,
+            last_ns: 2,
+            rate_pps: 3,
+        };
+        assert_eq!(b.tokens, 1);
+        assert_eq!(b.last_ns, 2);
+        assert_eq!(b.rate_pps, 3);
+    }
+
+    #[test]
+    fn reason_syncookie_txcapped_is_last_and_bumps_count() {
+        assert_eq!(REASON_SYNCOOKIE_TXCAPPED, 5);
+        assert_eq!(REASON_COUNT, 6);
     }
 
     #[test]

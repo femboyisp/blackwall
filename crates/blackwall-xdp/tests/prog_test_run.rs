@@ -1112,3 +1112,443 @@ fn disabled_capture_pushes_nothing() {
         "capture disabled: the ring must stay empty"
     );
 }
+
+// --- X1: race-free per-source RATE bucket ---
+//
+// The feasibility spike attempted a single shared bucket (one `LruHashMap`
+// entry per source) guarded by a `bpf_spin_lock` field. The verifier rejected
+// it on this toolchain/kernel: `map 'RATE' has to have BTF in order to use
+// bpf_spin_lock` — aya-ebpf 0.1.1's `#[map]` macro emits the legacy
+// `bpf_map_def`-based `maps` ELF section, not a BTF-defined map, so aya never
+// populates `btf_key_type_id`/`btf_value_type_id` at map-creation time. The
+// shipped fix is the fallback: `RATE` is now an `LruPerCpuHashMap`, so each
+// CPU's copy of a source's bucket is independent and the refill/decrement
+// needs no lock (see `blackwall_xdp_common::RateBucket`'s and
+// `blackwall-xdp-ebpf`'s `RATE`/`over_rate` doc comments for the full
+// rationale and the `N_cpus × configured burst` looser-bound trade-off).
+
+/// `#[repr(transparent)]` newtype so the foreign
+/// [`blackwall_xdp_common::RateBucket`] POD can carry an [`aya::Pod`] impl
+/// (the orphan rule forbids implementing it directly) — mirrors the
+/// production `RateBucketPod` in `blackwall_xdp::dataplane`.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct RateBucketPod(blackwall_xdp_common::RateBucket);
+
+// SAFETY: `RateBucket` is a `#[repr(C)]` `Copy + 'static` plain-old-data
+// struct of four `u64` fields; `#[repr(transparent)]` makes `RateBucketPod`
+// share its exact layout, so it is byte-for-byte valid as a BPF map value.
+unsafe impl aya::Pod for RateBucketPod {}
+
+/// Install a fresh token bucket for `addr` (v4, zero-padded into the low four
+/// bytes of the 16-byte key exactly like the eBPF program's own key) on
+/// *every* CPU's slot, with `rate_pps = 0` so the burst is never refilled
+/// mid-test — the (N+1)th packet on the pinned CPU is guaranteed to see zero
+/// tokens. Mirrors the production `XdpDataplane::rate_limit` per-CPU seeding
+/// (`RATE` is an `LruPerCpuHashMap`, X1 fallback).
+fn install_rate_bucket(bpf: &mut Ebpf, addr: [u8; 4], burst: u64) {
+    use aya::maps::{PerCpuHashMap, PerCpuValues};
+    use aya::util::nr_cpus;
+
+    let mut map: PerCpuHashMap<_, [u8; 16], RateBucketPod> =
+        PerCpuHashMap::try_from(bpf.map_mut("RATE").expect("RATE map present"))
+            .expect("RATE is a PerCpuHashMap");
+    let mut key = [0u8; 16];
+    key[..4].copy_from_slice(&addr);
+    let bucket = blackwall_xdp_common::RateBucket {
+        tokens: burst,
+        last_ns: 0,
+        rate_pps: 0,
+        burst,
+    };
+    let cpus = nr_cpus().expect("nr_cpus");
+    let values =
+        PerCpuValues::try_from(vec![RateBucketPod(bucket); cpus]).expect("build per-CPU values");
+    map.insert(key, values, 0).expect("insert rate bucket");
+}
+
+/// Pin the calling thread to CPU 0 for the duration of `f`, restoring the
+/// original affinity mask afterward.
+///
+/// `RATE` is per-CPU (X1 fallback), so `BPF_PROG_TEST_RUN` must execute every
+/// packet in a burst sequence on the *same* CPU: otherwise the scheduler
+/// could migrate the calling thread between calls and each packet would hit
+/// a different, independently-full per-CPU bucket rather than draining one.
+fn pin_to_cpu0<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: `old`/`only0` are zero-initialised, correctly-sized `cpu_set_t`
+    // buffers; `sched_getaffinity`/`sched_setaffinity` with pid `0` operate on
+    // the calling thread and write/read exactly `size_of::<cpu_set_t>()`
+    // bytes into/from them.
+    unsafe {
+        let mut old: libc::cpu_set_t = std::mem::zeroed();
+        let rc = libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut old);
+        assert_eq!(
+            rc,
+            0,
+            "sched_getaffinity failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut only0: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(0, &mut only0);
+        let rc =
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const only0);
+        assert_eq!(
+            rc,
+            0,
+            "sched_setaffinity(cpu0) failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let result = f();
+
+        let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const old);
+        assert_eq!(
+            rc,
+            0,
+            "sched_setaffinity(restore) failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        result
+    }
+}
+
+/// X1: the verifier must accept `RATE`'s `LruPerCpuHashMap` value
+/// (`prog.load()` below is the load/verify check) and, pinned to a single
+/// CPU so every `BPF_PROG_TEST_RUN` call hits the same per-CPU bucket slot,
+/// sequential calls must enforce the token bucket exactly as before X1: the
+/// first `burst` packets from one source are admitted, the next is dropped
+/// with `REASON_RATELIMIT`.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn rate_limited_source_is_admitted_up_to_burst_then_dropped() {
+    const SRC: [u8; 4] = [203, 0, 113, 42];
+    const BURST: u64 = 3;
+
+    pin_to_cpu0(|| {
+        let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+        install_rate_bucket(&mut bpf, SRC, BURST);
+
+        let prog: &mut Xdp = bpf
+            .program_mut("xdp_filter")
+            .expect("xdp_filter program present")
+            .try_into()
+            .expect("program is an Xdp");
+        // The load/verify step is itself the X1 spike assertion: the verifier
+        // must accept the `LruPerCpuHashMap` RATE map value on this kernel.
+        prog.load()
+            .expect("verify + load xdp_filter (per-CPU RATE map value)");
+        let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+        let frame = eth_ipv4(SRC);
+        for i in 0..BURST {
+            let action = run_xdp(prog_fd, &frame);
+            assert_eq!(action, XDP_PASS, "packet {i} within burst must be admitted");
+        }
+        assert_eq!(
+            stat_packets(&mut bpf, blackwall_xdp_common::REASON_RATELIMIT),
+            0,
+            "no packet within the burst should be rate-limited"
+        );
+
+        let over_burst = run_xdp(prog_fd, &frame);
+        assert_eq!(
+            over_burst, XDP_DROP,
+            "the (burst + 1)th packet must be rate-limited"
+        );
+        assert_eq!(
+            stat_packets(&mut bpf, blackwall_xdp_common::REASON_RATELIMIT),
+            1,
+            "exactly one packet must be counted as rate-limited"
+        );
+    });
+}
+
+// --- X3: global per-CPU SYN-cookie XDP_TX mint-rate cap ---
+//
+// The per-source `RATE` limiter (X1) never engages against a spoofed SYN
+// flood: each spoofed source address gets its own fresh, never-reused bucket,
+// so the in-kernel cookie fast path would mint (and `XDP_TX`-bounce) a
+// SYN-ACK for every single spoofed SYN with no ceiling. `TX_BUDGET` bounds the
+// *aggregate* mint rate regardless of how many distinct source addresses are
+// involved.
+
+/// `#[repr(transparent)]` newtype so the foreign
+/// [`blackwall_xdp_common::TxBucket`] POD can carry an [`aya::Pod`] impl (the
+/// orphan rule forbids implementing it directly) — mirrors `RateBucketPod`.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct TxBucketPod(blackwall_xdp_common::TxBucket);
+
+// SAFETY: `TxBucket` is a `#[repr(C)]` `Copy + 'static` plain-old-data struct
+// of three `u64` fields; `#[repr(transparent)]` makes `TxBucketPod` share its
+// exact layout, so it is byte-for-byte valid as a per-CPU BPF map value.
+unsafe impl aya::Pod for TxBucketPod {}
+
+/// Install a global `TX_BUDGET` bucket on *every* CPU's slot with explicit
+/// `tokens`/`last_ns`/`rate_pps`, giving each test full control over which of
+/// `tx_budget_ok`'s two code paths it exercises: a pre-seeded `tokens` count
+/// that must NOT be clamped down by the refill/burst logic (`install_tx_budget`
+/// below), or a refill-derived `tokens` count that starts at `0` and must be
+/// bounded by the rate-scaled burst ceiling (the X3 burst-scaling follow-up
+/// test).
+fn install_tx_budget_raw(bpf: &mut Ebpf, tokens: u64, last_ns: u64, rate_pps: u64) {
+    use aya::maps::{PerCpuArray, PerCpuValues};
+    use aya::util::nr_cpus;
+
+    let mut map: PerCpuArray<_, TxBucketPod> =
+        PerCpuArray::try_from(bpf.map_mut("TX_BUDGET").expect("TX_BUDGET map present"))
+            .expect("TX_BUDGET is a PerCpuArray");
+    let bucket = blackwall_xdp_common::TxBucket {
+        tokens,
+        last_ns,
+        rate_pps,
+    };
+    let cpus = nr_cpus().expect("nr_cpus");
+    let values =
+        PerCpuValues::try_from(vec![TxBucketPod(bucket); cpus]).expect("build per-CPU values");
+    map.set(0, values, 0).expect("insert tx budget");
+}
+
+/// Install a global `TX_BUDGET` cap of `cap` tokens on *every* CPU's slot,
+/// with `rate_pps = cap` (nonzero, so `tx_budget_ok` treats the cap as
+/// configured rather than "not configured => never throttle"; sized so the
+/// burst ceiling `tx_budget_ok` derives -- `min(2 x rate_pps,
+/// TX_BUDGET_BURST_MAX)` -- is `>= cap` and therefore never clamps the
+/// pre-seeded `tokens` down before the test drains them; see the X3
+/// burst-scaling follow-up, and `install_tx_budget_raw`'s doc comment) and
+/// `last_ns = u64::MAX` so `now.saturating_sub(last_ns)` is always `0` — no
+/// refill can occur during the test no matter how much wall-clock time
+/// elapses between `BPF_PROG_TEST_RUN` calls. Mirrors `install_rate_bucket`'s
+/// no-refill trick, adapted because X3's cap-enable signal is `rate_pps != 0`
+/// itself (unlike `RATE`, where `rate_pps = 0` is used to freeze refill while
+/// the bucket is still "configured" by virtue of the entry existing at all).
+///
+/// `cap` must be nonzero (a `rate_pps` of `0` would instead mean "not
+/// configured" and disable the cap entirely).
+fn install_tx_budget(bpf: &mut Ebpf, cap: u64) {
+    debug_assert!(
+        cap > 0,
+        "cap must be nonzero, else rate_pps=0 disables the cap"
+    );
+    install_tx_budget_raw(bpf, cap, u64::MAX, cap);
+}
+
+/// X3: with the cookie path fully enabled (protected prefix + port, a valid
+/// cookie key) and `TX_BUDGET` seeded to a cap of `CAP` tokens with no refill
+/// for the test's duration (see `install_tx_budget`), exactly the first `CAP`
+/// of `TOTAL > CAP` SYNs to the protected destination must be answered via
+/// `XDP_TX`; every SYN after that must fall through to its normal non-cookie
+/// verdict (`XDP_PASS`, since nothing else in this test gates it) instead of
+/// minting, and `REASON_SYNCOOKIE_TXCAPPED` must count exactly the denied
+/// SYNs. Pinned to one CPU (X1's pattern) so every `BPF_PROG_TEST_RUN` call
+/// hits the same per-CPU `TX_BUDGET` slot — otherwise the scheduler could
+/// migrate the calling thread between calls and each SYN would hit a
+/// different, independently-full per-CPU budget rather than draining one.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn global_tx_budget_caps_mints_then_stats_the_rest() {
+    const CAP: u64 = 3;
+    const TOTAL: u64 = 5;
+
+    pin_to_cpu0(|| {
+        let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+        install_tx_budget(&mut bpf, CAP);
+        let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+        let mut minted = 0u64;
+        let mut capped = 0u64;
+        for i in 0..TOTAL {
+            let port_offset = u16::try_from(i).expect("small test index fits u16");
+            let seq_offset = u32::try_from(i).expect("small test index fits u32");
+            let syn = eth_ipv4_tcp_syn(
+                [203, 0, 113, 7],
+                [10, 0, 0, 1],
+                50_000 + port_offset,
+                PROTECT_TCP_PORT,
+                0x1000_0000 + seq_offset,
+                1460,
+            );
+            let action = run_xdp(prog_fd, &syn);
+            if i < CAP {
+                assert_eq!(
+                    action, XDP_TX,
+                    "SYN {i} within the global budget must mint via XDP_TX"
+                );
+                minted += 1;
+            } else {
+                assert_eq!(
+                    action, XDP_PASS,
+                    "SYN {i} beyond the global budget must fall through to XDP_PASS"
+                );
+                capped += 1;
+            }
+        }
+        assert_eq!(minted, CAP, "exactly CAP SYNs must have minted");
+        assert_eq!(
+            capped,
+            TOTAL - CAP,
+            "the remaining SYNs must all be budget-capped"
+        );
+        assert_eq!(
+            stat_packets(&mut bpf, blackwall_xdp_common::REASON_SYNCOOKIE_TXCAPPED),
+            TOTAL - CAP,
+            "REASON_SYNCOOKIE_TXCAPPED must count exactly the denied SYNs"
+        );
+    });
+}
+
+/// X3 default-off regression guard: with `TX_BUDGET` left entirely unseeded
+/// (the map's zero-initialised default — `rate_pps == 0`), the cap must be
+/// treated as "not configured" and never throttle, so a single SYN mints
+/// exactly as it did before X3. This is the same scenario the pre-X3
+/// `syn_to_protected_prefix_and_port_is_answered_via_xdp_tx` test exercises;
+/// this test makes the "unseeded TX_BUDGET must not regress the existing
+/// syncookie behavior" requirement explicit and independently checked.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn unseeded_tx_budget_never_throttles() {
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    // Deliberately do NOT install TX_BUDGET.
+    let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+    let syn = eth_ipv4_tcp_syn(
+        [203, 0, 113, 7],
+        [10, 0, 0, 1],
+        54_321,
+        PROTECT_TCP_PORT,
+        0x1122_3344,
+        1460,
+    );
+    let action = run_xdp(prog_fd, &syn);
+    assert_eq!(
+        action, XDP_TX,
+        "an unseeded TX_BUDGET must never throttle -- a SYN must still mint"
+    );
+    assert_eq!(
+        stat_packets(&mut bpf, blackwall_xdp_common::REASON_SYNCOOKIE_TXCAPPED),
+        0,
+        "an unseeded TX_BUDGET must never count a SYN as capped"
+    );
+}
+
+/// X3 burst-scaling follow-up: the burst ceiling `tx_budget_ok` refills
+/// `tokens` up to must scale with the configured `rate_pps`
+/// (`min(2 x rate_pps, TX_BUDGET_BURST_MAX)`), not always refill to a fixed
+/// constant (the old, buggy `TX_BUDGET_BURST = 1_000_000`) regardless of how
+/// small `rate_pps` is.
+///
+/// Seeds `TX_BUDGET` with `tokens = 0`, `last_ns = 0` -- exactly the "just
+/// armed" state, so the very first `tx_budget_ok` call on CPU0 sees a huge
+/// `elapsed_ns` since boot and refills as far as the burst ceiling allows --
+/// and a conservative `RATE_PPS`. It then fires `TOTAL > 2 x RATE_PPS` SYNs.
+/// Under the pre-fix behavior this would refill all the way to
+/// `TX_BUDGET_BURST_MAX = 1_000_000` on the first call and every one of
+/// `TOTAL` SYNs would mint; with the fix, only the rate-scaled burst
+/// (`2 x RATE_PPS`) may mint and the rest must be attributed to
+/// `REASON_SYNCOOKIE_TXCAPPED`.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn global_tx_budget_burst_scales_with_rate_pps() {
+    const RATE_PPS: u64 = 10;
+    const BURST: u64 = 2 * RATE_PPS; // mirrors tx_budget_ok's min(2 x rate_pps, MAX)
+    const TOTAL: u64 = 3 * RATE_PPS; // > BURST, so some SYNs must be capped
+
+    pin_to_cpu0(|| {
+        let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+        install_tx_budget_raw(&mut bpf, 0, 0, RATE_PPS);
+        let prog_fd = load_with_cookie_and_gate(&mut bpf);
+
+        let mut minted = 0u64;
+        for i in 0..TOTAL {
+            let port_offset = u16::try_from(i).expect("small test index fits u16");
+            let seq_offset = u32::try_from(i).expect("small test index fits u32");
+            let syn = eth_ipv4_tcp_syn(
+                [203, 0, 113, 8],
+                [10, 0, 0, 1],
+                40_000 + port_offset,
+                PROTECT_TCP_PORT,
+                0x2000_0000 + seq_offset,
+                1460,
+            );
+            if run_xdp(prog_fd, &syn) == XDP_TX {
+                minted += 1;
+            }
+        }
+        assert_eq!(
+            minted, BURST,
+            "minted SYNs must be bounded by the rate-scaled burst \
+             (2 x RATE_PPS = {BURST}), not the old fixed TX_BUDGET_BURST_MAX \
+             ceiling (which would have let all {TOTAL} mint)"
+        );
+        assert_eq!(
+            stat_packets(&mut bpf, blackwall_xdp_common::REASON_SYNCOOKIE_TXCAPPED),
+            TOTAL - BURST,
+            "every SYN beyond the rate-scaled burst must be tx-capped"
+        );
+    });
+}
+
+/// X3 follow-up (v4/v6 ordering asymmetry, Fix 2): `try_synack_v6` must read
+/// and validate the cookie key *before* consuming global `TX_BUDGET`, exactly
+/// like `try_synack_v4` -- so a v6 SYN with no cookie key installed is never
+/// attributed to `REASON_SYNCOOKIE_TXCAPPED` (it must instead fall through to
+/// the generic `REASON_PASS`), even when the global budget also happens to be
+/// exhausted. Before the fix, `try_synack_v6` checked `tx_budget_ok` first,
+/// so this same combined state (`no key` + `cap exhausted`) would have
+/// consumed a token and mis-counted the SYN as tx-capped.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn v6_syn_with_no_cookie_key_is_not_misattributed_to_tx_cap() {
+    let client_port = 54_321u16;
+    let server_port = 443u16;
+    let client_seq = 0x1122_3344u32;
+    let client_mss = 1460u16;
+
+    let syn = eth_ipv6_tcp_syn(
+        CLIENT_IP6,
+        SERVER_IP6,
+        client_port,
+        server_port,
+        client_seq,
+        client_mss,
+    );
+
+    let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+    // Global mint budget exhausted (nonzero rate_pps => configured; tokens=0
+    // and last_ns=u64::MAX => frozen at empty, no refill can happen during
+    // the test) -- isolates "no cookie key" from "budget exhausted" so a
+    // misattribution would be unambiguous.
+    install_tx_budget_raw(&mut bpf, 0, u64::MAX, 1);
+    // B2.3c gate cleared (protected prefix + port)...
+    install_protect_prefix_v6(&mut bpf, 32, PROTECT_PREFIX6);
+    install_protect_port(&mut bpf, server_port);
+    // ...but deliberately do NOT install a cookie key.
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_filter")
+        .expect("xdp_filter program present")
+        .try_into()
+        .expect("program is an Xdp");
+    prog.load().expect("verify + load xdp_filter");
+    let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+    let (action, out) = run_xdp_out(prog_fd, &syn);
+    assert_eq!(
+        action, XDP_PASS,
+        "a v6 SYN with no cookie key installed must pass through, budget \
+         exhaustion notwithstanding"
+    );
+    assert_eq!(out, syn, "a passed SYN must be byte-for-byte unchanged");
+    assert_eq!(
+        stat_packets(&mut bpf, blackwall_xdp_common::REASON_SYNCOOKIE_TXCAPPED),
+        0,
+        "a SYN with no cookie key must never be counted as tx-capped -- the \
+         key check must happen before the budget check"
+    );
+    assert_eq!(
+        stat_packets(&mut bpf, blackwall_xdp_common::REASON_PASS),
+        1,
+        "the no-key bail must be counted via the generic REASON_PASS path"
+    );
+}

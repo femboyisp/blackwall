@@ -19,13 +19,14 @@ use crate::manager::{XdpExecError, XdpExecutor};
 use crate::XdpAction;
 use async_trait::async_trait;
 use aya::maps::lpm_trie::Key;
-use aya::maps::{HashMap, LpmTrie, MapData, PerCpuArray, XskMap};
+use aya::maps::{HashMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, XskMap};
 use aya::programs::{Xdp, XdpFlags};
+use aya::util::nr_cpus;
 use aya::Ebpf;
 use blackwall_core::XdpMode;
 use blackwall_xdp_common::{
-    CookieKeyValue, RateBucket, Stat, REASON_BLOCKLIST, REASON_PASS, REASON_RATELIMIT,
-    REASON_REDIRECT, REASON_SYNCOOKIE,
+    CookieKeyValue, RateBucket, Stat, TxBucket, REASON_BLOCKLIST, REASON_PASS, REASON_RATELIMIT,
+    REASON_REDIRECT, REASON_SYNCOOKIE, REASON_SYNCOOKIE_TXCAPPED,
 };
 use ipnet::IpNet;
 use std::net::IpAddr;
@@ -55,7 +56,12 @@ struct DataplaneMaps {
     /// IPv6 source blocklist (`{prefixlen:u32, addr:[u8;16]}` LPM key).
     block_v6: LpmTrie<MapData, [u8; 16], u8>,
     /// Per-source token buckets, keyed by the 16-byte source (v4 zero-padded).
-    rate: HashMap<MapData, [u8; 16], RateBucketPod>,
+    ///
+    /// `LruPerCpuHashMap` — the X1 fallback (see [`blackwall_xdp_common::RateBucket`]'s
+    /// doc comment): every CPU holds its own independent bucket for a given
+    /// source, so the effective admitted rate is up to `N_cpus × configured
+    /// burst` under an RSS-spread flood.
+    rate: PerCpuHashMap<MapData, [u8; 16], RateBucketPod>,
     /// Per-CPU decision counters, indexed by `REASON_*`.
     stats: PerCpuArray<MapData, StatPod>,
     /// Single-entry (key `0`) map carrying the SYN-cookie secret the in-kernel
@@ -81,6 +87,12 @@ struct DataplaneMaps {
     /// UDP destination ports whose IPv4 datagrams are redirected to the `AF_XDP`
     /// socket (B3.1), keyed by the host-native `u16` port value.
     redirect_port: HashMap<MapData, u16, u8>,
+    /// Single-entry (key `0`), per-CPU global SYN-cookie `XDP_TX` mint-rate
+    /// budget (sub-project X3 — see [`blackwall_xdp_common::TxBucket`]'s doc
+    /// comment). Per-CPU (the X1 fallback rationale applies here too), so every
+    /// CPU's slot must be seeded identically on write — see
+    /// [`DataplaneMaps::set_syn_cookie_tx_cap`].
+    tx_budget: PerCpuArray<MapData, TxBucketPod>,
 }
 
 /// Fixed map key of the sole `COOKIE_KEY` entry (mirrors the eBPF
@@ -120,6 +132,17 @@ struct CookieKeyPod(CookieKeyValue);
 // its exact layout, so it is byte-for-byte valid as a BPF map value.
 unsafe impl aya::Pod for CookieKeyPod {}
 
+/// `#[repr(transparent)]` newtype giving the foreign [`TxBucket`] POD an
+/// [`aya::Pod`] impl for the `TX_BUDGET` per-CPU map.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default)]
+struct TxBucketPod(TxBucket);
+
+// SAFETY: `TxBucket` is a `#[repr(C)]` `Copy + 'static` plain-old-data struct
+// of `u64` fields; `#[repr(transparent)]` makes `TxBucketPod` share its exact
+// layout, so it is byte-for-byte valid as a per-CPU BPF map value.
+unsafe impl aya::Pod for TxBucketPod {}
+
 /// A snapshot of the data plane's per-CPU decision counters plus current map
 /// occupancy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -136,6 +159,10 @@ pub struct XdpStats {
     /// Packets/bytes redirected to a userspace `AF_XDP` socket via `XSKS`
     /// (`REASON_REDIRECT`, B3.1).
     pub redirected: Stat,
+    /// Packets/bytes that cleared every SYN-cookie gate but were denied a
+    /// SipHash-cookie SYN-ACK because the global [`TxBucket`] mint budget was
+    /// exhausted (`REASON_SYNCOOKIE_TXCAPPED`, sub-project X3).
+    pub syn_cookies_txcapped: Stat,
     /// Number of blocklist entries (`BLOCK_V4` + `BLOCK_V6`).
     pub blocked_entries: u64,
     /// Number of rate-limit entries (`RATE`).
@@ -244,6 +271,7 @@ impl XdpDataplane {
             protect_port: take_map(&mut ebpf, "PROTECT_PORT")?,
             xsks: take_map(&mut ebpf, "XSKS")?,
             redirect_port: take_map(&mut ebpf, "REDIRECT_PORT")?,
+            tx_budget: take_map(&mut ebpf, "TX_BUDGET")?,
         };
 
         // B4.1: pin the capture ring + flag to bpffs so a separate
@@ -314,6 +342,30 @@ impl XdpDataplane {
     /// Returns [`XdpError::Map`] if the map write fails.
     pub fn set_cookie_key(&mut self, key: [u8; 16]) -> Result<(), XdpError> {
         self.locked()?.set_cookie_key(key)
+    }
+
+    /// Install the global SYN-cookie `XDP_TX` mint-rate cap (sub-project X3)
+    /// into the `TX_BUDGET` map, in packets (SYN-ACKs) per second.
+    ///
+    /// This bounds the *aggregate* in-kernel cookie-mint rate regardless of how
+    /// many distinct (possibly spoofed) source addresses a SYN flood spreads
+    /// across, on top of the per-source `RATE` limiter — see
+    /// [`blackwall_xdp_common::TxBucket`]'s doc comment for the full rationale.
+    ///
+    /// Callers must pass a nonzero `pps`: the eBPF fast path treats
+    /// `rate_pps == 0` as "cap not configured" and never throttles, so a `0`
+    /// here would silently re-open the unbounded reflector this cap exists to
+    /// close. `blackwalld` always calls this whenever `cookie-ports` is armed,
+    /// seeded from [`blackwall_core::DEFAULT_SYN_COOKIE_TX_CAP_PPS`] when the
+    /// operator leaves `syn-cookie-tx-cap` unset, so `TX_BUDGET` is never left
+    /// at its zero-initialised (unlimited) default while the cookie path is
+    /// live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XdpError::Map`] if the map write fails.
+    pub fn set_syn_cookie_tx_cap(&mut self, pps: u32) -> Result<(), XdpError> {
+        self.locked()?.set_syn_cookie_tx_cap(pps)
     }
 
     /// Install the box's own protected deception prefixes into `PROTECT_V4`
@@ -477,6 +529,11 @@ impl DataplaneMaps {
     }
 
     /// Install a fresh token bucket for `addr`.
+    ///
+    /// `RATE` is per-CPU (X1 fallback), so every CPU's slot for this key must
+    /// be seeded identically with a full `tokens = burst` bucket — otherwise
+    /// whichever CPU an RSS-steered packet lands on would see a stale or
+    /// empty bucket from before this call.
     fn rate_limit(&mut self, addr: IpAddr, pps: u64, burst: u64) -> Result<(), XdpError> {
         let bucket = RateBucket {
             tokens: burst,
@@ -484,9 +541,10 @@ impl DataplaneMaps {
             rate_pps: pps,
             burst,
         };
-        self.rate
-            .insert(rate_key(addr), RateBucketPod(bucket), 0)
-            .map_err(map_err)
+        let cpus = nr_cpus().map_err(|(ctx, e)| XdpError::Map(format!("{ctx}: {e}")))?;
+        let values = PerCpuValues::try_from(vec![RateBucketPod(bucket); cpus])
+            .map_err(|e| XdpError::Map(e.to_string()))?;
+        self.rate.insert(rate_key(addr), values, 0).map_err(map_err)
     }
 
     /// Remove any token bucket installed for `addr`.
@@ -499,6 +557,26 @@ impl DataplaneMaps {
         self.cookie_key
             .insert(COOKIE_KEY_SLOT, CookieKeyPod(encode_cookie_key(key)), 0)
             .map_err(map_err)
+    }
+
+    /// Seed the single `TX_BUDGET` slot's refill rate on every CPU.
+    ///
+    /// `TX_BUDGET` is per-CPU (X1/X3 fallback — see [`TxBucket`]'s doc
+    /// comment), so — exactly like [`Self::rate_limit`]'s `RATE` seeding —
+    /// every CPU's slot must be written identically with a full `tokens =
+    /// rate_pps` bucket; otherwise whichever CPU an RSS-steered SYN lands on
+    /// could see a stale or empty bucket from before this call.
+    fn set_syn_cookie_tx_cap(&mut self, pps: u32) -> Result<(), XdpError> {
+        let rate_pps = u64::from(pps);
+        let bucket = TxBucket {
+            tokens: rate_pps,
+            last_ns: 0,
+            rate_pps,
+        };
+        let cpus = nr_cpus().map_err(|(ctx, e)| XdpError::Map(format!("{ctx}: {e}")))?;
+        let values = PerCpuValues::try_from(vec![TxBucketPod(bucket); cpus])
+            .map_err(|e| XdpError::Map(e.to_string()))?;
+        self.tx_budget.set(0, values, 0).map_err(map_err)
     }
 
     /// Insert each prefix into the `PROTECT_V4` (IPv4) or `PROTECT_V6` (IPv6)
@@ -564,6 +642,7 @@ impl DataplaneMaps {
             dropped_ratelimit: self.sum_reason(REASON_RATELIMIT)?,
             syn_cookies_sent: self.sum_reason(REASON_SYNCOOKIE)?,
             redirected: self.sum_reason(REASON_REDIRECT)?,
+            syn_cookies_txcapped: self.sum_reason(REASON_SYNCOOKIE_TXCAPPED)?,
             blocked_entries: count_keys(self.block_v4.keys()) + count_keys(self.block_v6.keys()),
             ratelimit_entries: count_keys(self.rate.keys()),
         })

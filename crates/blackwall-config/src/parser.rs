@@ -716,6 +716,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                     cookie_ports: Vec::new(),
                     afxdp_udp_ports: Vec::new(),
                     afxdp_udp_banner: None,
+                    syn_cookie_tx_cap: blackwall_core::DEFAULT_SYN_COOKIE_TX_CAP_PPS,
                 };
                 for tok in &line.words[1..] {
                     let (k, v) = tok
@@ -766,6 +767,15 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         }
                         "afxdp-udp-banner" => {
                             cfg.afxdp_udp_banner = Some(decode_banner_escapes(v));
+                        }
+                        "syn-cookie-tx-cap" => {
+                            let n = v
+                                .parse::<u32>()
+                                .map_err(|_| bad("xdp syn-cookie-tx-cap", v))?;
+                            if n == 0 {
+                                return Err(bad("xdp syn-cookie-tx-cap", "must be >= 1"));
+                            }
+                            cfg.syn_cookie_tx_cap = n;
                         }
                         other => return Err(bad("xdp key", other)),
                     }
@@ -2034,6 +2044,60 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
             parse_text("interface wan eth0\nxdp interface=eth0 cookie-ports=8080,443\n").unwrap();
         let x = p.xdp.expect("xdp set");
         assert_eq!(x.cookie_ports, vec![8080, 443]);
+    }
+
+    #[test]
+    fn parses_xdp_syn_cookie_tx_cap() {
+        let p = parse_text(
+            "interface wan eth0\nxdp interface=eth0 cookie-ports=443 syn-cookie-tx-cap=5000\n",
+        )
+        .unwrap();
+        let x = p.xdp.expect("xdp set");
+        assert_eq!(x.syn_cookie_tx_cap, 5000);
+    }
+
+    #[test]
+    fn xdp_syn_cookie_tx_cap_absent_is_conservative_default() {
+        let p = parse_text("interface wan eth0\nxdp interface=eth0 cookie-ports=443\n").unwrap();
+        let x = p.xdp.expect("xdp set");
+        // Never 0/unlimited: an operator enabling cookie-ports without this
+        // knob must still get a bounded reflector.
+        assert_eq!(
+            x.syn_cookie_tx_cap,
+            blackwall_core::DEFAULT_SYN_COOKIE_TX_CAP_PPS
+        );
+        assert_eq!(x.syn_cookie_tx_cap, 1000);
+    }
+
+    #[test]
+    fn rejects_xdp_syn_cookie_tx_cap_zero() {
+        let err = parse_text("interface wan eth0\nxdp cookie-ports=443 syn-cookie-tx-cap=0\n")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp syn-cookie-tx-cap",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_xdp_syn_cookie_tx_cap_non_numeric() {
+        let err = parse_text("interface wan eth0\nxdp syn-cookie-tx-cap=notanumber\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::BadValue {
+                    what: "xdp syn-cookie-tx-cap",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

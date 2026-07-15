@@ -11,6 +11,14 @@
 //!    admits a burst then drops the sustained excess: a fast flood of M frames
 //!    from one source yields `REASON_RATELIMIT > 0` *and* a bounded number of
 //!    `REASON_PASS` (≈ `burst`).
+//! 3. **SYN-cookie global TX-budget cap under load** (sub-project X3) — a
+//!    spoofed-source SYN flood (a fresh source per frame, so the per-source
+//!    `RATE` limiter never engages — see `blackwall_xdp_common::TxBucket`'s
+//!    doc comment) at a protected cookie port admits only a bounded burst of
+//!    in-kernel SipHash-cookie `XDP_TX` mints (`REASON_SYNCOOKIE`) before the
+//!    global `TX_BUDGET` cap engages (`REASON_SYNCOOKIE_TXCAPPED > 0`), and a
+//!    legitimate SYN sent after the bucket has had time to refill still mints
+//!    a cookie — proving the cap denies the *excess*, not everything.
 //!
 //! The rate limiter is **time/rate-dependent** and cannot be exercised by
 //! `BPF_PROG_TEST_RUN` (single-shot, no wall-clock between runs): only a real
@@ -124,6 +132,44 @@ fn udp_frame(src: [u8; 4], dst_port: u16, marker: [u8; 4]) -> Vec<u8> {
     p[36..38].copy_from_slice(&dst_port.to_be_bytes()); // dst port
     p[38..40].copy_from_slice(&(8u16 + 4).to_be_bytes()); // UDP length
     p[42..46].copy_from_slice(&marker);
+    p
+}
+
+/// Client MAC used in the crafted SYN (mirrors `prog_test_run.rs`'s golden
+/// SYN-cookie frames; this file's own SYN-cookie test needs the same shape but
+/// each `#[test]` binary is compiled separately, so the builder is duplicated
+/// rather than shared).
+const CLIENT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+/// Server MAC used in the crafted SYN.
+const SERVER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+/// Build an `Ethernet + IPv4 + TCP SYN` frame carrying a single 4-byte MSS
+/// option (TCP data-offset 6). Input header checksums are left zero — the eBPF
+/// program never validates them, only recomputes the reply's.
+fn eth_ipv4_tcp_syn(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
+    const IP: usize = 14;
+    const TCP: usize = 34;
+    let mut p = vec![0u8; 14 + 20 + 24];
+    p[0..6].copy_from_slice(&SERVER_MAC);
+    p[6..12].copy_from_slice(&CLIENT_MAC);
+    p[12] = 0x08;
+    p[13] = 0x00;
+    p[IP] = 0x45;
+    let tot_len = u16::try_from(20 + 24).expect("tot_len fits in u16");
+    p[IP + 2..IP + 4].copy_from_slice(&tot_len.to_be_bytes());
+    p[IP + 8] = 64; // TTL
+    p[IP + 9] = 6; // protocol = TCP
+    p[IP + 12..IP + 16].copy_from_slice(&src_ip);
+    p[IP + 16..IP + 20].copy_from_slice(&dst_ip);
+    p[TCP..TCP + 2].copy_from_slice(&src_port.to_be_bytes());
+    p[TCP + 2..TCP + 4].copy_from_slice(&dst_port.to_be_bytes());
+    p[TCP + 4..TCP + 8].copy_from_slice(&0x1122_3344u32.to_be_bytes()); // seq
+    p[TCP + 12] = 6 << 4; // data offset = 6 words, reserved 0
+    p[TCP + 13] = 0x02; // SYN
+    p[TCP + 14..TCP + 16].copy_from_slice(&64_240u16.to_be_bytes()); // window
+    p[TCP + 20] = 2; // MSS option kind
+    p[TCP + 21] = 4; // MSS option len
+    p[TCP + 22..TCP + 24].copy_from_slice(&1460u16.to_be_bytes());
     p
 }
 
@@ -317,5 +363,97 @@ fn rate_limited_source_under_load_admits_a_burst_then_drops_the_excess() {
     assert!(
         passed <= burst + 30,
         "admitted far more than a burst ({passed} passed, burst={burst})"
+    );
+}
+
+#[test]
+#[ignore = "requires root + CAP_NET_ADMIN/RAW; run in the lab CI job"]
+fn syn_cookie_tx_cap_engages_under_spoofed_flood_but_legit_syn_still_mints() {
+    // X3: the veth gate for the global SYN-cookie XDP_TX mint-rate cap. Unlike
+    // `RATE` (per-source), a spoofed flood that never reuses a source address
+    // never trips the per-source limiter at all — only a real, sustained flood
+    // against the live program (not `BPF_PROG_TEST_RUN`, which is single-shot
+    // and cannot show token-bucket refill over time) proves the *aggregate*
+    // `TX_BUDGET` cap engages.
+    let veth = VethPair::create();
+    let mut dp = XdpDataplane::attach(&veth.a, XdpMode::Auto).expect("attach xdp_filter to veth_a");
+
+    // Arm the SYN-cookie fast path: secret + protected prefix + protected port.
+    let dst_ip = [198, 51, 100, 1];
+    let cookie_port = 8443u16;
+    dp.set_cookie_key([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ])
+    .expect("install cookie key");
+    dp.set_protected_prefixes(&["198.51.100.1/32".parse::<IpNet>().expect("parse prefix")])
+        .expect("install protected prefix");
+    dp.set_protected_ports(&[cookie_port])
+        .expect("install protected port");
+
+    // A conservative cap: burst ceiling is `min(2 * cap_pps, TX_BUDGET_BURST_MAX)`
+    // (see `TxBucket`'s doc comment) — small enough that a flood of hundreds of
+    // spoofed SYNs, sent back-to-back with negligible elapsed time, clearly
+    // exceeds it.
+    let cap_pps: u32 = 5;
+    dp.set_syn_cookie_tx_cap(cap_pps)
+        .expect("install syn-cookie tx cap");
+
+    let sender = Sender::open(&veth.b);
+    const M: u32 = 300;
+
+    let before = dp.stats();
+    // A fresh spoofed source per SYN so the per-source RATE limiter (unarmed
+    // here — no `dp.rate_limit` call) never engages; only the global
+    // `TX_BUDGET` cap can deny these.
+    for i in 0..M {
+        let src = [
+            10,
+            77,
+            u8::try_from(i / 256).expect("fits in u8"),
+            u8::try_from(i % 256).expect("fits in u8"),
+        ];
+        let sent = sender.send(&eth_ipv4_tcp_syn(src, dst_ip, 40_000, cookie_port));
+        assert!(sent, "flood SYN #{i} should transmit");
+    }
+    let after_flood = dp.stats();
+
+    let minted = after_flood.syn_cookies_sent.packets - before.syn_cookies_sent.packets;
+    let txcapped = after_flood.syn_cookies_txcapped.packets - before.syn_cookies_txcapped.packets;
+
+    // The cap engaged: most of the flood was denied a cookie SYN-ACK.
+    assert!(
+        txcapped > 0,
+        "TX_BUDGET cap never engaged (REASON_SYNCOOKIE_TXCAPPED delta = 0)"
+    );
+    // ...but it is NOT a blanket deny: some SYNs cleared every gate and got the
+    // initial burst worth of cookie mints.
+    assert!(
+        minted > 0,
+        "no SYNs minted a cookie at all (cap engaged too early / gating broken)"
+    );
+    // The cap bounds the admitted total far below a 1:1 mint rate — generous
+    // slack (RSS could in principle spread the flood across a few per-CPU
+    // TX_BUDGET slots on a multi-queue veth) still proves this is a real cap,
+    // not "everything passes".
+    assert!(
+        minted < u64::from(M) / 2,
+        "minted ({minted}) should be far below the flood size ({M}) — cap not bounding the rate"
+    );
+
+    // Let the bucket refill (cap_pps=5 => ~1 token every 200ms) and prove a
+    // legitimate SYN afterward still mints — the cap denies the *excess*, not
+    // every subsequent SYN forever.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let legit_src = [10, 88, 0, 1];
+    let sent = sender.send(&eth_ipv4_tcp_syn(legit_src, dst_ip, 40_001, cookie_port));
+    assert!(sent, "post-flood legit SYN should transmit");
+    // Give the kernel a moment to process the single frame before reading stats.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let after_legit = dp.stats();
+    let legit_minted = after_legit.syn_cookies_sent.packets - after_flood.syn_cookies_sent.packets;
+    assert!(
+        legit_minted >= 1,
+        "a legitimate SYN sent after the bucket had time to refill should still mint a cookie"
     );
 }

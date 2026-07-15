@@ -37,4 +37,4 @@ pub use resolve::{PolicyError, ResolvedService};
 pub use rtbh::RtbhPolicy;
 pub use shape::{ShapeBandwidth, ShapeRule};
 pub use target::ServiceTarget;
-pub use xdp::{XdpConfig, XdpMode};
+pub use xdp::{XdpConfig, XdpMode, DEFAULT_SYN_COOKIE_TX_CAP_PPS};
