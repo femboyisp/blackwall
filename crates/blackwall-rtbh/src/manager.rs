@@ -153,6 +153,30 @@ impl MirrorOp {
     }
 }
 
+/// Outcome of [`RtbhManager::execute_and_journal_announce`].
+///
+/// The auto path (`apply_event`/`tick`, via [`RtbhManager::execute_and_journal`])
+/// ignores this — auto re-detection naturally compensates for a skip on its
+/// next tick. [`RtbhManager::apply_add`] (the manual path) consumes it to
+/// report a truthful [`ApplyOutcome`] rather than always claiming
+/// [`ApplyOutcome::Applied`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceOutcome {
+    /// The announce reached BGP; a journal-mirror failure afterward is still
+    /// `Applied` (self-healed via [`RtbhManager::retry_pending_mirror`]) —
+    /// the live blackhole is active either way.
+    Applied,
+    /// Skipped: the shared cross-plane [`ArmingRateLimiter`] (C6) was at
+    /// capacity. The controller entry was rolled back.
+    RateCapped,
+    /// Skipped: the manager is [`RtbhManager::disarm`]ed (C5), record-only.
+    /// The controller entry was rolled back.
+    Disarmed,
+    /// Attempted and failed at the [`BgpExecutor`] (C2). The controller
+    /// entry was rolled back.
+    Failed,
+}
+
 impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     /// Wrap a controller with a BGP executor and a journal.
     pub fn new(controller: RtbhController, bgp: B, journal: J) -> Self {
@@ -228,15 +252,28 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
     ) -> ApplyOutcome {
         let actions = self.controller.manual_add(target, mono_now);
         if let Some(RtbhAction::Announce(route)) = actions.into_iter().next() {
-            self.execute_and_journal_announce(
-                target,
-                route,
-                BlackholeOrigin::Manual,
-                mono_now,
-                wall_now,
-            )
-            .await;
-            return ApplyOutcome::Applied;
+            let outcome = self
+                .execute_and_journal_announce(
+                    target,
+                    route,
+                    BlackholeOrigin::Manual,
+                    mono_now,
+                    wall_now,
+                )
+                .await;
+            return match outcome {
+                AnnounceOutcome::Applied => ApplyOutcome::Applied,
+                // The window will have room again; the request row stays
+                // `pending` and is retried next tick.
+                AnnounceOutcome::RateCapped => ApplyOutcome::Deferred,
+                // One-way: retrying is pointless until re-armed via restart.
+                AnnounceOutcome::Disarmed => ApplyOutcome::Rejected(format!(
+                    "{target} was not announced: manager is disarmed (C5)"
+                )),
+                // No auto re-detection exists for a manual request, so a
+                // failed BGP announce must be retried, not marked applied.
+                AnnounceOutcome::Failed => ApplyOutcome::Deferred,
+            };
         }
         // Empty result: either already active (upgrade), at cap, or rejected.
         if self.is_active(target) {
@@ -476,12 +513,12 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
         origin: BlackholeOrigin,
         mono_now: u64,
         wall_now: u64,
-    ) {
+    ) -> AnnounceOutcome {
         if self.disarmed {
             tracing::warn!(%target, "RTBH: disarmed (C5); skipping announce, recording only");
             self.controller.rollback(target);
             self.disarmed_skips = self.disarmed_skips.saturating_add(1);
-            return;
+            return AnnounceOutcome::Disarmed;
         }
         if let Some(limiter) = &self.rate_limiter {
             let allowed = limiter
@@ -492,14 +529,14 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
                 tracing::warn!(%target, "RTBH: cross-plane new-mitigation rate cap exceeded (C6); skipping announce, not activating");
                 self.controller.rollback(target);
                 self.ratecapped = self.ratecapped.saturating_add(1);
-                return;
+                return AnnounceOutcome::RateCapped;
             }
         }
         if let Err(e) = self.bgp.announce(route).await {
             tracing::warn!(%target, error = %e, "RTBH: BGP announce failed; rolling back active entry, not journaling");
             self.controller.rollback(target);
             self.apply_failures = self.apply_failures.saturating_add(1);
-            return;
+            return AnnounceOutcome::Failed;
         }
         if let Err(e) = self.journal.record_announce(target, origin, wall_now).await {
             tracing::error!(%target, error = %e, "RTBH: journal write failed after announce; keeping active");
@@ -509,6 +546,7 @@ impl<B: BgpExecutor, J: BlackholeJournal> RtbhManager<B, J> {
                 at_ms: wall_now,
             });
         }
+        AnnounceOutcome::Applied
     }
 
     /// Drain-retry queued mirror writes left over from a transient journal
@@ -1191,6 +1229,58 @@ mod tests {
         m.apply_event(&DetectionEvent::Opened(det("203.0.113.9")), 2_000, 2_000)
             .await;
         assert!(!m.is_active(ip("203.0.113.9")));
+    }
+
+    #[tokio::test]
+    async fn apply_add_while_disarmed_is_rejected_not_applied() {
+        // C5 + final-review fix: a manual add while disarmed must be
+        // classified Rejected (retrying is pointless — there is no re-arm
+        // entry point), never Applied — an "applied" operator-request row
+        // is never retried, which would silently lose operator intent.
+        let mut m = mgr(false, false);
+        m.disarm(0).await;
+
+        let outcome = m.apply_add(ip("203.0.113.7"), 1_000, 1_000).await;
+        match &outcome {
+            ApplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("disarmed"),
+                    "reason should mention 'disarmed': {reason}"
+                );
+            }
+            other => panic!("disarmed manual add must be Rejected, not {other:?}"),
+        }
+        assert!(
+            !m.is_active(ip("203.0.113.7")),
+            "a disarmed manual add must not leave a phantom active entry"
+        );
+        assert!(m.bgp().announced.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_add_while_rate_capped_is_deferred_not_applied() {
+        // C6 + final-review fix: a manual add rejected by the shared rate
+        // limiter must be classified Deferred (the request row stays
+        // `pending` and is retried next tick, once the window has room),
+        // never Applied.
+        let mut m =
+            mgr(false, false).with_rate_limiter(Arc::new(Mutex::new(ArmingRateLimiter::new(1))));
+        // Exhaust the limiter's one slot for this window via an auto path.
+        m.apply_event(&DetectionEvent::Opened(det("203.0.113.7")), 1_000, 1_000)
+            .await;
+        assert!(m.is_active(ip("203.0.113.7")));
+
+        let outcome = m.apply_add(ip("203.0.113.8"), 1_500, 1_500).await;
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Deferred,
+            "a rate-capped manual add must be Deferred, not Applied"
+        );
+        assert!(
+            !m.is_active(ip("203.0.113.8")),
+            "a rate-capped manual add must not leave a phantom active entry"
+        );
+        assert_eq!(m.ratecapped(), 1);
     }
 
     #[tokio::test]

@@ -69,6 +69,31 @@ impl MirrorOp {
     }
 }
 
+/// Outcome of [`FlowSpecManager::execute_and_journal_announce`].
+///
+/// Mirrors [`crate::manager`]'s private `AnnounceOutcome`. The auto path
+/// (`apply_open`/`tick`, via [`FlowSpecManager::execute_and_journal`])
+/// ignores this — auto re-detection naturally compensates for a skip on its
+/// next tick. [`FlowSpecManager::apply_add`] (the manual path) consumes it
+/// to report a truthful [`ApplyOutcome`] rather than always claiming
+/// [`ApplyOutcome::Applied`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceOutcome {
+    /// The announce reached BGP; a journal-mirror failure afterward is still
+    /// `Applied` (self-healed via [`FlowSpecManager::retry_pending_mirror`])
+    /// — the live rule is active either way.
+    Applied,
+    /// Skipped: the shared cross-plane [`ArmingRateLimiter`] (C6) was at
+    /// capacity. The controller entry was rolled back.
+    RateCapped,
+    /// Skipped: the manager is [`FlowSpecManager::disarm`]ed (C5),
+    /// record-only. The controller entry was rolled back.
+    Disarmed,
+    /// Attempted and failed at the [`BgpExecutor`] (C2). The controller
+    /// entry was rolled back.
+    Failed,
+}
+
 /// Single-owner FlowSpec manager.
 ///
 /// Owns the pure [`FlowSpecController`] plus the I/O boundary: it executes the
@@ -236,9 +261,22 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         let target = rule.dst.addr();
         let actions = self.controller.manual_add(rule.clone(), mono_now);
         if let Some(FlowSpecAction::Announce(r)) = actions.into_iter().next() {
-            self.execute_and_journal_announce(r, BlackholeOrigin::Manual, mono_now, wall_now)
+            let outcome = self
+                .execute_and_journal_announce(r, BlackholeOrigin::Manual, mono_now, wall_now)
                 .await;
-            return ApplyOutcome::Applied;
+            return match outcome {
+                AnnounceOutcome::Applied => ApplyOutcome::Applied,
+                // The window will have room again; the request row stays
+                // `pending` and is retried next tick.
+                AnnounceOutcome::RateCapped => ApplyOutcome::Deferred,
+                // One-way: retrying is pointless until re-armed via restart.
+                AnnounceOutcome::Disarmed => ApplyOutcome::Rejected(format!(
+                    "{target} was not announced: manager is disarmed (C5)"
+                )),
+                // No auto re-detection exists for a manual request, so a
+                // failed BGP announce must be retried, not marked applied.
+                AnnounceOutcome::Failed => ApplyOutcome::Deferred,
+            };
         }
         // Empty result: either already active (upgrade), at cap, or rejected.
         if self.is_active(key) {
@@ -465,7 +503,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
         origin: BlackholeOrigin,
         mono_now: u64,
         wall_now: u64,
-    ) {
+    ) -> AnnounceOutcome {
         let key = key_of(&rule);
         if self.disarmed {
             tracing::warn!(
@@ -474,7 +512,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
             );
             self.controller.rollback(key);
             self.disarmed_skips = self.disarmed_skips.saturating_add(1);
-            return;
+            return AnnounceOutcome::Disarmed;
         }
         if let Some(limiter) = &self.rate_limiter {
             let allowed = limiter
@@ -485,14 +523,14 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
                 tracing::warn!(?key, "FlowSpec: cross-plane new-mitigation rate cap exceeded (C6); skipping announce, not activating");
                 self.controller.rollback(key);
                 self.ratecapped = self.ratecapped.saturating_add(1);
-                return;
+                return AnnounceOutcome::RateCapped;
             }
         }
         if let Err(e) = self.bgp.announce_flowspec(rule.clone()).await {
             tracing::warn!(?key, error = %e, "FlowSpec: BGP announce failed; rolling back active entry, not journaling");
             self.controller.rollback(key);
             self.apply_failures = self.apply_failures.saturating_add(1);
-            return;
+            return AnnounceOutcome::Failed;
         }
         if let Err(e) = self
             .journal
@@ -506,6 +544,7 @@ impl<B: BgpExecutor, J: FlowSpecJournal> FlowSpecManager<B, J> {
                 at_ms: wall_now,
             });
         }
+        AnnounceOutcome::Applied
     }
 
     /// Drain-retry queued mirror writes left over from a transient journal
@@ -1173,6 +1212,70 @@ mod tests {
         assert_eq!(m.apply_failures(), 0);
         assert_eq!(m.ratecapped(), 0);
         assert_eq!(m.disarmed_skips(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_add_while_disarmed_is_rejected_not_applied() {
+        // C5 + final-review fix: a manual add while disarmed must be
+        // classified Rejected (retrying is pointless — there is no re-arm
+        // entry point), never Applied — an "applied" operator-request row
+        // is never retried, which would silently lose operator intent.
+        let mut m = mgr(false, false);
+        m.disarm(0).await;
+
+        let outcome = m
+            .apply_add(rule("203.0.113.7/32", 17, 53, 0.0), 1_000, 1_000)
+            .await;
+        match &outcome {
+            ApplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("disarmed"),
+                    "reason should mention 'disarmed': {reason}"
+                );
+            }
+            other => panic!("disarmed manual add must be Rejected, not {other:?}"),
+        }
+        let key = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key),
+            "a disarmed manual add must not leave a phantom active entry"
+        );
+        assert!(m.bgp().announced.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_add_while_rate_capped_is_deferred_not_applied() {
+        // C6 + final-review fix: a manual add rejected by the shared rate
+        // limiter must be classified Deferred (the request row stays
+        // `pending` and is retried next tick, once the window has room),
+        // never Applied.
+        let mut m =
+            mgr(false, false).with_rate_limiter(Arc::new(Mutex::new(ArmingRateLimiter::new(1))));
+        // Exhaust the limiter's one slot for this window via an auto path.
+        m.apply_open(
+            ip("203.0.113.7"),
+            &[flow_rule("203.0.113.7", 17, 53, 0.0)],
+            1_000,
+            1_000,
+        )
+        .await;
+        let key1 = key_of(&rule("203.0.113.7/32", 17, 53, 0.0));
+        assert!(m.is_active(key1));
+
+        let outcome = m
+            .apply_add(rule("203.0.113.8/32", 17, 53, 0.0), 1_500, 1_500)
+            .await;
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Deferred,
+            "a rate-capped manual add must be Deferred, not Applied"
+        );
+        let key2 = key_of(&rule("203.0.113.8/32", 17, 53, 0.0));
+        assert!(
+            !m.is_active(key2),
+            "a rate-capped manual add must not leave a phantom active entry"
+        );
+        assert_eq!(m.ratecapped(), 1);
     }
 
     #[tokio::test]

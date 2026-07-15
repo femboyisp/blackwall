@@ -108,6 +108,31 @@ enum MirrorKey {
     Net(IpNet),
 }
 
+/// Outcome of [`XdpManager::execute_and_journal`].
+///
+/// The auto path (`on_detection`, which always passes `fresh = true`)
+/// ignores this — auto re-detection naturally compensates for a skip on its
+/// next tick. [`XdpManager::apply_add`] and [`XdpManager::apply_rate_limit`]
+/// (the manual insert paths) consume it to report a truthful
+/// [`ApplyOutcome`] rather than always claiming [`ApplyOutcome::Applied`].
+/// There is no rate-capped variant here: unlike `RtbhManager`/
+/// `FlowSpecManager`, `XdpManager` has no [`crate`]-level cross-plane rate
+/// limiter attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecOutcome {
+    /// The action reached the executor; a journal-mirror failure afterward
+    /// is still `Applied` (self-healed via
+    /// [`XdpManager::retry_pending_mirror`]) — the live entry is active
+    /// either way.
+    Applied,
+    /// Skipped: the manager is [`XdpManager::disarm`]ed (C5), record-only.
+    /// A fresh insert's controller entry was rolled back.
+    Disarmed,
+    /// Attempted and failed at the [`XdpExecutor`] (C2). A fresh insert's
+    /// controller entry was rolled back.
+    Failed,
+}
+
 /// Single-owner XDP manager.
 ///
 /// Owns the pure [`XdpController`] plus the I/O boundary: it executes the
@@ -187,9 +212,19 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         let fresh = !self.controller.is_blocked(net);
         match self.controller.manual_block(net) {
             Ok(action) => {
-                self.execute_and_journal(action, XdpOrigin::Manual, wall_now, fresh)
-                    .await;
-                ApplyOutcome::Applied
+                match self
+                    .execute_and_journal(action, XdpOrigin::Manual, wall_now, fresh)
+                    .await
+                {
+                    ExecOutcome::Applied => ApplyOutcome::Applied,
+                    // One-way: retrying is pointless until re-armed via restart.
+                    ExecOutcome::Disarmed => ApplyOutcome::Rejected(format!(
+                        "{net} was not applied: manager is disarmed (C5)"
+                    )),
+                    // No auto re-detection exists for a manual request, so a
+                    // failed executor apply must be retried, not marked applied.
+                    ExecOutcome::Failed => ApplyOutcome::Deferred,
+                }
             }
             Err(e) if self.controller.overlaps_own_prefix(net) => ApplyOutcome::Rejected(e),
             Err(_) => ApplyOutcome::Deferred,
@@ -241,9 +276,19 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         let fresh = !self.controller.is_rate_limited(src);
         match self.controller.manual_rate_limit(src, pps, burst) {
             Ok(action) => {
-                self.execute_and_journal(action, XdpOrigin::Manual, wall_now, fresh)
-                    .await;
-                ApplyOutcome::Applied
+                match self
+                    .execute_and_journal(action, XdpOrigin::Manual, wall_now, fresh)
+                    .await
+                {
+                    ExecOutcome::Applied => ApplyOutcome::Applied,
+                    // One-way: retrying is pointless until re-armed via restart.
+                    ExecOutcome::Disarmed => ApplyOutcome::Rejected(format!(
+                        "{src} was not rate-limited: manager is disarmed (C5)"
+                    )),
+                    // No auto re-detection exists for a manual request, so a
+                    // failed executor apply must be retried, not marked applied.
+                    ExecOutcome::Failed => ApplyOutcome::Deferred,
+                }
             }
             Err(_) => ApplyOutcome::Deferred,
         }
@@ -383,7 +428,7 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
         origin: XdpOrigin,
         wall_now: u64,
         fresh: bool,
-    ) {
+    ) -> ExecOutcome {
         if self.disarmed
             && matches!(
                 action,
@@ -398,7 +443,7 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
                 self.controller.rollback(&action);
             }
             self.disarmed_skips = self.disarmed_skips.saturating_add(1);
-            return;
+            return ExecOutcome::Disarmed;
         }
         if let Err(e) = self.executor.apply(action).await {
             self.apply_failures = self.apply_failures.saturating_add(1);
@@ -412,7 +457,7 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
             } else {
                 tracing::warn!(error = %e, ?action, "XDP: executor apply failed; not journaling");
             }
-            return;
+            return ExecOutcome::Failed;
         }
         if let Err(e) = self.journal.record(&action, origin, wall_now).await {
             tracing::error!(error = %e, ?action, "XDP: journal write failed after apply; keeping active");
@@ -422,6 +467,7 @@ impl<E: XdpExecutor, J: XdpJournal> XdpManager<E, J> {
                 at_ms: wall_now,
             });
         }
+        ExecOutcome::Applied
     }
 
     /// Drain-retry queued mirror writes left over from a transient journal failure.
@@ -470,11 +516,21 @@ mod tests {
     struct FakeExecutor {
         applied: Mutex<Vec<XdpAction>>,
         fail: bool,
+        /// If `Some(n)`, the n-th call (1-indexed) onward fails; earlier
+        /// calls succeed. Used to simulate a successful fresh insert
+        /// followed by a failing upgrade apply (Fix 2 regression test).
+        fail_from_call: Option<usize>,
+        call_count: Mutex<usize>,
     }
     #[async_trait]
     impl XdpExecutor for FakeExecutor {
         async fn apply(&self, action: XdpAction) -> Result<(), XdpExecError> {
-            if self.fail {
+            let call_no = {
+                let mut count = self.call_count.lock().unwrap();
+                *count += 1;
+                *count
+            };
+            if self.fail || self.fail_from_call.is_some_and(|from| call_no >= from) {
                 return Err(XdpExecError);
             }
             self.applied.lock().unwrap().push(action);
@@ -823,6 +879,111 @@ mod tests {
         assert_eq!(m.executor().applied.lock().unwrap().len(), applied_before);
         assert_eq!(m.apply_failures(), 0);
         assert_eq!(m.disarmed_skips(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_add_while_disarmed_is_rejected_not_applied() {
+        // C5 + final-review fix: a manual add while disarmed must be
+        // classified Rejected (retrying is pointless — there is no re-arm
+        // entry point), never Applied — an "applied" operator-request row
+        // is never retried, which would silently lose operator intent.
+        let mut m = mgr(false, false);
+        m.disarm(0).await;
+
+        let outcome = m.apply_add("198.51.100.0/24".parse().unwrap(), 1_000).await;
+        match &outcome {
+            ApplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("disarmed"),
+                    "reason should mention 'disarmed': {reason}"
+                );
+            }
+            other => panic!("disarmed manual add must be Rejected, not {other:?}"),
+        }
+        assert!(
+            m.active().is_empty(),
+            "a disarmed manual add must not leave a phantom active entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_rate_limit_while_disarmed_is_rejected_not_applied() {
+        // Same as above, for the apply_rate_limit manual path.
+        let mut m = mgr(false, false);
+        m.disarm(0).await;
+
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+        let outcome = m.apply_rate_limit(addr, 500, 500, 1_000).await;
+        match &outcome {
+            ApplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("disarmed"),
+                    "reason should mention 'disarmed': {reason}"
+                );
+            }
+            other => panic!("disarmed manual rate-limit must be Rejected, not {other:?}"),
+        }
+        assert!(m.active().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_add_when_executor_fails_is_deferred_not_applied() {
+        // final-review fix: a manual add whose executor apply fails has no
+        // auto re-detection to compensate — it must be Deferred (retried
+        // next tick), not marked Applied.
+        let mut m = mgr(true, false); // executor always fails
+        let outcome = m.apply_add("198.51.100.0/24".parse().unwrap(), 0).await;
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Deferred,
+            "a failed executor apply on a manual add must be Deferred, not Applied"
+        );
+        assert!(m.active().is_empty());
+        assert_eq!(m.apply_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn upgrade_apply_failure_does_not_evict_existing_active_entry() {
+        // Fix 2 (final-review regression test): an already-active
+        // (successfully-applied) rate-limit entry, then an UPGRADE apply
+        // (same source, new pps/burst) whose executor FAILS must NOT evict
+        // the pre-existing active entry — only a FRESH insert's rollback
+        // undoes anything (`fresh` is computed BEFORE the controller call
+        // and rollback only fires `if fresh`).
+        let mut m = XdpManager::new(
+            XdpController::new(own(), 100, 1000, Vec::new()),
+            FakeExecutor {
+                // 1st call (the fresh insert) succeeds; 2nd call (the
+                // upgrade) and onward fail.
+                fail_from_call: Some(2),
+                ..Default::default()
+            },
+            FakeJournal::default(),
+        );
+        let addr: IpAddr = "198.51.100.9".parse().unwrap();
+
+        let first = m.apply_rate_limit(addr, 500, 500, 0).await;
+        assert_eq!(first, ApplyOutcome::Applied, "the fresh insert succeeds");
+        assert_eq!(m.active().len(), 1);
+
+        let second = m.apply_rate_limit(addr, 999, 999, 1_000).await;
+        assert_eq!(
+            second,
+            ApplyOutcome::Deferred,
+            "a failed upgrade apply must be Deferred, not Applied"
+        );
+        assert_eq!(
+            m.active().len(),
+            1,
+            "the pre-existing entry must still be active, not evicted by a failed upgrade"
+        );
+        assert!(
+            m.active().iter().any(
+                |(action, _)| matches!(action, XdpAction::RateLimit { src, .. } if *src == addr)
+            ),
+            "the surviving entry must still be for the same source"
+        );
+        assert_eq!(m.apply_failures(), 1);
     }
 
     #[tokio::test]
