@@ -79,7 +79,7 @@ use aya_ebpf::bindings::xdp_action;
 use aya_ebpf::helpers::{bpf_ktime_get_ns, bpf_xdp_load_bytes};
 use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, XskMap};
+use aya_ebpf::maps::{HashMap, LpmTrie, LruPerCpuHashMap, PerCpuArray, RingBuf, XskMap};
 use aya_ebpf::programs::XdpContext;
 use blackwall_cookie::make_cookie_raw;
 use blackwall_xdp_common::{
@@ -95,8 +95,17 @@ use network_types::tcp::TcpHdr;
 static BLOCK_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(65536, 1);
 #[map]
 static BLOCK_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(65536, 1);
+/// Per-source token bucket, keyed by 16-byte source (v4 zero-padded). An
+/// `LruPerCpuHashMap` (X1 fallback — see [`RateBucket`]'s doc comment for why
+/// a single `bpf_spin_lock`-guarded bucket was rejected by the verifier on
+/// this toolchain): each CPU holds its own independent bucket for a given
+/// source, so `over_rate`'s refill/decrement RMW is inherently race-free
+/// (never observed or mutated by another CPU) at the cost of an effective
+/// per-source limit of up to `N_cpus × configured burst` under an
+/// RSS-spread flood, rather than the exact configured value.
 #[map]
-static RATE: LruHashMap<[u8; 16], RateBucket> = LruHashMap::with_max_entries(1_048_576, 0);
+static RATE: LruPerCpuHashMap<[u8; 16], RateBucket> =
+    LruPerCpuHashMap::with_max_entries(1_048_576, 0);
 #[map]
 static STATS: PerCpuArray<Stat> = PerCpuArray::with_max_entries(REASON_COUNT, 0);
 /// Single-entry map (key `0`) holding the 128-bit SYN-cookie secret, pre-split
@@ -1086,12 +1095,26 @@ fn protected_v6(dst: [u8; 16]) -> bool {
 /// Token-bucket check keyed by 16-byte source (v4 zero-padded). Returns `true`
 /// if the packet exceeds the source's budget and should be dropped. Sources
 /// with no existing bucket are unconfigured and always pass.
+///
+/// # Race-free RMW (X1): per-CPU fallback
+///
+/// `RATE` is an `LruPerCpuHashMap` (see [`RateBucket`]'s doc comment and the
+/// `RATE` declaration above for why a single shared, `bpf_spin_lock`-guarded
+/// bucket was rejected by the verifier on this toolchain), so
+/// `RATE.get_ptr_mut` always returns a pointer to *this* CPU's own copy of
+/// the bucket: the kernel indexes per-CPU map lookups by the running CPU, so
+/// no other CPU can observe or mutate the same memory concurrently. The
+/// refill + decrement below is therefore already race-free with no lock
+/// needed -- at the cost of an effective per-source limit of up to
+/// `N_cpus × configured burst` under an RSS-spread flood (never tighter,
+/// only looser than the configured value).
 fn over_rate(src: [u8; 16]) -> bool {
     // SAFETY: `bpf_ktime_get_ns` is always safe to call from XDP context.
     let now = unsafe { bpf_ktime_get_ns() };
     if let Some(b) = RATE.get_ptr_mut(&src) {
         // SAFETY: `get_ptr_mut` returned a valid, exclusively-held pointer to
-        // this source's bucket for the duration of this call.
+        // this CPU's copy of this source's bucket for the duration of this
+        // call; no other CPU can alias it (per-CPU map lookup).
         unsafe {
             let elapsed_ns = now.saturating_sub((*b).last_ns);
             // Plain 64-bit `wrapping_mul` lowers to a single BPF multiply;

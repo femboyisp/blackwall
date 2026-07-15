@@ -1112,3 +1112,155 @@ fn disabled_capture_pushes_nothing() {
         "capture disabled: the ring must stay empty"
     );
 }
+
+// --- X1: race-free per-source RATE bucket ---
+//
+// The feasibility spike attempted a single shared bucket (one `LruHashMap`
+// entry per source) guarded by a `bpf_spin_lock` field. The verifier rejected
+// it on this toolchain/kernel: `map 'RATE' has to have BTF in order to use
+// bpf_spin_lock` — aya-ebpf 0.1.1's `#[map]` macro emits the legacy
+// `bpf_map_def`-based `maps` ELF section, not a BTF-defined map, so aya never
+// populates `btf_key_type_id`/`btf_value_type_id` at map-creation time. The
+// shipped fix is the fallback: `RATE` is now an `LruPerCpuHashMap`, so each
+// CPU's copy of a source's bucket is independent and the refill/decrement
+// needs no lock (see `blackwall_xdp_common::RateBucket`'s and
+// `blackwall-xdp-ebpf`'s `RATE`/`over_rate` doc comments for the full
+// rationale and the `N_cpus × configured burst` looser-bound trade-off).
+
+/// `#[repr(transparent)]` newtype so the foreign
+/// [`blackwall_xdp_common::RateBucket`] POD can carry an [`aya::Pod`] impl
+/// (the orphan rule forbids implementing it directly) — mirrors the
+/// production `RateBucketPod` in `blackwall_xdp::dataplane`.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct RateBucketPod(blackwall_xdp_common::RateBucket);
+
+// SAFETY: `RateBucket` is a `#[repr(C)]` `Copy + 'static` plain-old-data
+// struct of four `u64` fields; `#[repr(transparent)]` makes `RateBucketPod`
+// share its exact layout, so it is byte-for-byte valid as a BPF map value.
+unsafe impl aya::Pod for RateBucketPod {}
+
+/// Install a fresh token bucket for `addr` (v4, zero-padded into the low four
+/// bytes of the 16-byte key exactly like the eBPF program's own key) on
+/// *every* CPU's slot, with `rate_pps = 0` so the burst is never refilled
+/// mid-test — the (N+1)th packet on the pinned CPU is guaranteed to see zero
+/// tokens. Mirrors the production `XdpDataplane::rate_limit` per-CPU seeding
+/// (`RATE` is an `LruPerCpuHashMap`, X1 fallback).
+fn install_rate_bucket(bpf: &mut Ebpf, addr: [u8; 4], burst: u64) {
+    use aya::maps::{PerCpuHashMap, PerCpuValues};
+    use aya::util::nr_cpus;
+
+    let mut map: PerCpuHashMap<_, [u8; 16], RateBucketPod> =
+        PerCpuHashMap::try_from(bpf.map_mut("RATE").expect("RATE map present"))
+            .expect("RATE is a PerCpuHashMap");
+    let mut key = [0u8; 16];
+    key[..4].copy_from_slice(&addr);
+    let bucket = blackwall_xdp_common::RateBucket {
+        tokens: burst,
+        last_ns: 0,
+        rate_pps: 0,
+        burst,
+    };
+    let cpus = nr_cpus().expect("nr_cpus");
+    let values =
+        PerCpuValues::try_from(vec![RateBucketPod(bucket); cpus]).expect("build per-CPU values");
+    map.insert(key, values, 0).expect("insert rate bucket");
+}
+
+/// Pin the calling thread to CPU 0 for the duration of `f`, restoring the
+/// original affinity mask afterward.
+///
+/// `RATE` is per-CPU (X1 fallback), so `BPF_PROG_TEST_RUN` must execute every
+/// packet in a burst sequence on the *same* CPU: otherwise the scheduler
+/// could migrate the calling thread between calls and each packet would hit
+/// a different, independently-full per-CPU bucket rather than draining one.
+fn pin_to_cpu0<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: `old`/`only0` are zero-initialised, correctly-sized `cpu_set_t`
+    // buffers; `sched_getaffinity`/`sched_setaffinity` with pid `0` operate on
+    // the calling thread and write/read exactly `size_of::<cpu_set_t>()`
+    // bytes into/from them.
+    unsafe {
+        let mut old: libc::cpu_set_t = std::mem::zeroed();
+        let rc = libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw mut old);
+        assert_eq!(
+            rc,
+            0,
+            "sched_getaffinity failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut only0: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(0, &mut only0);
+        let rc =
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const only0);
+        assert_eq!(
+            rc,
+            0,
+            "sched_setaffinity(cpu0) failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let result = f();
+
+        let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const old);
+        assert_eq!(
+            rc,
+            0,
+            "sched_setaffinity(restore) failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        result
+    }
+}
+
+/// X1: the verifier must accept `RATE`'s `LruPerCpuHashMap` value
+/// (`prog.load()` below is the load/verify check) and, pinned to a single
+/// CPU so every `BPF_PROG_TEST_RUN` call hits the same per-CPU bucket slot,
+/// sequential calls must enforce the token bucket exactly as before X1: the
+/// first `burst` packets from one source are admitted, the next is dropped
+/// with `REASON_RATELIMIT`.
+#[test]
+#[ignore = "requires root + recent kernel; run in the lab CI job"]
+fn rate_limited_source_is_admitted_up_to_burst_then_dropped() {
+    const SRC: [u8; 4] = [203, 0, 113, 42];
+    const BURST: u64 = 3;
+
+    pin_to_cpu0(|| {
+        let mut bpf = Ebpf::load(blackwall_xdp::PROGRAM_OBJECT).expect("load eBPF object");
+        install_rate_bucket(&mut bpf, SRC, BURST);
+
+        let prog: &mut Xdp = bpf
+            .program_mut("xdp_filter")
+            .expect("xdp_filter program present")
+            .try_into()
+            .expect("program is an Xdp");
+        // The load/verify step is itself the X1 spike assertion: the verifier
+        // must accept the `LruPerCpuHashMap` RATE map value on this kernel.
+        prog.load()
+            .expect("verify + load xdp_filter (per-CPU RATE map value)");
+        let prog_fd = prog.fd().expect("program fd").as_fd().as_raw_fd();
+
+        let frame = eth_ipv4(SRC);
+        for i in 0..BURST {
+            let action = run_xdp(prog_fd, &frame);
+            assert_eq!(action, XDP_PASS, "packet {i} within burst must be admitted");
+        }
+        assert_eq!(
+            stat_packets(&mut bpf, blackwall_xdp_common::REASON_RATELIMIT),
+            0,
+            "no packet within the burst should be rate-limited"
+        );
+
+        let over_burst = run_xdp(prog_fd, &frame);
+        assert_eq!(
+            over_burst, XDP_DROP,
+            "the (burst + 1)th packet must be rate-limited"
+        );
+        assert_eq!(
+            stat_packets(&mut bpf, blackwall_xdp_common::REASON_RATELIMIT),
+            1,
+            "exactly one packet must be counted as rate-limited"
+        );
+    });
+}

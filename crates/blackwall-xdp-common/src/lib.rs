@@ -45,6 +45,36 @@ pub struct LpmKeyV6 {
 }
 
 /// Per-source token bucket value for the rate-limit map.
+///
+/// # Race-free RMW (X1): per-CPU fallback
+///
+/// A `bpf_spin_lock`-guarded single shared bucket (one `LruHashMap` entry per
+/// source, locked around the refill + decrement) was attempted first and
+/// **rejected by the verifier** on this toolchain: aya-ebpf 0.1.1's `#[map]`
+/// macro emits the legacy `bpf_map_def`-based `maps` ELF section rather than
+/// a BTF-defined map, so aya never populates
+/// `btf_key_type_id`/`btf_value_type_id` at map-creation time and the kernel
+/// refuses `bpf_spin_lock` with `map 'RATE' has to have BTF in order to use
+/// bpf_spin_lock` (reproduced live via `BPF_PROG_TEST_RUN`, kernel 6.18).
+/// Fixing that would mean hand-rolling a BTF-defined-map ELF layout aya-ebpf
+/// 0.1.1 doesn't emit for `#[map]` statics -- out of scope here.
+///
+/// The shipped fix instead makes `RATE` an `LruPerCpuHashMap` (see the `RATE`
+/// map declaration in `blackwall-xdp-ebpf/src/main.rs`): each CPU gets its
+/// own independent [`RateBucket`] copy for a given source, so
+/// `bpf_map_lookup_elem` from the eBPF program is inherently isolated per CPU
+/// (the kernel indexes it by the running CPU) and the refill/decrement RMW in
+/// `over_rate` needs no lock -- there is no other CPU that can observe or
+/// mutate the same memory.
+///
+/// This is race-free but **looser than the single shared-bucket design**: a
+/// source's effective admitted rate becomes up to `N_cpus x configured
+/// burst` (RSS can spread one spoofed-source flood across every RX
+/// queue/CPU, each with its own full token bucket) rather than the exact
+/// configured limit -- never *tighter*, only looser. Userspace
+/// summing/reconciling per-CPU bucket state into a single reported rate is a
+/// follow-on (not implemented here); today each CPU is seeded with the same
+/// `tokens = burst` on install.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateBucket {

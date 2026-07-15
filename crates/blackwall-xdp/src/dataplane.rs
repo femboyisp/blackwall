@@ -19,8 +19,9 @@ use crate::manager::{XdpExecError, XdpExecutor};
 use crate::XdpAction;
 use async_trait::async_trait;
 use aya::maps::lpm_trie::Key;
-use aya::maps::{HashMap, LpmTrie, MapData, PerCpuArray, XskMap};
+use aya::maps::{HashMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, XskMap};
 use aya::programs::{Xdp, XdpFlags};
+use aya::util::nr_cpus;
 use aya::Ebpf;
 use blackwall_core::XdpMode;
 use blackwall_xdp_common::{
@@ -55,7 +56,12 @@ struct DataplaneMaps {
     /// IPv6 source blocklist (`{prefixlen:u32, addr:[u8;16]}` LPM key).
     block_v6: LpmTrie<MapData, [u8; 16], u8>,
     /// Per-source token buckets, keyed by the 16-byte source (v4 zero-padded).
-    rate: HashMap<MapData, [u8; 16], RateBucketPod>,
+    ///
+    /// `LruPerCpuHashMap` — the X1 fallback (see [`blackwall_xdp_common::RateBucket`]'s
+    /// doc comment): every CPU holds its own independent bucket for a given
+    /// source, so the effective admitted rate is up to `N_cpus × configured
+    /// burst` under an RSS-spread flood.
+    rate: PerCpuHashMap<MapData, [u8; 16], RateBucketPod>,
     /// Per-CPU decision counters, indexed by `REASON_*`.
     stats: PerCpuArray<MapData, StatPod>,
     /// Single-entry (key `0`) map carrying the SYN-cookie secret the in-kernel
@@ -477,6 +483,11 @@ impl DataplaneMaps {
     }
 
     /// Install a fresh token bucket for `addr`.
+    ///
+    /// `RATE` is per-CPU (X1 fallback), so every CPU's slot for this key must
+    /// be seeded identically with a full `tokens = burst` bucket — otherwise
+    /// whichever CPU an RSS-steered packet lands on would see a stale or
+    /// empty bucket from before this call.
     fn rate_limit(&mut self, addr: IpAddr, pps: u64, burst: u64) -> Result<(), XdpError> {
         let bucket = RateBucket {
             tokens: burst,
@@ -484,9 +495,10 @@ impl DataplaneMaps {
             rate_pps: pps,
             burst,
         };
-        self.rate
-            .insert(rate_key(addr), RateBucketPod(bucket), 0)
-            .map_err(map_err)
+        let cpus = nr_cpus().map_err(|(ctx, e)| XdpError::Map(format!("{ctx}: {e}")))?;
+        let values = PerCpuValues::try_from(vec![RateBucketPod(bucket); cpus])
+            .map_err(|e| XdpError::Map(e.to_string()))?;
+        self.rate.insert(rate_key(addr), values, 0).map_err(map_err)
     }
 
     /// Remove any token bucket installed for `addr`.
