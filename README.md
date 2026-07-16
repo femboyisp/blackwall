@@ -285,7 +285,8 @@ AF_XDP, rate limiting.
 deployment on an anycast ISP (centralized BGP brain + multi-POP telemetry). Staged, not flag-day:
 - 🟡 **M0 — detection-only (shadow):** telemetry ingest ✅ (above), a POP-sensor deploy contract
   (hsflowd) ✅, a **BIRD iBGP-snippet generator** ✅ (`blackwalld bird-config` emits BIRD's side of
-  the session + `OWN_V4/V6` defines from blackwall's config, validated against real BIRD2), and
+  the session from blackwall's config — `OWN_V4/V6` defines opt-in via `--with-defines`, off by
+  default so they don't collide with the operator's own — validated against real BIRD2), and
   **network-wide shadow mode** ✅ (a `shadow` directive logs+records every RTBH/FlowSpec/XDP
   mitigation the daemon *would* apply, via `/v1/audit` + `blackwall_shadow_would_mitigate_total`,
   without executing it). Remaining: Incus/metrics deploy glue. Run live, watch, tune — act on nothing.
