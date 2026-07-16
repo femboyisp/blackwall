@@ -264,13 +264,24 @@ interface, and the home box's config must accept it (`flow --listen
 
 ## Generate BIRD's side of the session (`bird-config`)
 Blackwall's native speaker peers *into* your BIRD; the BIRD side of that iBGP
-session (the `protocol bgp` stanza + the `OWN_V4/OWN_V6` prefix defines its
-export filters reference) is generated from the same `blackwall.conf`, so you
-don't hand-maintain the prefix/session lists twice:
+session (the `protocol bgp` stanza) is generated from the same `blackwall.conf`,
+so you don't hand-maintain the prefix/session lists twice:
 ```bash
 blackwalld bird-config --config /etc/blackwall/blackwall.conf > /etc/bird/blackwall.conf
 ```
-Add `include "blackwall.conf";` to your `bird.conf` and `birdc configure`. This
+Add `include "blackwall.conf";` to your `bird.conf` and `birdc configure`.
+
+> **`OWN_V4`/`OWN_V6` defines.** By default `bird-config` does **not** emit
+> `define OWN_V4`/`OWN_V6` — most `bird.conf`s already declare them (for their own
+> egress/RTBH-export filters), and BIRD rejects a *duplicate* `define`, which makes
+> `birdc configure` refuse the **entire** include so nothing installs. The generated
+> session doesn't reference these symbols itself (its import filters carry the
+> prefixes inline), so omitting them is free. If your `bird.conf` does *not* already
+> declare `OWN_V4`/`OWN_V6` and your own export filters reference them, pass
+> `--with-defines` so blackwall's include is their single source — but then don't
+> also declare them elsewhere, or you're back to the duplicate-define failure.
+
+This
 requires `local-addr=<ip>` on the `rtbh` directive — blackwall's own BGP source
 address, which the generator emits as BIRD's `neighbor` and the speaker binds as
 its source so the session matches by construction (its family must match the

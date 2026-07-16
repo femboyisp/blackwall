@@ -3197,7 +3197,8 @@ async fn xdp_rate_limit(
     config: &std::path::Path,
     operator: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    require_xdp(config)?;
+    let policy = require_xdp(config)?;
+    reject_add_in_shadow(&policy, "xdp rate-limit")?;
     if pps == 0 {
         return Err("rate-limit pps must be >= 1".into());
     }
