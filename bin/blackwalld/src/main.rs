@@ -46,6 +46,13 @@ enum Command {
         /// Path to the Blackwall config file.
         #[arg(long)]
         config: PathBuf,
+        /// Also emit `define OWN_V4`/`OWN_V6` lines. Off by default: a real
+        /// `bird.conf` already declares them, and BIRD rejects a duplicate
+        /// `define` — which makes `birdc configure` refuse the whole include, so
+        /// the session silently never installs. Only pass this when generating a
+        /// standalone snippet for a config that does not already define them.
+        #[arg(long)]
+        with_defines: bool,
     },
     /// Parse a config, persist it, and apply the ruleset to the kernel.
     Apply {
@@ -1635,9 +1642,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{json}");
             Ok(())
         }
-        Command::BirdConfig { config } => {
+        Command::BirdConfig {
+            config,
+            with_defines,
+        } => {
             let policy = blackwall_config::parse_and_resolve(&config)?;
-            match blackwall_bgp::render_bird_ibgp(&policy) {
+            match blackwall_bgp::render_bird_ibgp(&policy, with_defines) {
                 Ok(s) => {
                     print!("{s}");
                     Ok(())
@@ -2336,6 +2346,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(metrics::metrics_server(metrics_listen, sources));
             }
 
+            // Optional read-only control API — the same `/v1/audit` (and
+            // friends) the deception daemon serves. Without this, `api listen=`
+            // under a `flow` block is silently inert, leaving the shadow
+            // would-mitigate set reviewable only via direct SQL. `store` is
+            // already an `Arc` on this path.
+            if let Some(api_cfg) = policy.api.clone() {
+                tokio::spawn(api::serve_api(api_cfg, store.clone()));
+            }
+
             tracing::info!(%listen, "sflow collector starting");
             let collector = blackwall_flow::run_collector(
                 listen,
@@ -2822,6 +2841,30 @@ async fn run_rtbh(action: RtbhCmd) -> Result<(), Box<dyn std::error::Error>> {
 /// `rtbh add`: reject `ip` up front (no database connection made yet) if it
 /// falls outside the config's eligible prefixes or has no next-hop for its
 /// address family; otherwise queue an `"add"` intent row.
+/// Refuse a plane `add`/`block` when the config carries `shadow`.
+///
+/// In shadow mode the daemon never wires a real executor, so a queued intent row
+/// is not announced now — but it stays `pending` in the request table and the
+/// daemon applies it on the first tick *after* the operator later arms (removes
+/// `shadow`), possibly days later with no one watching. Enqueueing in shadow is
+/// never useful and plants a delayed-mitigation landmine; refuse it and point the
+/// operator at the safe alternatives.
+fn reject_add_in_shadow(
+    policy: &blackwall_core::Policy,
+    verb: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if policy.shadow {
+        return Err(format!(
+            "config is in shadow mode: `{verb}` would queue an intent that announces nothing now \
+             and then fires on the first tick after you arm (remove `shadow`) — a delayed, \
+             unattended mitigation. Arm first, or test-fire the data path directly (e.g. a BIRD \
+             static route) instead of queueing daemon intent."
+        )
+        .into());
+    }
+    Ok(())
+}
+
 async fn rtbh_add(
     ip: IpAddr,
     config: &std::path::Path,
@@ -2831,6 +2874,7 @@ async fn rtbh_add(
     let Some(rtbh) = policy.rtbh.clone() else {
         return Err("config has no `rtbh` block; RTBH is not enabled".into());
     };
+    reject_add_in_shadow(&policy, "rtbh add")?;
     let controller = blackwall_rtbh::RtbhController::new(rtbh_config_from(&policy, &rtbh));
     if !controller.is_eligible(ip) {
         return Err(format!("{ip} is outside the configured RTBH-eligible prefixes").into());
@@ -2929,6 +2973,7 @@ async fn flowspec_add(
     let Some(fs) = policy.flowspec.clone() else {
         return Err("config has no `flowspec` block; FlowSpec is not enabled".into());
     };
+    reject_add_in_shadow(&policy, "flowspec add")?;
     let controller = blackwall_rtbh::FlowSpecController::new(flowspec_config_from(&policy, &fs));
     if !controller.is_eligible(ip) {
         return Err(format!("{ip} is outside the configured FlowSpec-eligible prefixes").into());
@@ -3091,6 +3136,7 @@ async fn xdp_block(
     operator: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let policy = require_xdp(config)?;
+    reject_add_in_shadow(&policy, "xdp block")?;
     if policy
         .prefixes
         .iter()
@@ -3297,4 +3343,37 @@ async fn xdp_capture(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy_from(cfg: &str) -> blackwall_core::Policy {
+        blackwall_config::parse_str(cfg).expect("parse")
+    }
+
+    const RTBH_CFG: &str = "interface wan eth0\n\
+         ipv4 203.0.113.0/24\n\
+         rtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 \
+         next-hop-v4=192.0.2.1 max=256 hold-down=60s local-addr=10.0.0.3\n";
+
+    #[test]
+    fn reject_add_in_shadow_refuses_when_shadow() {
+        let policy = policy_from(&format!("shadow\n{RTBH_CFG}"));
+        let err = reject_add_in_shadow(&policy, "rtbh add").expect_err("must refuse under shadow");
+        let msg = err.to_string();
+        assert!(msg.contains("shadow mode"), "message: {msg}");
+        assert!(
+            msg.contains("rtbh add"),
+            "message must name the verb: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_add_in_shadow_allows_when_armed() {
+        // No `shadow` directive → armed → the guard must pass.
+        let policy = policy_from(RTBH_CFG);
+        assert!(reject_add_in_shadow(&policy, "rtbh add").is_ok());
+    }
 }

@@ -121,7 +121,7 @@ fn full_session_v4_v6_no_auth_parses_under_real_bird() {
         eprintln!("`bird` not on PATH; skipping bird -p validation");
         return;
     }
-    let out = render_bird_ibgp(&policy_from(&base_cfg())).expect("render");
+    let out = render_bird_ibgp(&policy_from(&base_cfg()), true).expect("render");
     assert_bird_accepts("full-v4-v6", &out, true, true, &[]);
 }
 
@@ -135,7 +135,7 @@ fn v4_only_parses_under_real_bird() {
          ipv4 203.0.113.0/24\n\
          rtbh peer=10.0.0.2:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 \
          next-hop-v4=192.0.2.1 max=256 hold-down=60s local-addr=10.0.0.3\n";
-    let out = render_bird_ibgp(&policy_from(cfg)).expect("render");
+    let out = render_bird_ibgp(&policy_from(cfg), false).expect("render");
     assert_bird_accepts("v4-only", &out, true, false, &[]);
 }
 
@@ -149,7 +149,7 @@ fn v6_only_parses_under_real_bird() {
          ipv6 2001:db8::/48\n\
          rtbh peer=[2001:db8::2]:179 local-as=65000 peer-as=65000 router-id=10.0.0.1 \
          next-hop-v6=2001:db8::1 max=256 hold-down=60s local-addr=2001:db8::9\n";
-    let out = render_bird_ibgp(&policy_from(cfg)).expect("render");
+    let out = render_bird_ibgp(&policy_from(cfg), false).expect("render");
     assert_bird_accepts("v6-only", &out, false, true, &[]);
 }
 
@@ -160,7 +160,7 @@ fn gtsm_session_parses_under_real_bird() {
         return;
     }
     let cfg = format!("{} gtsm-hops=1\n", base_cfg().trim_end());
-    let out = render_bird_ibgp(&policy_from(&cfg)).expect("render");
+    let out = render_bird_ibgp(&policy_from(&cfg), false).expect("render");
     assert!(out.contains("ttl security on;"));
     assert_bird_accepts("gtsm", &out, true, true, &[]);
 }
@@ -172,7 +172,7 @@ fn md5_session_parses_under_real_bird_with_stub_secret() {
         return;
     }
     let cfg = format!("{} md5=s3cret\n", base_cfg().trim_end());
-    let out = render_bird_ibgp(&policy_from(&cfg)).expect("render");
+    let out = render_bird_ibgp(&policy_from(&cfg), false).expect("render");
     assert!(out.contains("include \"blackwall-secret.conf\";"));
     // The real secret is never in the generated output (checked in
     // render.rs's own tests); here it only matters that BIRD accepts a
@@ -197,7 +197,7 @@ fn defines_only_no_rtbh_parses_under_real_bird() {
         return;
     }
     let cfg = "interface wan eth0\nipv4 203.0.113.0/24\nipv6 2001:db8::/48\n";
-    let out = render_bird_ibgp(&policy_from(cfg)).expect("render");
+    let out = render_bird_ibgp(&policy_from(cfg), false).expect("render");
     assert!(!out.contains("protocol bgp blackwall"));
     assert_bird_accepts("defines-only", &out, false, false, &[]);
 }
