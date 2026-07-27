@@ -51,7 +51,7 @@ jobs:
         run: bash scripts/coverage.sh
 
   lab:
-    runs-on: ubuntu-latest
+    runs-on: privileged
     needs: check
     # Cap the whole job so a hung gate fails in minutes, not after hours.
     # Sized for the cold build (bpf-linker + hsflowd + all lab/interop/eBPF
