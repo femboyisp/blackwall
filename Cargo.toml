@@ -29,7 +29,7 @@ arc-swap = "1.7.1"
 notify = "8.0.0"
 socket2 = { version = "0.5.10", features = ["all"] }
 libc = "0.2.186"
-etherparse = "0.20.2"
+etherparse = "0.21.0"
 nfq = "0.2.5"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = "0.3.32"
