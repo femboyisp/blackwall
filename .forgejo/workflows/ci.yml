@@ -21,7 +21,7 @@ jobs:
     env:
       DATABASE_URL: postgres://blackwall:blackwall@localhost:5432/blackwall
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
@@ -59,7 +59,7 @@ jobs:
     # has its own `timeout-minutes`, so this only backstops a total overrun.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       # Cache cargo registry, target dir, and ~/.cargo/bin (warms the pinned
       # bpf-linker install + the lab/interop/eBPF crate build — the dominant
