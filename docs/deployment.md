@@ -313,7 +313,11 @@ This
 requires `local-addr=<ip>` on the `rtbh` directive — blackwall's own BGP source
 address, which the generator emits as BIRD's `neighbor` and the speaker binds as
 its source so the session matches by construction (its family must match the
-`peer=` address). If the `rtbh` block sets `md5=`, the generated file references
+`peer=` address). `router-id=` is **optional** and defaults to the IPv4
+`local-addr` (blackwall's own address, distinct from the BIRD peer's router-id by
+construction). Set it explicitly only if you must — and never to the peer's
+router-id or address, which BIRD rejects as `Bad BGP identifier` (the config
+parser refuses `router-id == peer`). If the `rtbh` block sets `md5=`, the generated file references
 `include "blackwall-secret.conf";` instead of embedding the secret — keep that
 one-line `password "…";` file `0600` alongside your other BIRD secrets. The
 generated file is otherwise non-sensitive and safe to commit. BIRD remains the

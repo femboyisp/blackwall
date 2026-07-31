@@ -276,9 +276,39 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 if local_asn != peer_asn {
                     return Err(bad("rtbh local-as/peer-as", "must match (iBGP only)"));
                 }
-                let router_id: Ipv4Addr = get("router-id")?
-                    .parse()
-                    .map_err(|_| bad("router-id", get("router-id").unwrap_or("")))?;
+                // Parse `local-addr` first: `router-id` defaults to it.
+                let local_addr: Option<IpAddr> = kv
+                    .get("local-addr")
+                    .map(|v| v.parse().map_err(|_| bad("local-addr", v)))
+                    .transpose()?;
+                // `router-id` is blackwall's own BGP identifier. When omitted it
+                // defaults to the IPv4 `local-addr` (blackwall's own source
+                // address) — the safe, collision-free choice, since that address
+                // is distinct from the BIRD peer's own router-id by construction.
+                // An operator who instead hand-picks a router-id equal to the
+                // peer's identity gets `Bad BGP identifier` and a session that
+                // never establishes (femboyisp/blackwall#232) — a failure a stale
+                // shadow deploy masks for weeks.
+                let router_id: Ipv4Addr = match kv.get("router-id") {
+                    Some(v) => v.parse().map_err(|_| bad("router-id", v))?,
+                    None => match local_addr {
+                        Some(IpAddr::V4(v4)) => v4,
+                        _ => {
+                            return Err(bad(
+                                "rtbh",
+                                "router-id required (or set an IPv4 local-addr to default it)",
+                            ))
+                        }
+                    },
+                };
+                // A router-id equal to the BGP peer's address is a common mistake
+                // that also yields `Bad BGP identifier`; reject it early.
+                if peer_addr.ip() == IpAddr::V4(router_id) {
+                    return Err(bad(
+                        "rtbh router-id",
+                        "must differ from the BGP peer address",
+                    ));
+                }
                 let next_hop_v4: Option<Ipv4Addr> = kv
                     .get("next-hop-v4")
                     .map(|v| v.parse().map_err(|_| bad("next-hop-v4", v)))
@@ -355,10 +385,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                         .get("md5")
                         .map(|s| blackwall_core::Md5Secret::new((*s).to_owned())),
                     gtsm_hops,
-                    local_addr: kv
-                        .get("local-addr")
-                        .map(|v| v.parse().map_err(|_| bad("local-addr", v)))
-                        .transpose()?,
+                    local_addr,
                     max_new_per_min,
                 });
             }
@@ -1880,6 +1907,41 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
     fn instance_rejects_empty_and_duplicate() {
         assert!(parse_text("interface wan eth0\ninstance=\n").is_err());
         assert!(parse_text("interface wan eth0\ninstance=a\ninstance=b\n").is_err());
+    }
+
+    #[test]
+    fn router_id_defaults_to_ipv4_local_addr() {
+        // Omit router-id; it must default to the v4 local-addr (blackwall's own
+        // address) — the collision-free identity (#232).
+        let p = parse_text(
+            "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 \
+             next-hop-v4=10.0.0.9 max=8 hold-down=30s local-addr=10.0.0.3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            p.rtbh.unwrap().router_id,
+            "10.0.0.3".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn router_id_equal_to_peer_is_rejected() {
+        // peer=10.0.0.2 and router-id=10.0.0.2 → `Bad BGP identifier` at runtime.
+        assert!(parse_text(
+            "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 \
+             router-id=10.0.0.2 next-hop-v4=10.0.0.9 max=8 hold-down=30s\n",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn router_id_omitted_without_v4_local_addr_errors() {
+        // No router-id and no IPv4 local-addr to default from → explicit error.
+        assert!(parse_text(
+            "interface wan eth0\nrtbh peer=10.0.0.2 local-as=1 peer-as=1 \
+             next-hop-v4=10.0.0.9 max=8 hold-down=30s\n",
+        )
+        .is_err());
     }
 
     #[test]
