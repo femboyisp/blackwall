@@ -143,6 +143,7 @@ mod tests {
             shadow: false,
             rpki_validator: None,
             rpki_check_interval: std::time::Duration::from_secs(3600),
+            instance: None,
         }
     }
 
@@ -312,6 +313,7 @@ mod tests {
             shadow: false,
             rpki_validator: None,
             rpki_check_interval: std::time::Duration::from_secs(3600),
+            instance: None,
         };
         let resolved = policy.resolve().expect("empty policy resolves");
         assert!(resolved.is_empty());

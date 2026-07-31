@@ -32,6 +32,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
     let mut protected_prefixes: Vec<ipnet::IpNet> = Vec::new();
     let mut rpki_validator: Option<String> = None;
     let mut rpki_check_interval = std::time::Duration::from_secs(3600);
+    let mut instance: Option<String> = None;
 
     let mut i = 0;
     while i < lines.len() {
@@ -817,6 +818,29 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
                 }
                 shadow = true;
             }
+            // `instance=<name>` — a single `key=value` token naming this daemon
+            // instance so its nft table / TPROXY mark / route table are unique to
+            // it (see `blackwall_core::InstanceIds`). Prefix-matched, like
+            // `rpki-validator=`.
+            d if d.starts_with("instance=") => {
+                expect_len(line, 1, "instance=<name>")?;
+                let name = d.strip_prefix("instance=").unwrap_or("");
+                if name.is_empty() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "instance",
+                        value: "empty (expected instance=<name>)".to_owned(),
+                    });
+                }
+                if instance.is_some() {
+                    return Err(ConfigError::BadValue {
+                        line: line.number,
+                        what: "instance",
+                        value: "duplicate".to_owned(),
+                    });
+                }
+                instance = Some(name.to_owned());
+            }
             // `rpki-validator=<url>` / `rpki-check-interval=<dur>` are single
             // `key=value` tokens (the whole line), not a leading keyword
             // followed by `key=value` pairs like `metrics`/`rtbh` — matched
@@ -897,6 +921,7 @@ pub fn parse(lines: &[Line]) -> Result<Policy, ConfigError> {
         protected_prefixes,
         rpki_validator,
         rpki_check_interval,
+        instance,
     })
 }
 
@@ -1837,6 +1862,24 @@ flowspec concentration=0.8 max-flows=4 rate=0 max-rules=256 hold-down=60s bogus=
     #[test]
     fn shadow_rejects_trailing_tokens() {
         assert!(parse_text("interface wan eth0\nshadow rtbh\n").is_err());
+    }
+
+    #[test]
+    fn parses_instance_directive() {
+        let p = parse_text("interface wan eth0\ninstance=ix\n").unwrap();
+        assert_eq!(p.instance.as_deref(), Some("ix"));
+    }
+
+    #[test]
+    fn instance_defaults_none() {
+        let p = parse_text("interface wan eth0\n").unwrap();
+        assert!(p.instance.is_none());
+    }
+
+    #[test]
+    fn instance_rejects_empty_and_duplicate() {
+        assert!(parse_text("interface wan eth0\ninstance=\n").is_err());
+        assert!(parse_text("interface wan eth0\ninstance=a\ninstance=b\n").is_err());
     }
 
     #[test]

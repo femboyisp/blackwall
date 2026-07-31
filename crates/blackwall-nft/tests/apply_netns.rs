@@ -39,6 +39,7 @@ fn sample() -> Policy {
         shadow: false,
         rpki_validator: None,
         rpki_check_interval: std::time::Duration::from_secs(3600),
+        instance: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn stale_set_elements_removed_on_second_apply() {
         shadow: false,
         rpki_validator: None,
         rpki_check_interval: std::time::Duration::from_secs(3600),
+        instance: None,
     };
     blackwall_nft::apply(&policy_empty).expect("second apply");
 

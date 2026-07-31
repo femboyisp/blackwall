@@ -54,21 +54,14 @@ fn iifname_match(iface: &str) -> Statement<'static> {
 
 /// The nftables family Blackwall uses (dual-stack).
 const FAMILY: NfFamily = NfFamily::INet;
-/// The table name Blackwall owns.
-const TABLE: &str = "blackwall";
-
-/// Firewall mark set on deception-TCP packets by the tproxy rule.
-///
-/// TPROXY only delivers a packet to the local transparent socket if the routing
-/// decision keeps it local; for a *forwarded* managed prefix (the dst is not a
-/// local address) it would otherwise be routed onward. Marking the packet lets
-/// a policy route (`ip rule fwmark <mark> lookup <table>` + a `local default`
-/// route in that table — installed by [`crate::apply`]) send it to the local
-/// input path instead. Must match [`TPROXY_ROUTE_TABLE`] in `apply`.
-pub(crate) const TPROXY_MARK: u32 = 0x1;
-
-/// Routing table holding the `local default` route for TPROXY-marked packets.
-pub(crate) const TPROXY_ROUTE_TABLE: u32 = 100;
+// The nft table name, the deception-TCP TPROXY fwmark, and the policy-route
+// table id are per-instance (so a second `blackwalld` on the box doesn't collide
+// on these shared kernel resources) — derived from `policy.instance` via
+// `blackwall_core::InstanceIds`. TPROXY only delivers a packet to the local
+// transparent socket if the routing decision keeps it local; a forwarded managed
+// prefix would otherwise be routed onward, so the ruleset marks it and a policy
+// route (`ip rule fwmark <mark> lookup <table>` + a `local default` route,
+// installed by [`crate::apply`]) sends it to the local input path.
 
 /// Build the full nftables ruleset for `policy`.
 ///
@@ -96,6 +89,7 @@ pub(crate) const TPROXY_ROUTE_TABLE: u32 = 100;
 /// When `policy.default_state == Closed` the chain's default policy is `drop`.
 pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     let resolved = policy.resolve()?;
+    let ids = blackwall_core::InstanceIds::derive(policy.instance.as_deref());
 
     let mut objects: Vec<NfObject<'static>> = Vec::new();
 
@@ -103,7 +97,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(
         Table {
             family: FAMILY,
-            name: TABLE.into(),
+            name: ids.nft_table.clone(),
             handle: None,
         },
     ))));
@@ -113,7 +107,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Flush(FlushObject::Table(
         Table {
             family: FAMILY,
-            name: TABLE.into(),
+            name: ids.nft_table.clone(),
             handle: None,
         },
     ))));
@@ -123,7 +117,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(
         Box::new(Set {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             name: "real_v4".into(),
             handle: None,
             set_type: SetTypeValue::Concatenated(
@@ -153,7 +147,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Set(
         Box::new(Set {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             name: "real_v6".into(),
             handle: None,
             set_type: SetTypeValue::Concatenated(
@@ -185,7 +179,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(
         Chain {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             name: "prerouting".into(),
             newname: None,
             handle: None,
@@ -209,7 +203,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         let daddr_field = if set_name == "real_v4" { "ip" } else { "ip6" };
         let accept_rule = Rule {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             chain: "prerouting".into(),
             expr: vec![
                 // iifname == managed interface — scope rule to policy interface
@@ -276,7 +270,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
             let prefix_len = prefix.prefix_len();
             let stateless_tcp_rule = Rule {
                 family: FAMILY,
-                table: TABLE.into(),
+                table: ids.nft_table.clone(),
                 chain: "prerouting".into(),
                 expr: vec![
                     // iifname == managed interface — scope rule to policy interface
@@ -351,7 +345,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         let prefix_len = prefix.prefix_len();
         let tproxy_rule = Rule {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             chain: "prerouting".into(),
             expr: vec![
                 // iifname == managed interface — scope rule to policy interface
@@ -383,7 +377,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
                 // transparent socket instead of routing it onward.
                 Statement::Mangle(Mangle {
                     key: Expression::Named(NamedExpression::Meta(Meta { key: MetaKey::Mark })),
-                    value: Expression::Number(TPROXY_MARK),
+                    value: Expression::Number(ids.tproxy_mark),
                 }),
                 Statement::TProxy(TProxy {
                     family: Some(addr_family.into()),
@@ -418,7 +412,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         let prefix_len = prefix.prefix_len();
         let queue_rule = Rule {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             chain: "prerouting".into(),
             expr: vec![
                 // iifname == managed interface — scope rule to policy interface
@@ -478,7 +472,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     if policy.default_state == PortState::Closed {
         let drop_rule = Rule {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             chain: "prerouting".into(),
             expr: vec![iifname_match(&policy.interface), Statement::Drop(None)].into(),
             handle: None,
@@ -500,7 +494,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
     objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(
         Chain {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             name: "dnat".into(),
             newname: None,
             handle: None,
@@ -525,7 +519,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         };
         let dnat_rule = Rule {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             chain: "dnat".into(),
             expr: vec![
                 iifname_match(&policy.interface),
@@ -595,7 +589,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::FlowTable(
             FlowTable {
                 family: FAMILY,
-                table: TABLE.into(),
+                table: ids.nft_table.clone(),
                 name: "ft".into(),
                 handle: None,
                 hook: Some(NfHook::Ingress),
@@ -610,7 +604,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(
             Chain {
                 family: FAMILY,
-                table: TABLE.into(),
+                table: ids.nft_table.clone(),
                 name: "forward".into(),
                 newname: None,
                 handle: None,
@@ -627,7 +621,7 @@ pub fn render(policy: &Policy) -> Result<Nftables<'static>, PolicyError> {
         // established conntrack flows, then hand the flow to the flowtable.
         let offload_rule = Rule {
             family: FAMILY,
-            table: TABLE.into(),
+            table: ids.nft_table.clone(),
             chain: "forward".into(),
             expr: vec![
                 iifname_match(&policy.interface),
@@ -726,6 +720,7 @@ mod tests {
             shadow: false,
             rpki_validator: None,
             rpki_check_interval: std::time::Duration::from_secs(3600),
+            instance: None,
         }
     }
 
@@ -760,6 +755,7 @@ mod tests {
             shadow: false,
             rpki_validator: None,
             rpki_check_interval: std::time::Duration::from_secs(3600),
+            instance: None,
         }
     }
 
@@ -848,6 +844,22 @@ mod tests {
             !json.contains("\"xt\""),
             "rendered JSON must NOT contain xt"
         );
+    }
+
+    #[test]
+    fn named_instance_renames_table() {
+        // No `instance` → default table `blackwall`.
+        let default_json = ruleset_json(&sample()).expect("render default");
+        assert!(default_json.contains("\"blackwall\""));
+        assert!(!default_json.contains("blackwall_ix"));
+
+        // `instance=ix` → table `blackwall_ix`, so two instances never share a
+        // table (and thus never flush-wipe each other on apply).
+        let mut p = sample();
+        p.instance = Some("ix".to_owned());
+        let named_json = ruleset_json(&p).expect("render named");
+        assert!(named_json.contains("blackwall_ix"));
+        assert_ne!(default_json, named_json);
     }
 
     #[test]
@@ -1270,6 +1282,7 @@ mod tests {
             shadow: false,
             rpki_validator: None,
             rpki_check_interval: std::time::Duration::from_secs(3600),
+            instance: None,
         };
         let ruleset = render(&policy).expect("render empty");
         // No resolved services, so real_v4 and real_v6 sets are empty.

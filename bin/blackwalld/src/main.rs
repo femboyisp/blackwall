@@ -1709,6 +1709,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!(
                     "SHADOW MODE — mitigations are LOGGED, NOT APPLIED (RTBH/FlowSpec/XDP)"
                 );
+            } else if let Some(rtbh) = policy.rtbh.as_ref() {
+                // Refuse to arm with a placeholder blackhole next-hop. A
+                // documentation/discard-range next-hop (the unreplaced
+                // config-template value) never resolves to a real discard route,
+                // so BIRD leaves the /32 `unreachable` and never exports it — the
+                // daemon would show `Established` yet announce nothing. Shadow is
+                // exempt (it announces nothing anyway).
+                let placeholders = rtbh.placeholder_next_hops();
+                if !placeholders.is_empty() {
+                    return Err(format!(
+                        "refusing to arm: RTBH next-hop {placeholders:?} is a documentation/discard \
+                         placeholder (RFC 5737/3849/6666) that never resolves to a real blackhole \
+                         route — BIRD would leave the blackhole `unreachable` and never export it. \
+                         Set next-hop-v4/next-hop-v6 to a real discard route, or run in `shadow`."
+                    )
+                    .into());
+                }
             }
             let database_url = std::env::var("DATABASE_URL")
                 .map_err(|_| "DATABASE_URL must be set for the flow detector")?;
@@ -2817,7 +2834,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Remove the dataplane so the box stops diverting deception traffic to
             // the now-dead engine (leaving it would black-hole the address space).
             tracing::info!("removing deception ruleset + TPROXY policy route");
-            blackwall_nft::teardown();
+            blackwall_nft::teardown(&policy);
             // Force-exit: the `run_nfqueue` blocking task never returns, so a
             // normal return would hang the runtime's shutdown waiting on it.
             std::process::exit(if clean { 0 } else { 1 });
