@@ -44,11 +44,15 @@ impl InstanceIds {
     ///
     /// `None` → today's exact defaults (`blackwall` / `0x1` / `100`), so
     /// existing single-instance deployments are unchanged. `Some(name)` →
-    /// `blackwall_<name>` plus a mark and a route-table id derived from a 16-bit
-    /// hash of `name`, both in a dedicated high range so they never collide with
-    /// the defaults and (across the handful of instances a box realistically
-    /// runs) never with each other. Distinct instances MUST use distinct names —
-    /// which is self-evident, since the table name embeds the name verbatim.
+    /// `blackwall_<name>` plus a mark and a route-table id taken from two
+    /// **independent** 32-bit halves of a 64-bit hash of `name`. The mark always
+    /// has bit 31 set (so it is never the default `0x1`, and never equals the
+    /// route id, which has bit 31 clear); the route id is always ≥ `0x4000_0000`
+    /// (so never the default `100`, and a valid 32-bit kernel table id). Because
+    /// the mark and route id come from different halves, a collision between two
+    /// distinct names is ~1/2³¹ on each — effectively never — and the table name
+    /// (which embeds `name` verbatim) never collides at all. Distinct instances
+    /// MUST use distinct names.
     #[must_use]
     pub fn derive(instance: Option<&str>) -> Self {
         match instance {
@@ -58,29 +62,30 @@ impl InstanceIds {
                 route_table: DEFAULT_ROUTE_TABLE,
             },
             Some(name) => {
-                let slot = fnv1a(name) & 0xffff;
+                let h = fnv1a64(name);
+                let lo = (h & 0xffff_ffff) as u32;
+                let hi = (h >> 32) as u32;
                 Self {
                     nft_table: Cow::Owned(format!("blackwall_{name}")),
-                    // High word 0x0001 keeps named marks clear of the default 0x1
-                    // and of any low-bit marks other subsystems commonly use.
-                    tproxy_mark: 0x0001_0000 | slot,
-                    // Distinct high word so a mark and a route id are never the
-                    // same number; kernel route-table ids are 32-bit, so this is
-                    // a valid id well clear of the default 100.
-                    route_table: 0x0002_0000 | slot,
+                    // Bit 31 set: never the default 0x1, never equals route_table.
+                    tproxy_mark: 0x8000_0000 | (lo & 0x7fff_ffff),
+                    // Bit 30 set, bit 31 clear: a valid 32-bit kernel table id,
+                    // never the default 100, drawn from the OTHER hash half.
+                    route_table: 0x4000_0000 | (hi & 0x3fff_ffff),
                 }
             }
         }
     }
 }
 
-/// 32-bit FNV-1a hash — small, dependency-free, and stable across runs (so an
-/// instance keeps the same mark/route-table id across restarts).
-fn fnv1a(s: &str) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
+/// 64-bit FNV-1a hash — small, dependency-free, and stable across runs (so an
+/// instance keeps the same mark/route-table id across restarts). The two 32-bit
+/// halves are used independently for the mark and the route id.
+fn fnv1a64(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
-        hash ^= u32::from(b);
-        hash = hash.wrapping_mul(0x0100_0193);
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
 }

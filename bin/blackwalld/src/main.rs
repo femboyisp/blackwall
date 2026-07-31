@@ -41,6 +41,17 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Remove this instance's deception dataplane (the nft table + TPROXY policy
+    /// route) without running the engine — the crash/SIGKILL cleanup backstop the
+    /// runit `finish` script calls. Derives the per-instance resources from
+    /// `--config` (via `instance=`), so it only ever touches THIS instance's
+    /// table/mark/route table and never a co-located instance's. Best-effort;
+    /// needs CAP_NET_ADMIN.
+    Teardown {
+        /// Path to the Blackwall config file (the same one the daemon runs with).
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Parse a config and print the generated BIRD iBGP include.
     BirdConfig {
         /// Path to the Blackwall config file.
@@ -1640,6 +1651,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let policy = blackwall_config::parse_file(&config)?;
             let json = blackwall_nft::ruleset_json(&policy)?;
             println!("{json}");
+            Ok(())
+        }
+        Command::Teardown { config } => {
+            // Raw parse (not resolve): teardown only needs `policy.instance`, and
+            // a cleanup backstop must work even if the config no longer fully
+            // resolves. `teardown` is itself all best-effort.
+            let policy = blackwall_config::parse_file(&config)?;
+            blackwall_nft::teardown(&policy);
             Ok(())
         }
         Command::BirdConfig {

@@ -58,8 +58,8 @@ pub fn teardown(policy: &Policy) {
 }
 
 /// Install the TPROXY policy route so deception TCP packets the ruleset marked
-/// (`meta mark set` [`crate::render::TPROXY_MARK`]) are delivered to the local
-/// transparent engine socket instead of being forwarded onward. Without this,
+/// (`meta mark set <ids.tproxy_mark>`) are delivered to the local transparent
+/// engine socket instead of being forwarded onward. Without this,
 /// deception only works when the managed address is local to the box; a routed
 /// managed prefix (the production case) silently fails to divert.
 ///

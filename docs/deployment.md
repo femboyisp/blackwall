@@ -122,6 +122,13 @@ Omit `instance=` (the default) and nothing changes — the identity stays exactl
 `blackwall` / mark `0x1` / route table `100`. Distinct instances need distinct
 names (the table name embeds the name, so a collision is self-evident).
 
+`instance=` does **not** cover the two per-policy binds that are also
+process-global: set a distinct `engine tproxy-port=` and `engine nfqueue-num=`
+in each instance's config too, or the second daemon's TPROXY/NFQUEUE bind fails
+at startup (a loud error, not silent corruption). If you copy the runit service
+dir for a second instance, point both its `run` and `finish` at the second
+config path.
+
 ## Observe
 Set `metrics listen=127.0.0.1:9100` in the config and scrape `GET /metrics`:
 - `flow`: BGP session state + reconnects, sFlow datagrams/decode-errors, active
