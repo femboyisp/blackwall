@@ -57,9 +57,12 @@ impl Drop for Teardown {
             // Best-effort: daemons that are not group leaders (knotd's `ip`) have
             // no such group and the signal is a harmless no-op; `child.kill()`
             // below still reaps them as before.
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .status();
+            //
+            // Must go through `kill(2)`, never `kill(1)`: shelling out here is
+            // what SIGKILLed the lab itself (and, under CI, `timeout`) instead
+            // of the target group on every gate from 8b42717 onward. See
+            // [`crate::exec::kill_process_group`] for the procps-ng parse.
+            super::kill_process_group(child.id());
             let _ = child.kill();
             // Bounded reap: `child.kill()` SIGKILLs the direct child, so
             // `try_wait` sees it exit within milliseconds. Give up after a short
