@@ -50,9 +50,94 @@ pub struct RtbhPolicy {
     pub max_new_per_min: Option<u32>,
 }
 
+impl RtbhPolicy {
+    /// Configured NEXT_HOPs that fall in a documentation / discard placeholder
+    /// range and so will never resolve to a real blackhole route — i.e. an
+    /// unreplaced config-template value. BIRD leaves a route with such a next-hop
+    /// as `unreachable` (not `blackhole`) and refuses to export it, so an armed
+    /// daemon would silently announce nothing. Flags RFC 5737
+    /// (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), RFC 3849
+    /// (`2001:db8::/32`), and RFC 6666 (`100::/64`) — which are exactly the
+    /// example values `docs/deployment.md` ships.
+    #[must_use]
+    pub fn placeholder_next_hops(&self) -> Vec<std::net::IpAddr> {
+        let mut out = Vec::new();
+        if let Some(v4) = self.next_hop_v4 {
+            if is_placeholder_v4(v4) {
+                out.push(v4.into());
+            }
+        }
+        if let Some(v6) = self.next_hop_v6 {
+            if is_placeholder_v6(v6) {
+                out.push(v6.into());
+            }
+        }
+        out
+    }
+}
+
+/// True if `a` is in an RFC 5737 documentation range (never a real next-hop).
+fn is_placeholder_v4(a: Ipv4Addr) -> bool {
+    let o = a.octets();
+    matches!(
+        (o[0], o[1], o[2]),
+        (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+    )
+}
+
+/// True if `a` is in RFC 3849 (`2001:db8::/32`) or RFC 6666 (`100::/64`).
+fn is_placeholder_v6(a: Ipv6Addr) -> bool {
+    let s = a.segments();
+    (s[0] == 0x2001 && s[1] == 0x0db8) || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_next_hops_flags_doc_ranges_only() {
+        let base = RtbhPolicy {
+            local_asn: 1,
+            peer_asn: 1,
+            peer_addr: "10.0.0.2:179".parse().unwrap(),
+            router_id: "10.0.0.1".parse().unwrap(),
+            blackhole_communities: vec![(65535, 666)],
+            next_hop_v4: Some("192.0.2.1".parse().unwrap()), // RFC 5737
+            next_hop_v6: Some("100::1".parse().unwrap()),    // RFC 6666
+            max_blackholes: 8,
+            hold_down: std::time::Duration::from_secs(60),
+            max_ttl: None,
+            md5: None,
+            gtsm_hops: None,
+            local_addr: None,
+            max_new_per_min: None,
+        };
+        assert_eq!(
+            base.placeholder_next_hops().len(),
+            2,
+            "both are placeholders"
+        );
+
+        let real = RtbhPolicy {
+            next_hop_v4: Some("10.222.255.99".parse().unwrap()),
+            next_hop_v6: Some("2a12:9b00:b00b::99".parse().unwrap()),
+            ..base.clone()
+        };
+        assert!(
+            real.placeholder_next_hops().is_empty(),
+            "real next-hops must not be flagged"
+        );
+
+        // 2001:db8::/32 (RFC 3849) is also caught.
+        let doc_v6 = RtbhPolicy {
+            next_hop_v4: None,
+            next_hop_v6: Some("2001:db8::1".parse().unwrap()),
+            ..base
+        };
+        assert_eq!(doc_v6.placeholder_next_hops().len(), 1);
+    }
+
     #[test]
     fn rtbh_policy_roundtrips_serde() {
         let p = RtbhPolicy {

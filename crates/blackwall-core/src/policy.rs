@@ -91,4 +91,11 @@ pub struct Policy {
     /// directive). Defaults to one hour; meaningless when `rpki_validator`
     /// is `None`.
     pub rpki_check_interval: std::time::Duration,
+    /// Instance name (the `instance=<name>` directive) that namespaces this
+    /// daemon's shared kernel resources — nft table, TPROXY fwmark, and policy
+    /// route table — so a second `blackwalld` on the same box (e.g. covering a
+    /// separate IX-peering NIC) doesn't collide with this one. `None` (the
+    /// default) keeps today's exact identity (`blackwall` / `0x1` / `100`). See
+    /// [`crate::InstanceIds`].
+    pub instance: Option<String>,
 }

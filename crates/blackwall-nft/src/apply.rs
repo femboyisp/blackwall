@@ -13,14 +13,15 @@ use nftables::helper;
 ///
 /// Requires `CAP_NET_ADMIN` (run as root).
 pub fn apply(policy: &Policy) -> Result<(), NftError> {
+    let ids = blackwall_core::InstanceIds::derive(policy.instance.as_deref());
     let ruleset = crate::render::render(policy).map_err(|e| NftError::Apply(e.to_string()))?;
     helper::apply_ruleset(&ruleset).map_err(|e| NftError::Apply(e.to_string()))?;
     // The ruleset is now installed and diverting deception TCP to the engine. If
     // the policy route can't be set up, don't leave a black-holing table behind
     // (deception traffic would be tproxy'd to a socket the route can't reach):
     // tear the whole dataplane back down and surface the error.
-    if let Err(e) = ensure_tproxy_route() {
-        teardown();
+    if let Err(e) = ensure_tproxy_route(&ids) {
+        teardown(policy);
         return Err(e);
     }
     Ok(())
@@ -32,16 +33,18 @@ pub fn apply(policy: &Policy) -> Result<(), NftError> {
 /// the box would keep `tproxy`-diverting deception traffic to a now-dead socket
 /// and silently black-hole most of the managed address space. Every step is
 /// best-effort (a missing table/rule is not an error); needs `CAP_NET_ADMIN`.
-pub fn teardown() {
+pub fn teardown(policy: &Policy) {
     use std::process::Command;
+    let ids = blackwall_core::InstanceIds::derive(policy.instance.as_deref());
     // Delete the ruleset. `.output()` swallows the "No such file" if it was
-    // never applied.
+    // never applied. Scoped to THIS instance's table so a second instance's
+    // table is never touched.
     let _ = Command::new("nft")
-        .args(["delete", "table", "inet", "blackwall"])
+        .args(["delete", "table", "inet", ids.nft_table.as_ref()])
         .output();
 
-    let table = crate::render::TPROXY_ROUTE_TABLE.to_string();
-    let mark = format!("0x{:x}", crate::render::TPROXY_MARK);
+    let table = ids.route_table.to_string();
+    let mark = format!("0x{:x}", ids.tproxy_mark);
     for family in [&[][..], &["-6"][..]] {
         let _ = Command::new("ip")
             .args(family)
@@ -55,8 +58,8 @@ pub fn teardown() {
 }
 
 /// Install the TPROXY policy route so deception TCP packets the ruleset marked
-/// (`meta mark set` [`crate::render::TPROXY_MARK`]) are delivered to the local
-/// transparent engine socket instead of being forwarded onward. Without this,
+/// (`meta mark set <ids.tproxy_mark>`) are delivered to the local transparent
+/// engine socket instead of being forwarded onward. Without this,
 /// deception only works when the managed address is local to the box; a routed
 /// managed prefix (the production case) silently fails to divert.
 ///
@@ -65,15 +68,15 @@ pub fn teardown() {
 ///   `ip route replace local default dev lo table <table>`  (idempotent)
 ///
 /// Needs `CAP_NET_ADMIN`. IPv6 setup is best-effort (skipped if IPv6 is off).
-fn ensure_tproxy_route() -> Result<(), NftError> {
+fn ensure_tproxy_route(ids: &blackwall_core::InstanceIds) -> Result<(), NftError> {
     // Disable src_valid_mark to prevent the kernel from treating marked packets
     // as martian sources during source validation routing checks.
     let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/src_valid_mark", "0");
     let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/src_valid_mark", "0");
 
     use std::process::Command;
-    let mark = format!("0x{:x}", crate::render::TPROXY_MARK);
-    let table = crate::render::TPROXY_ROUTE_TABLE.to_string();
+    let mark = format!("0x{:x}", ids.tproxy_mark);
+    let table = ids.route_table.to_string();
 
     // v4 rule (idempotent: check-then-add, since `ip rule add` never dedupes).
     let want = format!("fwmark {mark} lookup {table}");

@@ -101,6 +101,34 @@ Then follow the two runbooks for the hands-on first-run procedure:
 - `docs/runbook-flow-mitigation.md` — observe-only → tune → arm auto-mitigation.
 - `docs/runbook-deception.md` — verify the routed diversion + a real service.
 
+> **Arming refuses a placeholder blackhole next-hop.** If you arm `flow` (no
+> `shadow`) with an `rtbh` block whose `next-hop-v4`/`next-hop-v6` sits in a
+> documentation/discard range (RFC 5737 `192.0.2.0/24` etc., RFC 3849
+> `2001:db8::/32`, RFC 6666 `100::/64` — the usual unreplaced template values),
+> the daemon **exits at startup** instead of coming up "armed" but silently
+> announcing nothing (such a next-hop never resolves to a real discard route, so
+> BIRD leaves the blackhole `unreachable` and never exports it). Set the next-hops
+> to a real discard route on your box before arming.
+
+## Running two instances on one box (`instance=`)
+One `blackwalld` covers one ingress path. To cover a second (e.g. a separate
+IX-peering NIC) with its own daemon, give **each** config a distinct
+`instance=<name>` top-level directive. It namespaces the three kernel resources
+the daemons would otherwise share and clobber: the nft table
+(`blackwall` → `blackwall_<name>`), the deception TPROXY fwmark, and its policy
+route table. Without it, a second instance's every apply flush-wipes the first's
+nft rules, and either instance stopping tears out the shared TPROXY plumbing.
+Omit `instance=` (the default) and nothing changes — the identity stays exactly
+`blackwall` / mark `0x1` / route table `100`. Distinct instances need distinct
+names (the table name embeds the name, so a collision is self-evident).
+
+`instance=` does **not** cover the two per-policy binds that are also
+process-global: set a distinct `engine tproxy-port=` and `engine nfqueue-num=`
+in each instance's config too, or the second daemon's TPROXY/NFQUEUE bind fails
+at startup (a loud error, not silent corruption). If you copy the runit service
+dir for a second instance, point both its `run` and `finish` at the second
+config path.
+
 ## Observe
 Set `metrics listen=127.0.0.1:9100` in the config and scrape `GET /metrics`:
 - `flow`: BGP session state + reconnects, sFlow datagrams/decode-errors, active
@@ -285,7 +313,11 @@ This
 requires `local-addr=<ip>` on the `rtbh` directive — blackwall's own BGP source
 address, which the generator emits as BIRD's `neighbor` and the speaker binds as
 its source so the session matches by construction (its family must match the
-`peer=` address). If the `rtbh` block sets `md5=`, the generated file references
+`peer=` address). `router-id=` is **optional** and defaults to the IPv4
+`local-addr` (blackwall's own address, distinct from the BIRD peer's router-id by
+construction). Set it explicitly only if you must — and never to the peer's
+router-id or address, which BIRD rejects as `Bad BGP identifier` (the config
+parser refuses `router-id == peer`). If the `rtbh` block sets `md5=`, the generated file references
 `include "blackwall-secret.conf";` instead of embedding the secret — keep that
 one-line `password "…";` file `0600` alongside your other BIRD secrets. The
 generated file is otherwise non-sensitive and safe to commit. BIRD remains the

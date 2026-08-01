@@ -127,6 +127,7 @@ async fn serves_deception_banner() {
         shadow: false,
         rpki_validator: None,
         rpki_check_interval: std::time::Duration::from_secs(3600),
+        instance: None,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
@@ -197,6 +198,7 @@ async fn serves_deception_under_load() {
         shadow: false,
         rpki_validator: None,
         rpki_check_interval: std::time::Duration::from_secs(3600),
+        instance: None,
     };
 
     // Apply the REAL nft ruleset: deception TCP on the prefix -> tproxy :61000
@@ -289,6 +291,7 @@ fn serves_stateless_syn_cookie() {
         shadow: false,
         rpki_validator: None,
         rpki_check_interval: std::time::Duration::from_secs(3600),
+        instance: None,
     };
 
     // Apply the REAL nft ruleset: stateless-tcp TCP on 8080 -> nfqueue
@@ -377,6 +380,7 @@ fn serves_stateless_syn_cookie_v6() {
         shadow: false,
         rpki_validator: None,
         rpki_check_interval: std::time::Duration::from_secs(3600),
+        instance: None,
     };
 
     blackwall_nft::apply(&policy).expect("nft apply");
