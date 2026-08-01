@@ -137,9 +137,7 @@ pub fn run(
     v4.set_freebind_v4(true).map_err(DeceptionError::Io)?;
     v6_tcp.set_freebind_v6(true).map_err(DeceptionError::Io)?;
     v6_udp.set_freebind_v6(true).map_err(DeceptionError::Io)?;
-    v6_icmp
-        .set_freebind_v6(true)
-        .map_err(DeceptionError::Io)?;
+    v6_icmp.set_freebind_v6(true).map_err(DeceptionError::Io)?;
     let socks = RawSockets {
         v4,
         v6_tcp,
