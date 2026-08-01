@@ -58,6 +58,13 @@ scenario "generated-include-establishes-session" {
     // accepts blackwall's /32 blackhole (community 65535:666, RFC 7999).
     step assert node="peer" cmd="birdc show route 203.0.113.8/32 all" \
          contains="(65535,666)" timeout="15s"
+    // Proves the RFC 7999 conversion end to end: the import filter turns the
+    // community-tagged /32 into a real discard (`dest = RTD_BLACKHOLE`), so real
+    // BIRD reports it as `blackhole` — NOT `unreachable`, which is what a
+    // non-resolving next-hop leaves without this clause (the live symptom that
+    // made RTBH announce nothing). `bird -p` cannot see this; only real BIRD can.
+    step assert node="peer" cmd="birdc show route 203.0.113.8/32 all" \
+         contains="blackhole" timeout="15s"
     // Proves the generated `flow4` import filter (`net.dst ~ [...]`) accepts a
     // real FlowSpec route end to end — the assertion that catches the
     // `net` vs `net.dst` filter-logic bug (`net ~` would leave flow4tab
