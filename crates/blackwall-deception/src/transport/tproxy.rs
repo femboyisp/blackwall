@@ -53,8 +53,13 @@ impl TproxyListener {
         let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         sock.set_nonblocking(true)?;
         sock.set_reuse_address(true)?;
-        // IP_TRANSPARENT lets us accept connections destined to non-local addrs.
-        sock.set_ip_transparent(true)?;
+        // IP_TRANSPARENT (v4) / IPV6_TRANSPARENT (v6) lets us accept connections
+        // destined to non-local addrs. socket2 0.6 split these by family.
+        if addr.is_ipv6() {
+            sock.set_ip_transparent_v6(true)?;
+        } else {
+            sock.set_ip_transparent_v4(true)?;
+        }
         sock.bind(&addr.into())?;
         sock.listen(1024)?;
         let std_listener: std::net::TcpListener = sock.into();
