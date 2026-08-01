@@ -97,11 +97,19 @@ pub fn render_bird_ibgp(policy: &Policy, include_defines: bool) -> Result<String
     if rtbh.gtsm_hops.is_some() {
         let _ = writeln!(out, "    ttl security on;");
     }
+    // Import filters accept only routes inside the managed space. A route
+    // carrying the RFC 7999 BLACKHOLE community (65535, 666) is converted to a
+    // real discard (`dest = RTD_BLACKHOLE`) so it black-holes regardless of
+    // whether its next-hop resolves on the BIRD box — without this the route
+    // lands as `unreachable` and is never black-holed (confirmed live). The
+    // conversion is guarded to host routes (`net.len = 32` / `= 128`) so a
+    // community-tagged aggregate can never blackhole the whole managed prefix.
+    // flow4/flow6 (FlowSpec) carry no `dest`, so they are left untouched.
     if !v4.is_empty() {
         let m = join_prefixes(&v4, true);
         let _ = writeln!(
             out,
-            "    ipv4 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; next hop self; }};"
+            "    ipv4 {{ import filter {{ if net !~ [ {m} ] then reject; if (65535, 666) ~ bgp_community && net.len = 32 then dest = RTD_BLACKHOLE; accept; }}; export none; next hop self; }};"
         );
         // On a flowspec channel `net` is the whole flow spec, not a plain
         // prefix — its destination-prefix component is reached via `net.dst`.
@@ -118,7 +126,7 @@ pub fn render_bird_ibgp(policy: &Policy, include_defines: bool) -> Result<String
         let m = join_prefixes(&v6, true);
         let _ = writeln!(
             out,
-            "    ipv6 {{ import filter {{ if net ~ [ {m} ] then accept; reject; }}; export none; next hop self; }};"
+            "    ipv6 {{ import filter {{ if net !~ [ {m} ] then reject; if (65535, 666) ~ bgp_community && net.len = 128 then dest = RTD_BLACKHOLE; accept; }}; export none; next hop self; }};"
         );
         let _ = writeln!(
             out,
@@ -184,7 +192,7 @@ mod tests {
         assert!(out.contains("local 10.0.0.2 as 65000;"));
         assert!(out.contains("neighbor 10.0.0.3 as 65000;"));
         assert!(out.contains(
-            "ipv4 { import filter { if net ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; next hop self; };"
+            "ipv4 { import filter { if net !~ [ 203.0.113.0/24+ ] then reject; if (65535, 666) ~ bgp_community && net.len = 32 then dest = RTD_BLACKHOLE; accept; }; export none; next hop self; };"
         ));
         assert!(out.contains(
             "flow4 { import filter { if net.dst ~ [ 203.0.113.0/24+ ] then accept; reject; }; export none; };"
@@ -208,6 +216,13 @@ mod tests {
         assert!(out.contains("flow4 { import filter {"));
         assert!(!out.contains("ipv6 { import filter {"));
         assert!(!out.contains("flow6 { import filter {"));
+        // RFC 7999: a community-tagged /32 becomes a real discard; the FlowSpec
+        // channel carries no such conversion.
+        assert!(out.contains("net.len = 32 then dest = RTD_BLACKHOLE;"));
+        assert!(out
+            .lines()
+            .filter(|l| l.contains("flow4"))
+            .all(|l| !l.contains("RTD_BLACKHOLE")));
     }
 
     #[test]
@@ -224,6 +239,13 @@ mod tests {
         assert!(out.contains("flow6 { import filter {"));
         assert!(!out.contains("ipv4 { import filter {"));
         assert!(!out.contains("flow4 { import filter {"));
+        // RFC 7999: a community-tagged /128 becomes a real discard; the FlowSpec
+        // channel carries no such conversion.
+        assert!(out.contains("net.len = 128 then dest = RTD_BLACKHOLE;"));
+        assert!(out
+            .lines()
+            .filter(|l| l.contains("flow6"))
+            .all(|l| !l.contains("RTD_BLACKHOLE")));
     }
 
     #[test]
@@ -268,7 +290,7 @@ mod tests {
         assert!(out.contains("protocol bgp blackwall {"));
         // The import filters carry the prefixes inline, so scoping survives the
         // absence of the defines.
-        assert!(out.contains("if net ~ [ 203.0.113.0/24+ ]"));
+        assert!(out.contains("if net !~ [ 203.0.113.0/24+ ] then reject;"));
     }
 
     #[test]
