@@ -25,7 +25,7 @@ jobs:
       DATABASE_URL: postgres://blackwall:blackwall@postgres:5432/blackwall
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
       # Cache the cargo registry, target dir, and ~/.cargo/bin (so the pinned
@@ -45,7 +45,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2
         with:
           tool: cargo-llvm-cov
       # The coverage gate (90%) and its exclusion list live in scripts/coverage.sh,
@@ -63,7 +63,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       # Cache cargo registry, target dir, and ~/.cargo/bin (warms the pinned
       # bpf-linker install + the lab/interop/eBPF crate build — the dominant
       # cost in this job's cold ~18min build). Separate key from the `check`
