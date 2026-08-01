@@ -134,11 +134,11 @@ pub fn run(
     // it per-socket avoids requiring the global `net.ipv{4,6}.ip_nonlocal_bind`
     // sysctl. (The v4 socket is header-included, so its source rarely needs
     // this, but set it for parity and for any non-hdrincl kernel path.)
-    v4.set_freebind(true).map_err(DeceptionError::Io)?;
-    v6_tcp.set_freebind_ipv6(true).map_err(DeceptionError::Io)?;
-    v6_udp.set_freebind_ipv6(true).map_err(DeceptionError::Io)?;
+    v4.set_freebind_v4(true).map_err(DeceptionError::Io)?;
+    v6_tcp.set_freebind_v6(true).map_err(DeceptionError::Io)?;
+    v6_udp.set_freebind_v6(true).map_err(DeceptionError::Io)?;
     v6_icmp
-        .set_freebind_ipv6(true)
+        .set_freebind_v6(true)
         .map_err(DeceptionError::Io)?;
     let socks = RawSockets {
         v4,
