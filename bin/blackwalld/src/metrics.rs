@@ -157,6 +157,19 @@ async fn gather(sources: &MetricsSources) -> Vec<Metric> {
             kind: MetricKind::Counter,
             value: u64_to_f64(collector.sample_decode_errors()),
         });
+        m.push(Metric {
+            name: "blackwall_flow_sampled_bytes_total",
+            help:
+                "Estimated bytes represented by decoded flow samples (sampling-rate extrapolated)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(collector.sampled_bytes_value()),
+        });
+        m.push(Metric {
+            name: "blackwall_flow_sampled_packets_total",
+            help: "Estimated packets represented by decoded flow samples (sampling-rate extrapolated)",
+            kind: MetricKind::Counter,
+            value: u64_to_f64(collector.sampled_packets_value()),
+        });
     }
     if let Some(inflight) = &sources.inflight {
         m.push(Metric {
