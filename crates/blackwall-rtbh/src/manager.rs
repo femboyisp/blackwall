@@ -697,6 +697,22 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    /// Serializes every test that calls [`RtbhManager::disarm`].
+    ///
+    /// `disarm()` emits its `DISARMED` `tracing::warn!` at a single callsite,
+    /// and `tracing` caches that callsite's `Interest` **process-globally**. A
+    /// disarm-calling test running with no subscriber installed re-registers
+    /// that callsite as `Interest::never()`; if that happens in the window
+    /// between `disarm_logs_disarmed_exactly_once`'s `set_default` (which
+    /// rebuilds the interest cache) and its `disarm()` emit, the counted
+    /// `warn!` is filtered before the thread-local counter sees it and the
+    /// assertion reads `0` instead of `1` (the CI-only flake seen on runs 64
+    /// and 83). Holding this lock across the whole disarm section of each such
+    /// test keeps any two of them from touching the callsite concurrently, so
+    /// the counting test's rebuild→emit window can't be poisoned. Any new test
+    /// that calls `disarm()` MUST take this lock first.
+    static DISARM_CALLSITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[derive(Default, Clone)]
     struct FakeBgp {
         announced: Arc<Mutex<Vec<IpNet>>>,
@@ -1262,6 +1278,7 @@ mod tests {
 
     #[tokio::test]
     async fn disarm_withdraws_all_and_switches_to_record_only() {
+        let _serial = DISARM_CALLSITE_LOCK.lock().await;
         // C5: disarm must withdraw every active blackhole on BGP (best
         // effort), clear the active set, and thereafter skip every new
         // Announce (record-only) — detection/selection keep running (the
@@ -1310,6 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn disarm_tolerates_a_withdraw_error() {
+        let _serial = DISARM_CALLSITE_LOCK.lock().await;
         // Best-effort: a withdraw Err during disarm must not abort the
         // sweep (a second active target is still withdrawn) or stop the
         // manager from switching to record-only.
@@ -1391,6 +1409,7 @@ mod tests {
 
     #[tokio::test]
     async fn disarm_logs_disarmed_exactly_once() {
+        let _serial = DISARM_CALLSITE_LOCK.lock().await;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let counter = DisarmedCounter::default();
@@ -1414,6 +1433,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_add_while_disarmed_is_rejected_not_applied() {
+        let _serial = DISARM_CALLSITE_LOCK.lock().await;
         // C5 + final-review fix: a manual add while disarmed must be
         // classified Rejected (retrying is pointless — there is no re-arm
         // entry point), never Applied — an "applied" operator-request row
