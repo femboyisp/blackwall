@@ -2546,12 +2546,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let watch_shared = shared.clone();
                 let mut watcher =
                     notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                        if res.is_ok() {
-                            if let Err(err) = watch_shared.reload(&watch_path) {
-                                tracing::warn!(%err, "banner reload failed");
-                            } else {
-                                tracing::info!("banners reloaded");
-                            }
+                        let Ok(event) = res else { return };
+                        // Only content-changing events. Access events (which the
+                        // reload's own read_to_string can itself provoke) and
+                        // Other would otherwise re-trigger the watcher in a loop.
+                        if !matches!(
+                            event.kind,
+                            notify::EventKind::Modify(_)
+                                | notify::EventKind::Create(_)
+                                | notify::EventKind::Any
+                        ) {
+                            return;
+                        }
+                        match watch_shared.reload(&watch_path) {
+                            Ok(true) => tracing::info!("banners reloaded"),
+                            // Content unchanged — a spurious/duplicate event.
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!(%err, "banner reload failed"),
                         }
                     })?;
                 notify::Watcher::watch(
