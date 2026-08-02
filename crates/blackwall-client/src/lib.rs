@@ -6,5 +6,6 @@
 //! crate.
 
 pub mod metrics;
+pub mod views;
 
 pub use metrics::{parse_prometheus, MetricsSnapshot, Sample};
