@@ -75,7 +75,10 @@ pub async fn run_collector(
                                     for _ in 0..sample_errors { m.incr_sample_decode_errors(); }
                                 }
                                 let t = now_ms();
-                                for o in &observations { detector.observe(o, t); }
+                                for o in &observations {
+                                    if let Some(m) = &metrics { m.record_sample(o.sampling_rate, o.frame_len); }
+                                    detector.observe(o, t);
+                                }
                             }
                             Err(err) => {
                                 if let Some(m) = &metrics { m.incr_decode_errors(); }

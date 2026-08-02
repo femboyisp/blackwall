@@ -20,6 +20,8 @@ pub struct CollectorMetrics {
     min_sample_suppressed: AtomicU64,
     detections_opened: AtomicU64,
     detections_cleared: AtomicU64,
+    sampled_bytes: AtomicU64,
+    sampled_packets: AtomicU64,
 }
 
 impl CollectorMetrics {
@@ -134,6 +136,34 @@ impl CollectorMetrics {
     pub fn set_detections_cleared(&self, value: u64) {
         self.detections_cleared.store(value, Ordering::Relaxed);
     }
+
+    /// Estimated total bytes represented by decoded flow samples, extrapolated
+    /// from sFlow's packet-sampling rate (`blackwall_flow_sampled_bytes_total`
+    /// for the dashboard's throughput panel). See [`Self::record_sample`].
+    #[must_use]
+    pub fn sampled_bytes_value(&self) -> u64 {
+        self.sampled_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Estimated total packets represented by decoded flow samples, extrapolated
+    /// from sFlow's packet-sampling rate
+    /// (`blackwall_flow_sampled_packets_total`). See [`Self::record_sample`].
+    #[must_use]
+    pub fn sampled_packets_value(&self) -> u64 {
+        self.sampled_packets.load(Ordering::Relaxed)
+    }
+
+    /// Record one decoded flow sample: each sample represents `sampling_rate`
+    /// packets of `frame_len` bytes (1-in-N sFlow packet sampling), so this
+    /// adds `sampling_rate` to the packet estimate and `sampling_rate *
+    /// frame_len` to the byte estimate. Saturating arithmetic: a pathological
+    /// sampling rate/frame length cannot wrap the counters.
+    pub fn record_sample(&self, sampling_rate: u32, frame_len: u32) {
+        let packets = u64::from(sampling_rate);
+        let bytes = packets.saturating_mul(u64::from(frame_len));
+        self.sampled_packets.fetch_add(packets, Ordering::Relaxed);
+        self.sampled_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +212,17 @@ mod tests {
         m.set_detections_cleared(4);
         assert_eq!(m.detections_opened(), 5);
         assert_eq!(m.detections_cleared(), 4);
+    }
+
+    #[test]
+    fn record_sample_scales_by_sampling_rate() {
+        let m = CollectorMetrics::new();
+        m.record_sample(1000, 500); // 1 sample repr. 1000 packets of 500B
+        assert_eq!(m.sampled_packets_value(), 1000);
+        assert_eq!(m.sampled_bytes_value(), 500_000);
+        m.record_sample(1, 64);
+        assert_eq!(m.sampled_packets_value(), 1001);
+        assert_eq!(m.sampled_bytes_value(), 500_064);
     }
 
     #[test]
