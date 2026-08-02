@@ -5,7 +5,7 @@ use crate::state::{
     AuditView, DetectionView, FlowSpecView, IpAssignmentView, RtbhView, ServiceView, SessionView,
     TenantView, XdpView,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use utoipa::ToSchema;
 
@@ -76,7 +76,12 @@ impl From<IpAssignmentView> for IpAssignmentDto {
 }
 
 /// An RTBH blackhole (announced mirror).
-#[derive(Debug, Serialize, ToSchema)]
+///
+/// Also `Deserialize` (unlike the other DTOs, which are response-only): the
+/// read-only Blackwall TUI/GUI clients (`blackwall-client`) decode this type
+/// straight from the `/v1/mitigations/rtbh` response body, so the wire
+/// contract is shared rather than redefined client-side.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RtbhDto {
     /// Null-routed target.
     #[schema(value_type = String)]
@@ -170,7 +175,9 @@ impl From<XdpView> for XdpDto {
 }
 
 /// An active volumetric detection.
-#[derive(Debug, Serialize, ToSchema)]
+///
+/// Also `Deserialize`; see [`RtbhDto`]'s doc for why.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DetectionDto {
     /// Detected target.
     #[schema(value_type = String)]
@@ -201,7 +208,9 @@ impl From<DetectionView> for DetectionDto {
 }
 
 /// A recorded deception session.
-#[derive(Debug, Serialize, ToSchema)]
+///
+/// Also `Deserialize`; see [`RtbhDto`]'s doc for why.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SessionDto {
     /// Local (honeypot) address.
     #[schema(value_type = String)]

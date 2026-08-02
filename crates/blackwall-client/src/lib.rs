@@ -5,7 +5,11 @@
 //! Prometheus text endpoint. No mutating/write call lives anywhere in this
 //! crate.
 
+pub mod api;
+pub mod http;
 pub mod metrics;
 pub mod views;
 
+pub use api::{ApiClient, ClientError};
+pub use http::MetricsClient;
 pub use metrics::{parse_prometheus, MetricsSnapshot, Sample};
