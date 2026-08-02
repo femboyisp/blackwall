@@ -88,8 +88,13 @@ pub(crate) fn kill_pidfiles(run_dir: &str) {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let pid = contents.trim();
-        if pid.is_empty() {
+        // Parse before use: a pidfile is untrusted input, and a non-positive
+        // value must never reach `kill(2)`, where it would mean "this process
+        // group" (0) or "every process we may signal" (-1).
+        let Ok(pid) = contents.trim().parse::<i32>() else {
+            continue;
+        };
+        if pid <= 0 {
             continue;
         }
         // Guard against PID reuse (issue #81): only kill if the live process is
@@ -102,7 +107,7 @@ pub(crate) fn kill_pidfiles(run_dir: &str) {
         if comm.trim() != "bird" {
             continue;
         }
-        let _ = Command::new("kill").args(["-KILL", pid]).status();
+        super::kill_pid(pid);
     }
 }
 

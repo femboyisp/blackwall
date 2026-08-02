@@ -100,12 +100,11 @@ pub(crate) fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Captur
 }
 
 /// SIGKILL the process group led by `pid` (best-effort). The child was spawned
-/// with `process_group(0)`, so its PGID equals its PID; `kill -<pid>` targets
-/// the whole tree. Failure is ignored — the caller also kills the direct child.
+/// with `process_group(0)`, so its PGID equals its PID; a negative target
+/// signals the whole tree. Failure is ignored — the caller also kills the
+/// direct child.
 fn kill_group(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .status();
+    super::kill_process_group(pid);
 }
 
 /// Join a pipe-reader thread, but give up after `grace` and return whatever was

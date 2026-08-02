@@ -376,6 +376,7 @@ dependencies = [
  "ctrlc",
  "ipnet",
  "kdl",
+ "libc",
  "thiserror 2.0.19",
 ]
 
