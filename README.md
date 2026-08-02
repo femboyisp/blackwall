@@ -119,6 +119,25 @@ With a `metrics` block, `blackwalld flow` serves `GET /metrics` (Prometheus text
 session state + reconnects, sFlow datagrams/decode-errors, active RTBH/FlowSpec rule counts,
 pending operator-intent queue depths, and detection/session/audit totals.
 
+### Dashboard (TUI)
+
+`blackwall-tui` is a read-only, Blackwall-themed terminal dashboard over the read control API
+(`/v1/*`) and the `metrics` endpoint — live throughput, upstream BGP peering, active RTBH
+blackholes, and deception sessions. Watch-only (no arm/disarm/blackhole). With `blackwalld`
+serving its `api` + `metrics` endpoints:
+
+```bash
+# local (defaults hit 127.0.0.1:8080 / 127.0.0.1:9100)
+BLACKWALL_API_TOKEN=<token> cargo run --release -p blackwall-tui
+
+# remote box
+cargo run --release -p blackwall-tui -- \
+  --api-url http://<host>:8080 --metrics-url http://<host>:9100/metrics --token <token>
+```
+
+Each source degrades independently — an unreachable API or metrics endpoint shows a
+`stale`/`OFFLINE` badge instead of blanking the screen. Quit with `q`.
+
 ### RTBH operator commands
 
 With an `rtbh` block configured, `blackwalld flow` auto-blackholes detected volumetric
@@ -229,6 +248,8 @@ generation to exercise the XDP/eBPF data plane.
 | `blackwall-xdp` / `blackwall-xdp-ebpf` / `blackwall-xdp-common` | On-box XDP/eBPF data plane (sub-project B): userspace loader/control/sink + the aya eBPF program (source-drop, rate-limit, in-kernel SYN cookies, AF_XDP redirect). |
 | `blackwall-cookie` | `no_std` SipHash SYN-cookie core shared byte-for-byte between the userspace and eBPF tiers. |
 | `blackwall-api` | Tenant-aware, bearer-authenticated read-only control API (axum + OpenAPI), mounted in `blackwalld run` (A·M4). |
+| `blackwall-client` | Read-only async data layer for dashboards: an `ApiClient` over `/v1/*` (reuses `blackwall-api` DTOs, so wire drift fails to compile) + a Prometheus-scraping `MetricsClient`. Shared by the TUI and a future web GUI. |
+| `blackwall-tui` | Blackwall-themed read-only terminal dashboard (ratatui): live throughput, upstream BGP peering, RTBH blackholes, and deception sessions, over `blackwall-client`. |
 | `blackwall-trafficgen` | DDoS-lab traffic generator (AF_PACKET) for the netns XDP/flood gates. |
 | `blackwall-lab` | netns integration-test lab harness (`lab` CLI) — see below. |
 | `blackwalld` | The daemon/CLI that wires it together (`render`, `apply`, `run`, `flow`, …). |

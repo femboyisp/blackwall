@@ -142,6 +142,22 @@ Set `metrics listen=127.0.0.1:9100` in the config and scrape `GET /metrics`:
 Also: Postgres tables (`detections`, `rtbh_blackholes`, `flowspec_rules`, the
 `*_requests` intent logs) and `birdc`/your router.
 
+### Dashboard (TUI)
+`blackwall-tui` is a read-only, red-on-black terminal view of throughput, upstream BGP
+peering, active RTBH, and deception sessions — over the read API (`api listen=`) and
+`/metrics`. Watch-only (no arm/disarm/blackhole). With both endpoints reachable:
+```bash
+export BLACKWALL_API_TOKEN=<token>
+cargo run --release -p blackwall-tui -- \
+  --api-url http://<host>:8080 --metrics-url http://<host>:9100/metrics
+```
+Throughput is derived from the `blackwall_flow_sampled_bytes_total` /
+`blackwall_flow_sampled_packets_total` counters (bps/pps via two scrapes). Each source
+degrades independently — an unreachable API or `/metrics` shows a `stale`/`OFFLINE` badge
+rather than blanking the screen. To watch a remote box whose endpoints aren't directly
+routable, forward them first (`ssh -L 8080:<container-ip>:8080 -L 9100:<container-ip>:9100
+<host>`) and point the TUI at its localhost defaults.
+
 ## Stop / emergency
 - `systemctl stop blackwalld-deception` (or `sv stop blackwalld-deception`) —
   graceful: removes the nft ruleset + policy route, exits 0 (traffic stops being
