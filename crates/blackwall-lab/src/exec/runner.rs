@@ -219,16 +219,27 @@ pub(crate) fn run_test(manifest_text: &str, junit_path: Option<&str>) -> Result<
     let mut scenarios = Vec::new();
     let mut all_pass = true;
     let mut n = 0_usize;
+    let mut dumped_logs = false;
     for sc in &manifest.scenarios {
         let mut steps = Vec::new();
         for step in &sc.steps {
             let (name, outcome) = run_step(&id, &manifest, step);
-            if matches!(outcome, StepOutcome::Fail(_)) {
+            let failed = matches!(outcome, StepOutcome::Fail(_));
+            if failed {
                 all_pass = false;
             }
             let result = StepResult { name, outcome };
             n += 1;
             print!("{}", tap_step_line(n, &result));
+            // On the first failure, dump the run's node logs as TAP `#`
+            // comments so CI shows WHY a node never came up — e.g. an engine
+            // panic hidden behind a `wait port-open` timeout, which otherwise
+            // surfaces only as an opaque "probe timed out". Once per run; later
+            // steps usually fail downstream of the first.
+            if failed && !dumped_logs {
+                print!("{}", run_logs_tap(&id));
+                dumped_logs = true;
+            }
             let _ = std::io::stdout().flush();
             steps.push(result);
         }
@@ -258,6 +269,71 @@ fn ns_for(manifest: &Manifest, id: &str, node: &str) -> String {
         .find(|n| n.name == node)
         .and_then(|n| n.netns.clone())
         .unwrap_or_else(|| crate::plan::netns_name(id, node))
+}
+
+/// Gather every daemon/run log under a run's scratch dir as
+/// `(relative-label, contents)` pairs sorted by path. Best-effort: a missing
+/// dir or unreadable file simply yields no entry (never an error) — this runs
+/// on a failure path and must not itself fail the run.
+fn collect_run_logs(base: &std::path::Path) -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else if path.extension().is_some_and(|e| e == "log") {
+                if let Ok(body) = std::fs::read_to_string(&path) {
+                    let label = path
+                        .strip_prefix(base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((label, body));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(base, base, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Format gathered logs as TAP `#` comment lines: a header, then each log's
+/// last `max_lines` lines under a `===== <label> =====` banner (earlier lines
+/// elided with a count). Empty input still emits a note, so "no logs found" is
+/// itself visible in CI.
+fn format_log_dump(entries: &[(String, String)], max_lines: usize) -> String {
+    let mut s = String::from("# ---- lab: node logs after first failure ----\n");
+    if entries.is_empty() {
+        s.push_str("# (no logs found under the run scratch dir)\n");
+        return s;
+    }
+    for (label, body) in entries {
+        s.push_str(&format!("# ===== {label} =====\n"));
+        let lines: Vec<&str> = body.lines().collect();
+        let start = lines.len().saturating_sub(max_lines);
+        if start > 0 {
+            s.push_str(&format!("# ...({start} earlier line(s) elided)\n"));
+        }
+        for line in &lines[start..] {
+            s.push_str("#   ");
+            s.push_str(line);
+            s.push('\n');
+        }
+    }
+    s.push_str("# ---- end node logs ----\n");
+    s
+}
+
+/// TAP `#`-comment dump of a run's node logs (last 80 lines each). Emitted on
+/// the first step failure so a `wait` timeout shows the failing node's output.
+fn run_logs_tap(id: &str) -> String {
+    let base = format!("/run/blackwall-lab/{id}");
+    format_log_dump(&collect_run_logs(std::path::Path::new(&base)), 80)
 }
 
 /// Execute one scenario step, returning (label, outcome).
@@ -413,4 +489,59 @@ pub(crate) fn shell(manifest_text: &str, node: &str) -> Result<i32, LabError> {
         .status()
         .map_err(|e| LabError::Exec(format!("shell: {e}")))?;
     Ok(status.code().unwrap_or(-1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_run_logs, format_log_dump};
+
+    #[test]
+    fn format_log_dump_tails_and_prefixes_every_line_as_tap_comment() {
+        let body = (1..=100)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = format_log_dump(&[("engine/run.log".to_owned(), body)], 80);
+
+        // Every emitted line is a TAP comment (`#`), so no parser mis-reads it
+        // as a test result.
+        assert!(
+            out.lines().all(|l| l.starts_with('#')),
+            "not all `#`: {out}"
+        );
+        assert!(out.contains("# ===== engine/run.log ====="));
+        // Only the last 80 lines are kept; the first 20 are elided with a count.
+        assert!(out.contains("# ...(20 earlier line(s) elided)"));
+        assert!(out.contains("#   line100"));
+        assert!(out.contains("#   line21"));
+        assert!(
+            !out.contains("#   line20\n"),
+            "line20 should be elided: {out}"
+        );
+    }
+
+    #[test]
+    fn format_log_dump_notes_when_no_logs() {
+        let out = format_log_dump(&[], 80);
+        assert!(out.contains("no logs found"));
+    }
+
+    #[test]
+    fn collect_run_logs_finds_nested_logs_sorted_by_label() {
+        let dir =
+            std::env::temp_dir().join(format!("blackwall-lab-runner-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = dir.join("engine");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::write(node.join("run.log"), "thread panicked at bind\n").unwrap();
+        std::fs::write(dir.join("victim-bird.log"), "bird up\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a log\n").unwrap();
+
+        let logs = collect_run_logs(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let labels: Vec<&str> = logs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["engine/run.log", "victim-bird.log"]);
+        assert!(logs[0].1.contains("panicked"));
+    }
 }
