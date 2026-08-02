@@ -15,25 +15,29 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// First interface in the current netns that is neither `lo` nor `ifb*` — the veth.
+/// The interface in the current netns that carries the lab-assigned IPv4 — the
+/// veth.
+///
+/// Selected by "has a global IPv4", not "first non-`lo` link": a fresh netns in
+/// some environments (notably the CI runner's container) auto-creates tunnel
+/// devices (`sit0`/`tunl0`/`ip6tnl0`) that sort ahead of the veth in `ip link
+/// show` but carry no address. Picking the first non-`lo` link there returned a
+/// tunnel stub, and `first_ipv4_of` then panicked with "no inet addr on iface"
+/// (the deception-nft gate never got past setup). The veth is the only non-`lo`
+/// interface with an inet address, so scan IPv4 assignments directly.
 fn first_non_loopback_iface() -> String {
     let out = std::process::Command::new("ip")
-        .args(["-o", "link", "show"])
+        .args(["-o", "-4", "addr", "show"])
         .output()
-        .expect("run `ip -o link show`");
+        .expect("run `ip -o -4 addr show`");
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = line
-            .split(':')
-            .nth(1)
-            .map(str::trim)
-            .and_then(|n| n.split('@').next())
-            .map(str::trim)
-            .unwrap_or("");
+        // "<idx>: <iface>    inet 10.0.0.1/30 ... scope global <iface>"
+        let name = line.split_whitespace().nth(1).unwrap_or("");
         if !name.is_empty() && name != "lo" && !name.starts_with("ifb") {
             return name.to_owned();
         }
     }
-    panic!("no non-loopback interface in this netns");
+    panic!("no non-loopback interface with an IPv4 address in this netns");
 }
 
 /// The first IPv4 address configured on `iface` (e.g. `10.0.0.1`).
