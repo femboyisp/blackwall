@@ -214,26 +214,39 @@ const HSFLOWD_SAMPLING: u32 = 4;
 /// sFlow v5 to 127.0.0.1:6343. Foreground (`-d`), root (`-P`, needed for pcap);
 /// output redirected so it cannot hold the lab's stdout pipe. Killed at teardown.
 pub(crate) fn spawn_hsflowd(run_id: &str, node: &str, ns: &str) -> Result<Child, LabError> {
-    // Discover the node's veth inside its namespace (first non-lo/ifb iface).
+    // Discover the node's veth inside its namespace by "has a global-scope
+    // address", not "first non-lo link": a fresh netns on the CI runner
+    // auto-creates tunnel stubs (sit0/tunl0/ip6tnl0) that sort ahead of the veth
+    // in `ip link show` but carry no address. `mod_pcap` on such a stub samples
+    // zero packets, so hsflowd exports no flow samples and the live detector
+    // never fires (empty hsflowd.log, `file-present` probe times out). The veth
+    // carries the lab /30, so scanning global-scope addresses picks it. Same fix
+    // as the trafficgen/deception selectors (#254/#256/#258); `scope global`
+    // (not `-4`) also covers a v6-only netns.
     let out = Command::new("ip")
-        .args(["netns", "exec", ns, "ip", "-o", "link", "show"])
+        .args([
+            "netns", "exec", ns, "ip", "-o", "addr", "show", "scope", "global",
+        ])
         .output()
-        .map_err(|e| LabError::Exec(format!("ip link in {ns}: {e}")))?;
-    let iface = String::from_utf8_lossy(&out.stdout)
+        .map_err(|e| LabError::Exec(format!("ip addr in {ns}: {e}")))?;
+    let addr_show = String::from_utf8_lossy(&out.stdout);
+    let iface = addr_show
         .lines()
-        .filter_map(|l| {
-            l.split(':')
-                .nth(1)
-                .map(str::trim)
-                .and_then(|n| n.split('@').next())
-                .map(str::trim)
-        })
+        // "<idx>: <iface>    inet 10.0.0.1/30 scope global <iface>"
+        .filter_map(|l| l.split_whitespace().nth(1))
         .find(|n| !n.is_empty() && *n != "lo" && !n.starts_with("ifb"))
-        .ok_or_else(|| LabError::Exec(format!("no veth in {ns}")))?
+        .ok_or_else(|| LabError::Exec(format!("no addressed veth in {ns}")))?
         .to_owned();
 
     let dir = format!("/run/blackwall-lab/{run_id}/{node}");
     std::fs::create_dir_all(&dir).map_err(|e| LabError::Exec(format!("mkdir {dir}: {e}")))?;
+    // Diagnostic (surfaced by the failure log-dump, which globs `*.log`): record
+    // which iface `mod_pcap` samples plus the addresses chosen from, so a future
+    // "no live detection" can be told apart from a wrong-iface pick.
+    let _ = std::fs::write(
+        format!("{dir}/hsflowd-iface.log"),
+        format!("selected iface: {iface}\n--- ip -o addr show scope global ---\n{addr_show}"),
+    );
     let conf = crate::render::render_hsflowd_conf(
         &iface,
         "127.0.0.1",
