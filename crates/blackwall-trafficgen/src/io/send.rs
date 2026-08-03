@@ -66,37 +66,45 @@ pub fn run_send(
 
     loop {
         let elapsed = start.elapsed();
+        // Frames owed by each flow this pass, computed against a single `elapsed`
+        // snapshot so the counts stay in proportion to each flow's pps.
         let mut any_active = false;
-        for (idx, plan, sent, counts) in &mut plans {
+        let mut dues = vec![0u64; plans.len()];
+        for (i, (_idx, plan, sent, _counts)) in plans.iter().enumerate() {
             if plan.finished(elapsed, *sent) {
                 continue;
             }
             any_active = true;
-            let due = plan.due(elapsed, *sent);
-            let ps = &spec.patterns[*idx];
-            for _ in 0..due {
-                let params = FrameParams {
-                    src_mac: SRC_MAC,
-                    dst_mac: DST_MAC,
-                    src_ip: std::net::IpAddr::V4(src_ip),
-                    dst_ip: std::net::IpAddr::V4(dst),
-                    dst_port,
-                    payload_len: 64,
-                };
-                let frame = build_frame(&ps.pattern, &params, *sent)?;
-                let res = sendto_ll(&sock, &frame, &sll);
-                if res.is_ok() {
-                    *sent += 1;
-                    counts.packets += 1;
-                    let blen = u64::try_from(frame.len()).unwrap_or(0);
-                    counts.bytes += blen;
-                    total.packets += 1;
-                    total.bytes += blen;
-                }
-            }
+            dues[i] = plan.due(elapsed, *sent);
         }
         if !any_active {
             break;
+        }
+        // Emit round-robin across flows rather than draining each flow's whole
+        // due before the next: when the tx ring saturates and `sendto` starts
+        // returning ENOBUFS (silently dropped below), interleaving spreads those
+        // drops across all flows in proportion to their due, instead of letting
+        // the high-rate flows at the front of the list starve the tail (benign).
+        for i in interleave_order(&dues) {
+            let (idx, _plan, sent, counts) = &mut plans[i];
+            let ps = &spec.patterns[*idx];
+            let params = FrameParams {
+                src_mac: SRC_MAC,
+                dst_mac: DST_MAC,
+                src_ip: std::net::IpAddr::V4(src_ip),
+                dst_ip: std::net::IpAddr::V4(dst),
+                dst_port,
+                payload_len: 64,
+            };
+            let frame = build_frame(&ps.pattern, &params, *sent)?;
+            if sendto_ll(&sock, &frame, &sll).is_ok() {
+                *sent += 1;
+                counts.packets += 1;
+                let blen = u64::try_from(frame.len()).unwrap_or(0);
+                counts.bytes += blen;
+                total.packets += 1;
+                total.bytes += blen;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -114,6 +122,33 @@ pub fn run_send(
         sent: total,
         per_pattern,
     })
+}
+
+/// Round-robin emission order across flows for one send pass: given each flow's
+/// frame `dues` for this pass, return one flow index per frame, cycling flows so
+/// a low-rate flow's frames are interleaved with — not queued behind — a
+/// high-rate flow's. Draining each flow's whole due in list order lets the tx
+/// ring fill on the high-rate flows at the front, so every flow after them eats
+/// the resulting ENOBUFS drops; interleaving spreads the drops in proportion to
+/// each flow's due, so no flow (notably `benign`, last in the spec) is starved
+/// below its share. Total frame count is unchanged — only the order differs.
+fn interleave_order(dues: &[u64]) -> Vec<usize> {
+    let total: u64 = dues.iter().copied().sum();
+    let mut order = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
+    let mut remaining = dues.to_vec();
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for (i, r) in remaining.iter_mut().enumerate() {
+            if *r == 0 {
+                continue;
+            }
+            *r -= 1;
+            order.push(i);
+            progress = true;
+        }
+    }
+    order
 }
 
 // --- libc-level helpers (AF_PACKET sockaddr_ll + sendto) ---
@@ -163,5 +198,36 @@ fn sendto_ll(sock: &Socket, frame: &[u8], sll: &libc::sockaddr_ll) -> std::io::R
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interleave_order;
+
+    #[test]
+    fn interleave_is_round_robin_not_drain_in_order() {
+        // A high-rate flow (idx 0) and a single-frame low-rate flow (idx 1):
+        // the low-rate frame lands second, not last, so a saturated tx ring
+        // can't drop it after already accepting all of flow 0.
+        assert_eq!(interleave_order(&[3, 1]), vec![0, 1, 0, 0]);
+        // Three flows cycle in order until each is drained.
+        assert_eq!(interleave_order(&[2, 2, 1]), vec![0, 1, 2, 0, 1]);
+    }
+
+    #[test]
+    fn interleave_preserves_total_and_per_flow_counts() {
+        let dues = [50, 20, 5, 1, 1];
+        let order = interleave_order(&dues);
+        assert_eq!(order.len(), 77);
+        for (flow, &due) in dues.iter().enumerate() {
+            let got = order.iter().filter(|&&i| i == flow).count();
+            assert_eq!(u64::try_from(got).unwrap(), due, "flow {flow}");
+        }
+    }
+
+    #[test]
+    fn interleave_of_all_zero_is_empty() {
+        assert!(interleave_order(&[0, 0, 0]).is_empty());
     }
 }

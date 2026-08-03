@@ -15,29 +15,32 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// The interface in the current netns that carries the lab-assigned IPv4 — the
-/// veth.
+/// The interface in the current netns that carries the lab-assigned address —
+/// the veth.
 ///
-/// Selected by "has a global IPv4", not "first non-`lo` link": a fresh netns in
-/// some environments (notably the CI runner's container) auto-creates tunnel
-/// devices (`sit0`/`tunl0`/`ip6tnl0`) that sort ahead of the veth in `ip link
-/// show` but carry no address. Picking the first non-`lo` link there returned a
-/// tunnel stub, and `first_ipv4_of` then panicked with "no inet addr on iface"
-/// (the deception-nft gate never got past setup). The veth is the only non-`lo`
-/// interface with an inet address, so scan IPv4 assignments directly.
+/// Selected by "has a global-scope address" (v4 or v6), not "first non-`lo`
+/// link": a fresh netns in some environments (notably the CI runner's
+/// container) auto-creates tunnel devices (`sit0`/`tunl0`/`ip6tnl0`) that sort
+/// ahead of the veth in `ip link show` but carry no global address (at most a
+/// link-local `fe80`), so the link-order heuristic returned a tunnel stub.
+/// Filtering to `scope global` covers both the IPv4 deception/syncookie netns
+/// and the IPv6-only syncookie-v6 netns — where the veth has only a ULA and no
+/// IPv4, so an IPv4-only scan (`ip -o -4 addr show`) finds nothing and panics.
+/// The veth is the only non-`lo` interface with a global address in either.
 fn first_non_loopback_iface() -> String {
     let out = std::process::Command::new("ip")
-        .args(["-o", "-4", "addr", "show"])
+        .args(["-o", "addr", "show", "scope", "global"])
         .output()
-        .expect("run `ip -o -4 addr show`");
+        .expect("run `ip -o addr show scope global`");
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        // "<idx>: <iface>    inet 10.0.0.1/30 ... scope global <iface>"
+        // "<idx>: <iface>    inet 10.0.0.1/30 scope global <iface>" or
+        // "<idx>: <iface>    inet6 fd00::1/64 scope global ..."
         let name = line.split_whitespace().nth(1).unwrap_or("");
         if !name.is_empty() && name != "lo" && !name.starts_with("ifb") {
             return name.to_owned();
         }
     }
-    panic!("no non-loopback interface with an IPv4 address in this netns");
+    panic!("no non-loopback interface with a global address in this netns");
 }
 
 /// The first IPv4 address configured on `iface` (e.g. `10.0.0.1`).
