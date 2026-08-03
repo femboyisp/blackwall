@@ -153,16 +153,15 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/trafficgen-foundation.kdl lab-junit-trafficgen.xml
       - name: Run the lab gate (flow-live)
-        # Quarantined (#88): non-blocking. The old wedge is fixed — closing fd
-        # 3/4 for `lab test` (`3>&- 4>&-` below) stops lingering daemons
-        # (hsflowd) from holding the runner pipe, so the step now finalizes
-        # cleanly instead of hanging. What remains is the live-sFlow detection
-        # itself firing unreliably on this runner (the sampled volumetric flood
-        # doesn't consistently trip the collector within the 40s window), which
-        # is environmental — the flood volume is runner-bound and the sampler
-        # timing varies. Keep the gate running for visibility via
-        # `continue-on-error`, but don't let it fail the (non-required) lab job.
-        continue-on-error: true
+        # #88 un-quarantined: the "environmental, unreliable detection" was
+        # really hsflowd sampling the wrong interface. A fresh netns's tunnel
+        # stubs (sit0/tunl0/ip6tnl0) sorted ahead of the veth in the old
+        # `ip link` selector, so mod_pcap saw zero packets and no sFlow was ever
+        # exported (empty hsflowd.log). Fixed to select the veth by global-scope
+        # address (matching the trafficgen/deception selectors), so the gate now
+        # detects reliably and gates for real — no `continue-on-error`. fd 3/4
+        # are still closed (`3>&- 4>&-` below) so no lingering daemon holds the
+        # runner pipe.
         timeout-minutes: 6
         run: |
           trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
