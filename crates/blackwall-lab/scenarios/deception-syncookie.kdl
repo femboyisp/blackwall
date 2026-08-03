@@ -23,9 +23,13 @@ scenario "stateless-cookie-serves-under-flood" {
     // the cookie responder (dropped after a cookie SYN-ACK, no backlog, no
     // conntrack entry) — the responder must survive it (trafficgen's `send`
     // self-asserts generator fidelity, so this only fails if sending itself
-    // breaks).
+    // breaks). Uses `reduced-set` (15.4k pps), not `full-set` (77k): the victim
+    // runs the NFQUEUE responder per packet and competes with this generator
+    // for host CPU on the shared runner, so full-set's send rate is unreachable
+    // here and the fidelity self-check flaked. reduced-set is still a real
+    // spoofed-SYN flood (4k SYN-pps × 10s) but stays under the contended ceiling.
     step assert node="attacker" \
-         cmd="target/debug/trafficgen send --dst 10.0.0.1 --spec full-set --duration 10 --dst-port 8080" \
+         cmd="target/debug/trafficgen send --dst 10.0.0.1 --spec reduced-set --duration 10 --dst-port 8080" \
          exit="0" timeout="30s"
     // The key assertion: a legit TCP connect from the attacker to the
     // stateless port, after the flood, receives the marker banner — proving

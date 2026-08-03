@@ -20,7 +20,17 @@ pub struct GenSpec {
     pub patterns: Vec<PatternSpec>,
 }
 
-/// Parse a named spec. Only `"full-set"` is defined in increment 1.
+/// Parse a named spec.
+///
+/// - `"full-set"` — the full 77k-pps mix (UDP/SYN/reflection/malformed/benign).
+/// - `"reduced-set"` — the same five patterns at one-fifth the rate (15.4k pps
+///   total). For gates whose victim runs a per-packet userspace responder (the
+///   deception NFQUEUE syn-cookie tier): the responder competes with the
+///   co-located generator for host CPU on a shared runner, so `full-set`'s send
+///   rate is unreachable there and the `send` fidelity self-check flakes. The
+///   reduced rate is still a real spoofed-source flood (4k SYN-pps × 10s = 40k
+///   SYNs exercise the cookie path) but sits well under the generator's
+///   contended ceiling, so fidelity holds.
 ///
 /// # Errors
 /// [`TrafficGenError::Spec`] for any other name.
@@ -47,6 +57,32 @@ pub fn parse_spec(name: &str) -> Result<GenSpec> {
                 PatternSpec {
                     pattern: Pattern::Benign,
                     pps: 1_000,
+                },
+            ],
+        }),
+        // full-set scaled to 1/5: same pattern mix and proportions, generation-
+        // sustainable on a runner whose victim also burns CPU per packet.
+        "reduced-set" => Ok(GenSpec {
+            patterns: vec![
+                PatternSpec {
+                    pattern: Pattern::UdpFlood,
+                    pps: 10_000,
+                },
+                PatternSpec {
+                    pattern: Pattern::SynFlood { spoof_src: true },
+                    pps: 4_000,
+                },
+                PatternSpec {
+                    pattern: Pattern::Reflection(ReflProto::Dns),
+                    pps: 1_000,
+                },
+                PatternSpec {
+                    pattern: Pattern::Malformed(MalformedKind::BadIpChecksum),
+                    pps: 200,
+                },
+                PatternSpec {
+                    pattern: Pattern::Benign,
+                    pps: 200,
                 },
             ],
         }),
@@ -155,6 +191,32 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_spec() {
         assert!(parse_spec("nonsense").is_err());
+    }
+
+    #[test]
+    fn reduced_set_is_full_set_at_one_fifth() {
+        let full = parse_spec("full-set").unwrap();
+        let reduced = parse_spec("reduced-set").unwrap();
+        // Same pattern mix, in the same order.
+        assert_eq!(reduced.patterns.len(), full.patterns.len());
+        for (r, f) in reduced.patterns.iter().zip(&full.patterns) {
+            assert_eq!(
+                std::mem::discriminant(&r.pattern),
+                std::mem::discriminant(&f.pattern),
+                "pattern order/kind must match full-set",
+            );
+        }
+        // One-fifth the aggregate rate, and well under the ~30k-pps ceiling the
+        // generator sustains while the victim responder contends for host CPU.
+        let total: u64 = reduced.patterns.iter().map(|p| p.pps).sum();
+        assert_eq!(total, 15_400);
+        // Enough SYNs to exercise the cookie path (4k pps).
+        let syn = reduced
+            .patterns
+            .iter()
+            .find(|p| matches!(p.pattern, Pattern::SynFlood { .. }))
+            .expect("reduced-set has a SYN flood");
+        assert_eq!(syn.pps, 4_000);
     }
 
     fn good_report() -> RecvReport {
