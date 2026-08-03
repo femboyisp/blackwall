@@ -1,7 +1,7 @@
 //! Orchestrate a lab run: realize plan -> run scenario -> report -> teardown.
 
 use crate::addr::{allocate, resolve_env, AddressMap};
-use crate::assert::{evaluate, StepOutcome};
+use crate::assert::{evaluate, Captured, StepOutcome};
 use crate::error::LabError;
 use crate::exec::{netns, proc};
 use crate::plan::{compile, ExecutionPlan, Op};
@@ -336,6 +336,35 @@ fn run_logs_tap(id: &str) -> String {
     format_log_dump(&collect_run_logs(std::path::Path::new(&base)), 80)
 }
 
+/// Fold a failing assert command's own output into its TAP `#` reason.
+///
+/// A matcher failure (e.g. `exit 1 != 0`) otherwise reports only the mismatch,
+/// not *why* the command failed — the command's stderr/stdout are captured but
+/// discarded. This appends the last 20 lines of stderr (then stdout) as TAP
+/// comment-continuation lines (`#   …`), so a failing `assert` shows the same
+/// kind of diagnostic the run-node log dump gives a failing `wait`. A passing
+/// outcome, or a failure with no captured output, is returned unchanged.
+fn with_cmd_output(outcome: StepOutcome, cap: &Captured) -> StepOutcome {
+    let StepOutcome::Fail(reason) = outcome else {
+        return outcome;
+    };
+    let mut detail = String::new();
+    for (stream, text) in [("stderr", &cap.stderr), ("stdout", &cap.stdout)] {
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        detail.push_str(&format!("\n#   --- {stream} ---"));
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let start = lines.len().saturating_sub(20);
+        for line in &lines[start..] {
+            detail.push_str("\n#   ");
+            detail.push_str(line);
+        }
+    }
+    StepOutcome::Fail(format!("{reason}{detail}"))
+}
+
 /// Execute one scenario step, returning (label, outcome).
 fn run_step(id: &str, manifest: &Manifest, step: &Step) -> (String, StepOutcome) {
     match step {
@@ -376,7 +405,7 @@ fn run_step(id: &str, manifest: &Manifest, step: &Step) -> (String, StepOutcome)
                             return (label, StepOutcome::Pass);
                         }
                         if std::time::Instant::now() >= deadline {
-                            return (label, evaluate(matcher, &cap));
+                            return (label, with_cmd_output(evaluate(matcher, &cap), &cap));
                         }
                     }
                     Err(e) => {
@@ -493,7 +522,7 @@ pub(crate) fn shell(manifest_text: &str, node: &str) -> Result<i32, LabError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_run_logs, format_log_dump};
+    use super::{collect_run_logs, format_log_dump, with_cmd_output, Captured, StepOutcome};
 
     #[test]
     fn format_log_dump_tails_and_prefixes_every_line_as_tap_comment() {
@@ -543,5 +572,47 @@ mod tests {
         let labels: Vec<&str> = logs.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["engine/run.log", "victim-bird.log"]);
         assert!(logs[0].1.contains("panicked"));
+    }
+
+    #[test]
+    fn with_cmd_output_appends_streams_as_tap_comments() {
+        let cap = Captured {
+            stdout: "out-tail".to_owned(),
+            stderr: "generator fidelity: 0 pps\nsecond line".to_owned(),
+            exit: 1,
+        };
+        let out = with_cmd_output(StepOutcome::Fail("exit 1 != 0".to_owned()), &cap);
+        let StepOutcome::Fail(reason) = out else {
+            panic!("expected Fail");
+        };
+        assert!(reason.starts_with("exit 1 != 0"));
+        assert!(reason.contains("#   --- stderr ---"));
+        assert!(reason.contains("#   generator fidelity: 0 pps"));
+        assert!(reason.contains("#   --- stdout ---"));
+        assert!(reason.contains("#   out-tail"));
+        // Every appended line is a TAP comment continuation (the first line gets
+        // its `# ` from tap_step_line).
+        for line in reason.lines().skip(1) {
+            assert!(line.starts_with("#   "), "not a tap comment: {line:?}");
+        }
+    }
+
+    #[test]
+    fn with_cmd_output_leaves_pass_and_empty_untouched() {
+        let cap = Captured {
+            stdout: "x".to_owned(),
+            stderr: "y".to_owned(),
+            exit: 0,
+        };
+        assert_eq!(with_cmd_output(StepOutcome::Pass, &cap), StepOutcome::Pass);
+        let empty = Captured {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit: 1,
+        };
+        assert_eq!(
+            with_cmd_output(StepOutcome::Fail("reason".to_owned()), &empty),
+            StepOutcome::Fail("reason".to_owned()),
+        );
     }
 }

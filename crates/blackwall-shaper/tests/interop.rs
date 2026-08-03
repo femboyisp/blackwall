@@ -20,25 +20,26 @@ fn env_u32(key: &str) -> u32 {
 /// `ifb*` device — i.e. the node's veth. The test runs inside the node's netns
 /// (the lab launches it via `ip netns exec`), so `ip link` lists that ns.
 fn first_non_loopback_iface() -> String {
+    // Selected by "has a global IPv4", not "first non-`lo` link": a fresh netns
+    // in some environments (notably the CI runner's container) auto-creates
+    // tunnel devices (`sit0`/`tunl0`/`ip6tnl0`) that sort ahead of the veth in
+    // `ip link show` but carry no address, so the link-order heuristic returned
+    // a tunnel stub. The veth is the only non-`lo` interface with an inet
+    // address, so scan IPv4 assignments directly (matches the deception and
+    // trafficgen lab drivers).
     let out = std::process::Command::new("ip")
-        .args(["-o", "link", "show"])
+        .args(["-o", "-4", "addr", "show"])
         .output()
-        .expect("run `ip -o link show`");
+        .expect("run `ip -o -4 addr show`");
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
-        // Format: "<idx>: <name>[@peer]: <flags> ..."
-        let name = line
-            .split(':')
-            .nth(1)
-            .map(str::trim)
-            .and_then(|n| n.split('@').next())
-            .map(str::trim)
-            .unwrap_or("");
+        // "<idx>: <iface>    inet 10.0.0.1/30 ... scope global <iface>"
+        let name = line.split_whitespace().nth(1).unwrap_or("");
         if !name.is_empty() && name != "lo" && !name.starts_with("ifb") {
             return name.to_owned();
         }
     }
-    panic!("no non-loopback interface found in this netns");
+    panic!("no non-loopback interface with an IPv4 address in this netns");
 }
 
 #[test]
