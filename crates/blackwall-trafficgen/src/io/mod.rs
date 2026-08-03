@@ -7,28 +7,33 @@ pub mod send;
 use crate::error::{Result, TrafficGenError};
 use std::net::Ipv4Addr;
 
-/// First interface in this namespace that is not `lo`/`ifb*` (the veth).
+/// The interface in this namespace that carries the lab-assigned IPv4 (the veth).
+///
+/// Selected by "has a global IPv4", not "first non-`lo` link": a fresh netns in
+/// some environments (notably the CI runner's container) auto-creates tunnel
+/// devices (`sit0`/`tunl0`/`ip6tnl0`) that sort ahead of the veth in `ip link
+/// show` but carry no address. Binding `AF_PACKET` to a tunnel stub sends into
+/// the void — the sink sees `kernel_rx_packets: 0` and `send`'s fidelity check
+/// fails — even though the veth is fine. Both endpoints of the lab link have an
+/// IPv4 (the `/30`), so scanning IPv4 assignments picks the veth on each side.
 ///
 /// # Errors
 /// [`TrafficGenError::Io`] if no such interface exists or `ip` fails.
 pub fn first_non_loopback_iface() -> Result<String> {
     let out = std::process::Command::new("ip")
-        .args(["-o", "link", "show"])
+        .args(["-o", "-4", "addr", "show"])
         .output()
-        .map_err(|e| TrafficGenError::Io(format!("ip link: {e}")))?;
+        .map_err(|e| TrafficGenError::Io(format!("ip addr: {e}")))?;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = line
-            .split(':')
-            .nth(1)
-            .map(str::trim)
-            .and_then(|n| n.split('@').next())
-            .map(str::trim)
-            .unwrap_or("");
+        // "<idx>: <iface>    inet 10.0.0.1/30 ... scope global <iface>"
+        let name = line.split_whitespace().nth(1).unwrap_or("");
         if !name.is_empty() && name != "lo" && !name.starts_with("ifb") {
             return Ok(name.to_owned());
         }
     }
-    Err(TrafficGenError::Io("no non-loopback interface".to_owned()))
+    Err(TrafficGenError::Io(
+        "no non-loopback interface with an IPv4 address".to_owned(),
+    ))
 }
 
 /// The first IPv4 address on `iface`.
