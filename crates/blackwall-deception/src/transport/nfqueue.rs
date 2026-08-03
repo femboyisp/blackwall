@@ -6,6 +6,7 @@ use std::ffi::c_void;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -364,15 +365,43 @@ fn handle_udp(
     Ok(Verdict::Drop)
 }
 
-/// Log a per-packet reply-send failure (see the `run` loop's dispatch) and
+/// How many reply-send failures pass between emitted log lines. Under a
+/// spoofed-source flood every reply to an unroutable source fails identically
+/// (`ENETUNREACH`), so one line per packet is pure noise — and its cost is not
+/// free: `eprintln!` takes the stderr lock and issues a write syscall per call,
+/// which in the syncookie lab gate produced a ~64k-line flood that stole CPU
+/// from co-located work (and would drown a real deployment's logs during an
+/// actual flood). A power of two so the modulo is a mask.
+const DROP_LOG_SAMPLE: u64 = 1024;
+
+/// Count of reply-send failures seen process-wide; drives [`DROP_LOG_SAMPLE`]
+/// sampling in [`drop_and_log`].
+static DROP_LOG_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the `seen`-th (0-based) reply-send failure should be logged: the
+/// first (`seen == 0`) and every [`DROP_LOG_SAMPLE`]-th thereafter.
+fn should_sample_drop_log(seen: u64) -> bool {
+    seen.is_multiple_of(DROP_LOG_SAMPLE)
+}
+
+/// Note a per-packet reply-send failure (see the `run` loop's dispatch) and
 /// yield the [`Verdict::Drop`] the caller falls back to.
 ///
 /// Never propagated as fatal: the original packet is dropped either way (the
 /// stateless tier keeps no state to retry), so a reply that could not be
 /// sent is exactly as harmless to this responder's availability as one that
-/// was never attempted.
+/// was never attempted. The log is sampled (see [`DROP_LOG_SAMPLE`]): the first
+/// failure and every `DROP_LOG_SAMPLE`-th thereafter is printed, carrying the
+/// running total so a burst is visible without flooding stderr.
 fn drop_and_log(kind: &str, err: &DeceptionError) -> Verdict {
-    eprintln!("blackwall-deception: nfqueue: {kind} reply send failed, dropping packet: {err}");
+    let seen = DROP_LOG_SEEN.fetch_add(1, Ordering::Relaxed);
+    if should_sample_drop_log(seen) {
+        eprintln!(
+            "blackwall-deception: nfqueue: {kind} reply send failed, dropping packet: {err} \
+             (1 in {DROP_LOG_SAMPLE} shown; {} total)",
+            seen + 1
+        );
+    }
     Verdict::Drop
 }
 
@@ -549,5 +578,19 @@ mod tests {
             Arc::new(StatelessMetrics::new()),
         );
         assert_eq!(transport.name(), "nfqueue-stateless");
+    }
+
+    #[test]
+    fn drop_log_sampling_shows_first_and_every_nth() {
+        // First failure is always shown, so a single reply-send error is not
+        // silently swallowed.
+        assert!(should_sample_drop_log(0));
+        // Everything between samples is suppressed (the flood case).
+        assert!(!should_sample_drop_log(1));
+        assert!(!should_sample_drop_log(DROP_LOG_SAMPLE - 1));
+        assert!(!should_sample_drop_log(DROP_LOG_SAMPLE + 1));
+        // Exact multiples are shown, carrying the running total.
+        assert!(should_sample_drop_log(DROP_LOG_SAMPLE));
+        assert!(should_sample_drop_log(DROP_LOG_SAMPLE * 63));
     }
 }
