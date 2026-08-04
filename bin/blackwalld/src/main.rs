@@ -2494,20 +2494,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let store = blackwall_state::Store::connect(&database_url).await?;
             store.migrate().await?;
 
-            // Attempt to connect to Incus; log a warning and continue without it on failure.
-            let incus_client = match blackwall_discovery::UnixIncusClient::connect(&incus_socket) {
-                Ok(client) => {
-                    tracing::info!(socket = %incus_socket.display(), "connected to Incus");
-                    Some(client)
+            // Incus service discovery only makes sense where Incus is running
+            // (the home host); the AS214806 POPs have no Incus socket, so both
+            // the initial connect and the supervised reconnect loop below are
+            // gated on the socket existing. Without this gate, off-host
+            // deployments retry a never-present socket forever, spamming
+            // "Incus reconnect failed" (see femboy/blackwall#270). Host-socket
+            // discovery (`discover_host`) is independent and always runs.
+            let incus_present = incus_socket.exists();
+            let incus_client = if incus_present {
+                // Attempt to connect to Incus; log a warning and continue without it on failure.
+                match blackwall_discovery::UnixIncusClient::connect(&incus_socket) {
+                    Ok(client) => {
+                        tracing::info!(socket = %incus_socket.display(), "connected to Incus");
+                        Some(client)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            socket = %incus_socket.display(),
+                            "failed to connect to Incus; continuing with base policy only"
+                        );
+                        None
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        %err,
-                        socket = %incus_socket.display(),
-                        "failed to connect to Incus; continuing with base policy only"
-                    );
-                    None
-                }
+            } else {
+                tracing::info!(
+                    socket = %incus_socket.display(),
+                    "Incus socket absent; service discovery disabled (expected off-host, e.g. POPs)"
+                );
+                None
             };
 
             // Build the initial discovered set and apply the reconciled effective policy.
@@ -2699,9 +2715,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             // Spawn the Incus discovery loop as a supervised task that reconnects
             // forever. Without this, an Incus restart ends the event stream and
-            // discovery would go permanently stale. Spawns even when the initial
-            // connect failed, so a late Incus start is also picked up.
-            {
+            // discovery would go permanently stale. Only spawned when the Incus
+            // socket exists (`incus_present`, above): a host that has Incus still
+            // recovers from an Incus restart (socket persists), while off-host
+            // deployments with no socket don't spin a pointless reconnect loop
+            // that spams "Incus reconnect failed" (femboy/blackwall#270).
+            if incus_present {
                 let policy_for_task = policy.clone();
                 let store_for_task = store.clone();
                 let socket_for_task = incus_socket.clone();
