@@ -14,7 +14,7 @@ path = "src/main.rs"
 blackwall-cookie = { path = "../blackwall-cookie" }
 blackwall-xdp-common = { path = "../blackwall-xdp-common" }
 aya-ebpf = "0.1.1"
-network-types = "0.0.7"
+network-types = "0.2.0"
 
 [profile.dev]
 opt-level = 3
