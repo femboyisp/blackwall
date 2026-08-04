@@ -2611,8 +2611,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::warn!(
                         %err,
                         port = tproxy_port,
-                        "failed to bind IPv6 TPROXY listener (IPv6 may be disabled on \
-                         this host); continuing with IPv4 only"
+                        "failed to bind IPv6 TPROXY listener; continuing with IPv4 only \
+                         (the listener is now IPV6_V6ONLY, so this is a genuine v6 bind \
+                         failure — e.g. IPv6 disabled or missing CAP_NET_ADMIN — not the \
+                         old v4/v6 wildcard collision)"
                     );
                     None
                 }

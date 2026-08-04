@@ -56,6 +56,13 @@ impl TproxyListener {
         // IP_TRANSPARENT (v4) / IPV6_TRANSPARENT (v6) lets us accept connections
         // destined to non-local addrs. socket2 0.6 split these by family.
         if addr.is_ipv6() {
+            // Bind v6-only: a wildcard `[::]` socket on a host with the Linux
+            // default `net.ipv6.bindv6only=0` also claims the v4 address space,
+            // so it collides (EADDRINUSE) with the separate `0.0.0.0` listener
+            // the engine already bound on the same port. Setting IPV6_V6ONLY
+            // makes the split explicit and portable, independent of the host
+            // sysctl (see femboy/blackwall#265).
+            sock.set_only_v6(true)?;
             sock.set_ip_transparent_v6(true)?;
         } else {
             sock.set_ip_transparent_v4(true)?;
