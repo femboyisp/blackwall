@@ -251,6 +251,12 @@ impl Store {
 
     /// Append a deception-session audit row.
     pub async fn record_session(&self, s: &SessionRow) -> Result<(), StateError> {
+        // `note` is attacker-derived (an emulator captures the client's first
+        // command/request line). Postgres `text` columns reject a raw NUL byte
+        // (0x00) outright, so a captured payload containing one — ordinary
+        // honeypot input — would fail the INSERT and silently drop the session's
+        // audit record. Strip NUL bytes before binding (see femboy/blackwall#266).
+        let note = s.note.as_deref().map(strip_nul);
         sqlx::query(
             "INSERT INTO deception_sessions \
              (local_addr, local_port, peer_addr, proto, emulator, bytes_in, bytes_out, note) \
@@ -263,7 +269,7 @@ impl Store {
         .bind(&s.emulator)
         .bind(s.bytes_in)
         .bind(s.bytes_out)
-        .bind(s.note.as_deref())
+        .bind(note.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1073,6 +1079,17 @@ fn ipnetwork_addr(addr: IpAddr) -> sqlx::types::ipnetwork::IpNetwork {
     sqlx::types::ipnetwork::IpNetwork::from_str(&addr.to_string()).expect("host address is valid")
 }
 
+/// Strip NUL bytes (`0x00`) from a string bound for a Postgres `text`/`varchar`
+/// column, which rejects them outright. Borrows unchanged when there is no NUL,
+/// so the common (clean) path allocates nothing.
+fn strip_nul(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.as_bytes().contains(&0) {
+        std::borrow::Cow::Owned(s.replace('\0', ""))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// Map a [`Severity`] to its database text representation.
 fn severity_str(s: Severity) -> &'static str {
     match s {
@@ -1351,6 +1368,44 @@ mod tests {
             })
             .await
             .expect("record");
+        assert_eq!(store.session_count().await.expect("count"), before + 1);
+    }
+
+    #[test]
+    fn strip_nul_removes_embedded_nul_bytes() {
+        // NUL anywhere is stripped; the rest of the string is preserved.
+        assert_eq!(strip_nul("GET /\0\0 HTTP"), "GET / HTTP");
+        assert_eq!(strip_nul("a\0b\0"), "ab");
+        assert_eq!(strip_nul("\0"), "");
+        // Clean input is borrowed, not reallocated.
+        assert!(matches!(strip_nul("clean"), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[tokio::test]
+    async fn record_session_with_nul_note_persists() {
+        // Regression for #266: a captured note containing a raw NUL byte must
+        // not fail the INSERT (Postgres text rejects 0x00).
+        let Some(url) = test_url() else {
+            eprintln!("DATABASE_URL not set; skipping");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let _guard = DB_SERIAL_LOCK.lock().await;
+        let before = store.session_count().await.expect("count");
+        store
+            .record_session(&SessionRow {
+                local_addr: "203.0.113.5".parse().unwrap(),
+                local_port: 80,
+                peer_addr: "198.51.100.9".parse().unwrap(),
+                proto: "tcp".to_owned(),
+                emulator: "http".to_owned(),
+                bytes_in: 8,
+                bytes_out: 0,
+                note: Some("GET /\0\0 HTTP/1.1".to_owned()),
+            })
+            .await
+            .expect("record must succeed despite NUL in note");
         assert_eq!(store.session_count().await.expect("count"), before + 1);
     }
 
