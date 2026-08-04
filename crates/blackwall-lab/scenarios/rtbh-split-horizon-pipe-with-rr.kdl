@@ -1,0 +1,40 @@
+// Control for rtbh-split-horizon-pipe-blocked.kdl: identical topology and
+// fixtures (rtbh4 table + pipe into master4 on "home"), except the "to_c"
+// session also has `rr client;`. This proves route reflection — not the
+// pipe — is what actually lets an iBGP-learned RTBH route reach a second
+// iBGP peer, matching the fix direction docs/BLACKWALL.md leaves open for
+// home's real POP-facing sessions (kc4/6, ny4/6, ch4/6, ...). With `rr
+// client` set, BIRD both exports the route and stamps it with
+// `BGP.originator_id`/`BGP.cluster_list` — the standard RFC 4456 route-
+// reflection markers — confirming this is genuine reflection, not some
+// filter-level workaround.
+topology "rtbh-split-horizon-pipe-with-rr" {
+    node "a" {
+        daemon "bird" include-file="crates/blackwall-lab/scenarios/fixtures/rtbh-split-horizon-a.conf"
+    }
+    node "home" {
+        daemon "bird" include-file="crates/blackwall-lab/scenarios/fixtures/rtbh-split-horizon-home-pipe-rr.conf"
+    }
+    node "c" {
+        daemon "bird" include-file="crates/blackwall-lab/scenarios/fixtures/rtbh-split-horizon-c.conf"
+    }
+    link "a" "home" subnet="10.0.1.0/30"
+    link "home" "c" subnet="10.0.2.0/30"
+}
+
+scenario "rr-client-lets-the-piped-route-reach-c" {
+    step wait node="a" until="bgp-established" timeout="20s"
+    step wait node="c" until="bgp-established" timeout="20s"
+    step assert node="home" cmd="birdc show route table master4 203.0.113.99/32 all" \
+         contains="blackhole" timeout="15s"
+    // Now a candidate for export to "c" (contrast with the blocked gate's
+    // grep-count-0 assertion on the same command).
+    step assert node="home" \
+         cmd="birdc show route export to_c | grep -c 203.0.113.99/32" \
+         equals="1" timeout="15s"
+    // Arrives on "c", carrying the RFC 4456 reflection markers.
+    step assert node="c" cmd="birdc show route 203.0.113.99/32 all" \
+         contains="BGP.originator_id" timeout="15s"
+    step assert node="c" cmd="birdc show route 203.0.113.99/32 all" \
+         contains="BGP.cluster_list" timeout="15s"
+}

@@ -206,6 +206,34 @@ jobs:
           sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ./target/debug/lab test crates/blackwall-lab/scenarios/rtbh-bird.kdl lab-junit-rtbh.xml
+      - name: "Run the lab gate (rtbh split-horizon: pipe alone is blocked)"
+        # Regression for the still-open "RTBH doesn't propagate past home"
+        # bug (docs/BLACKWALL.md, deploy repo): proves against real BIRD
+        # 2.17.1 that importing an iBGP-learned route into a separate table
+        # and piping it into master4 does NOT defeat iBGP split horizon — the
+        # route's internal-origin marker survives the table copy, so a
+        # second plain iBGP session still refuses to export it without `rr
+        # client`. Exists so nobody ships a pipe-only "fix" for RTBH
+        # propagation that doesn't actually work.
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/rtbh-split-horizon-pipe-blocked.kdl lab-junit-rtbh-split-horizon-blocked.xml
+      - name: "Run the lab gate (rtbh split-horizon: rr client fixes it)"
+        # Control for the gate above: same topology, but the outbound
+        # session also has `rr client;` — proves route reflection (not the
+        # pipe) is what actually lets the route through, with the real RFC
+        # 4456 originator-id/cluster-list markers to show it.
+        timeout-minutes: 6
+        run: |
+          trap 'rc=$?; exec 1>&3 2>&4; cat lab-gate.log; exit $rc' EXIT
+          exec 3>&1 4>&2 >lab-gate.log 2>&1
+          sudo timeout --kill-after=15s 300s env "PATH=$HOME/.cargo/bin:$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            ./target/debug/lab test crates/blackwall-lab/scenarios/rtbh-split-horizon-pipe-with-rr.kdl lab-junit-rtbh-split-horizon-rr.xml
       - name: Run the lab gate (bird-gen)
         # Peers real BIRD2 against blackwall's *actual* generated iBGP
         # include (not the lab's own hand-rolled approximation the other
@@ -344,6 +372,8 @@ jobs:
             lab-junit-syncookie.xml
             lab-junit-syncookie-v6.xml
             lab-junit-rtbh.xml
+            lab-junit-rtbh-split-horizon-blocked.xml
+            lab-junit-rtbh-split-horizon-rr.xml
             lab-junit-bird-gen.xml
             lab-junit-flowspec.xml
             lab-junit-flowspec-auto.xml

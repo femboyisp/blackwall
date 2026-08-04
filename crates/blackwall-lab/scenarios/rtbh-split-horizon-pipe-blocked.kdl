@@ -1,0 +1,58 @@
+// Regression test for a hypothesis raised while investigating the still-open
+// "RTBH doesn't propagate past home" bug (docs/BLACKWALL.md in the deploy
+// repo): does importing an iBGP-learned route into a separate table and
+// `protocol pipe`-ing it into master4 defeat BIRD's iBGP split horizon,
+// letting it re-export to a second iBGP peer without `rr client`? A pipe is
+// not a BGP protocol and has no ASN, so this seemed plausible — but real
+// BIRD 2.17.1 says no: the route's internal-origin marker survives the
+// table copy, and `to_c` still refuses to export it. This gate exists so
+// nobody "fixes" RTBH propagation with a pipe alone and ships a fix that
+// doesn't actually work — see rtbh-split-horizon-pipe-with-rr.kdl for the
+// control proving `rr client` (not the pipe) is what's actually needed.
+//
+// "a" originates an RTBH-style blackhole (RFC 7999 community 65535:666)
+// over iBGP (AS 214806, same as blackwall's real session) to "home". "home"
+// imports it into a dedicated `rtbh4` table (converting the community into a
+// real `dest = RTD_BLACKHOLE`, matching blackwall's real import filter) and
+// pipes it into `master4`. "home" then re-exports `master4` to "c" (a POP
+// stand-in) over a second plain iBGP session — no `rr client` anywhere.
+topology "rtbh-split-horizon-pipe-blocked" {
+    node "a" {
+        daemon "bird" include-file="crates/blackwall-lab/scenarios/fixtures/rtbh-split-horizon-a.conf"
+    }
+    node "home" {
+        daemon "bird" include-file="crates/blackwall-lab/scenarios/fixtures/rtbh-split-horizon-home-pipe.conf"
+    }
+    node "c" {
+        daemon "bird" include-file="crates/blackwall-lab/scenarios/fixtures/rtbh-split-horizon-c.conf"
+    }
+    link "a" "home" subnet="10.0.1.0/30"
+    link "home" "c" subnet="10.0.2.0/30"
+}
+
+scenario "pipe-alone-does-not-defeat-split-horizon" {
+    step wait node="a" until="bgp-established" timeout="20s"
+    step wait node="c" until="bgp-established" timeout="20s"
+    // The route lands in home's dedicated table, converted to a real
+    // blackhole by the import filter (proves the pipe's source side works).
+    step assert node="home" cmd="birdc show route table rtbh4 203.0.113.99/32 all" \
+         contains="blackhole" timeout="15s"
+    // ...and the pipe does carry it into master4.
+    step assert node="home" cmd="birdc show route table master4 203.0.113.99/32 all" \
+         contains="blackhole" timeout="15s"
+    // But it is NOT a candidate for export to "c" — split horizon still
+    // applies. This is the core negative result: `show route export to_c`
+    // lists home's other master4 routes (the connected /30s) but not the
+    // piped one. (A prefix-filtered `show route export to_c <net>` on a
+    // route that isn't a candidate prints nothing at all, not "Network not
+    // found" — that message is specific to `show route <net>`/`<net> all` on
+    // a table lookup, exercised on "c" below — so this counts occurrences in
+    // the unfiltered export listing instead.)
+    step assert node="home" \
+         cmd="birdc show route export to_c | grep -c 203.0.113.99/32" \
+         equals="0" timeout="15s"
+    // Confirmed from the receiving side too, matching how the real bug was
+    // diagnosed on kc (`birdc show route ... all` -> `Network not found`).
+    step assert node="c" cmd="birdc show route 203.0.113.99/32 all" \
+         contains="Network not found" timeout="15s"
+}
