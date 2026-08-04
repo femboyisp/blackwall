@@ -36,7 +36,7 @@ pub use pop::PopEntry;
 pub use port::PortState;
 pub use proto::L4Proto;
 pub use resolve::{PolicyError, ResolvedService};
-pub use rtbh::RtbhPolicy;
+pub use rtbh::{NextHopVerdict, RtbhPolicy};
 pub use shape::{ShapeBandwidth, ShapeRule};
 pub use target::ServiceTarget;
 pub use xdp::{XdpConfig, XdpMode, DEFAULT_SYN_COOKIE_TX_CAP_PPS};

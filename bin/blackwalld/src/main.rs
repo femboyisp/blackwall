@@ -1729,21 +1729,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "SHADOW MODE — mitigations are LOGGED, NOT APPLIED (RTBH/FlowSpec/XDP)"
                 );
             } else if let Some(rtbh) = policy.rtbh.as_ref() {
-                // Refuse to arm with a placeholder blackhole next-hop. A
-                // documentation/discard-range next-hop (the unreplaced
-                // config-template value) never resolves to a real discard route,
-                // so BIRD leaves the /32 `unreachable` and never exports it — the
-                // daemon would show `Established` yet announce nothing. Shadow is
-                // exempt (it announces nothing anyway).
-                let placeholders = rtbh.placeholder_next_hops();
-                if !placeholders.is_empty() {
-                    return Err(format!(
-                        "refusing to arm: RTBH next-hop {placeholders:?} is a documentation/discard \
-                         placeholder (RFC 5737/3849/6666) that never resolves to a real blackhole \
-                         route — BIRD would leave the blackhole `unreachable` and never export it. \
-                         Set next-hop-v4/next-hop-v6 to a real discard route, or run in `shadow`."
-                    )
-                    .into());
+                // A documentation/discard-range next-hop is the unreplaced
+                // config-template value. Whether that's fatal depends on how the
+                // route becomes a real discard: via next-hop recursion (needs a
+                // resolvable next-hop) or via BIRD's community→RTD_BLACKHOLE
+                // import filter (c49e31b — next-hop irrelevant). Shadow is exempt
+                // (it announces nothing anyway); see `RtbhPolicy::next_hop_verdict`.
+                match rtbh.next_hop_verdict() {
+                    blackwall_core::NextHopVerdict::Ok => {}
+                    blackwall_core::NextHopVerdict::PlaceholderWithCommunity(placeholders) => {
+                        // A blackhole community is configured, so a placeholder
+                        // next-hop is acceptable *if* the router's BIRD import
+                        // filter does the community→RTD_BLACKHOLE conversion.
+                        // blackwalld can't see the router config to confirm that,
+                        // so warn and arm rather than block (femboy/blackwall#273).
+                        tracing::warn!(
+                            ?placeholders,
+                            "RTBH next-hop is a documentation/discard placeholder (RFC 5737/3849/6666); \
+                             arming anyway because a blackhole community is configured. This yields a \
+                             real blackhole only if BIRD's import filter converts the RFC 7999 \
+                             community to RTD_BLACKHOLE (`blackwalld bird-config`, c49e31b+); if your \
+                             router instead relies on next-hop resolution, blackholes will be \
+                             announced but left `unreachable`."
+                        );
+                    }
+                    blackwall_core::NextHopVerdict::PlaceholderNoCommunity(placeholders) => {
+                        return Err(format!(
+                            "refusing to arm: RTBH next-hop {placeholders:?} is a documentation/discard \
+                             placeholder (RFC 5737/3849/6666) and no blackhole community is configured, \
+                             so BIRD cannot convert the route to a real discard — it would leave the \
+                             blackhole `unreachable` and never export it. Set next-hop-v4/next-hop-v6 to \
+                             a real discard route, add a `community=`, or run in `shadow`."
+                        )
+                        .into());
+                    }
                 }
             }
             let database_url = std::env::var("DATABASE_URL")

@@ -74,6 +74,47 @@ impl RtbhPolicy {
         }
         out
     }
+
+    /// Arm-time verdict on the configured blackhole NEXT_HOPs.
+    ///
+    /// A documentation/discard-placeholder next-hop used to be a hard
+    /// arm-blocking error, because a route with such a next-hop never resolves
+    /// and BIRD leaves it `unreachable` instead of exporting a real blackhole.
+    /// Since `c49e31b` that is no longer the only path to a real discard:
+    /// blackwall's generated BIRD import filter converts an RFC 7999
+    /// community-tagged host route directly to `dest = RTD_BLACKHOLE` on
+    /// import, so the next-hop need not resolve at all. Whenever a blackhole
+    /// community is configured (the default `[(65535, 666)]`), a placeholder
+    /// next-hop is therefore acceptable — but blackwalld cannot see the
+    /// router's config to confirm the import filter is actually in place, so
+    /// that case is a warning, not a hard block. Only with NO community
+    /// configured is next-hop resolution the sole mechanism, and a placeholder
+    /// definitely broken.
+    #[must_use]
+    pub fn next_hop_verdict(&self) -> NextHopVerdict {
+        let placeholders = self.placeholder_next_hops();
+        if placeholders.is_empty() {
+            NextHopVerdict::Ok
+        } else if self.blackhole_communities.is_empty() {
+            NextHopVerdict::PlaceholderNoCommunity(placeholders)
+        } else {
+            NextHopVerdict::PlaceholderWithCommunity(placeholders)
+        }
+    }
+}
+
+/// Outcome of [`RtbhPolicy::next_hop_verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextHopVerdict {
+    /// No placeholder next-hop configured; nothing to flag.
+    Ok,
+    /// Placeholder next-hop(s), but a blackhole community is configured, so
+    /// BIRD's community→`RTD_BLACKHOLE` import filter (`c49e31b`) can produce a
+    /// real blackhole without next-hop resolution. Warn, but arm.
+    PlaceholderWithCommunity(Vec<std::net::IpAddr>),
+    /// Placeholder next-hop(s) and no blackhole community, so there is no path
+    /// to a real discard route. Refuse to arm.
+    PlaceholderNoCommunity(Vec<std::net::IpAddr>),
 }
 
 /// True if `a` is in an RFC 5737 documentation range (never a real next-hop).
@@ -136,6 +177,64 @@ mod tests {
             ..base
         };
         assert_eq!(doc_v6.placeholder_next_hops().len(), 1);
+    }
+
+    #[test]
+    fn next_hop_verdict_gates_on_blackhole_community() {
+        let placeholder = RtbhPolicy {
+            local_asn: 214_806,
+            peer_asn: 214_806,
+            peer_addr: "10.0.0.2:179".parse().unwrap(),
+            router_id: "10.0.0.1".parse().unwrap(),
+            blackhole_communities: vec![(65535, 666)],
+            next_hop_v4: Some("192.0.2.1".parse().unwrap()), // RFC 5737 placeholder
+            next_hop_v6: Some("100::1".parse().unwrap()),    // RFC 6666 placeholder
+            max_blackholes: 8,
+            hold_down: std::time::Duration::from_secs(60),
+            max_ttl: None,
+            md5: None,
+            gtsm_hops: None,
+            local_addr: None,
+            max_new_per_min: None,
+        };
+
+        // Placeholder next-hops WITH a blackhole community: the community→
+        // RTD_BLACKHOLE import filter (c49e31b) makes the next-hop irrelevant,
+        // so this is a warn-and-arm, not a block. (Regression for #273.)
+        assert_eq!(
+            placeholder.next_hop_verdict(),
+            NextHopVerdict::PlaceholderWithCommunity(vec![
+                "192.0.2.1".parse().unwrap(),
+                "100::1".parse().unwrap(),
+            ]),
+        );
+
+        // Placeholder next-hops with NO community: next-hop resolution is the
+        // only path to a real discard, so a placeholder is a hard block.
+        let no_community = RtbhPolicy {
+            blackhole_communities: vec![],
+            ..placeholder.clone()
+        };
+        assert_eq!(
+            no_community.next_hop_verdict(),
+            NextHopVerdict::PlaceholderNoCommunity(vec![
+                "192.0.2.1".parse().unwrap(),
+                "100::1".parse().unwrap(),
+            ]),
+        );
+
+        // A real next-hop is always Ok, community or not.
+        let real = RtbhPolicy {
+            next_hop_v4: Some("94.156.238.67".parse().unwrap()),
+            next_hop_v6: Some("2a12:9b00:b00b::67".parse().unwrap()),
+            ..placeholder.clone()
+        };
+        assert_eq!(real.next_hop_verdict(), NextHopVerdict::Ok);
+        let real_no_comm = RtbhPolicy {
+            blackhole_communities: vec![],
+            ..real
+        };
+        assert_eq!(real_no_comm.next_hop_verdict(), NextHopVerdict::Ok);
     }
 
     #[test]
